@@ -1,0 +1,15 @@
+# 依赖与构建产物（这个扩展本身零依赖、零构建，列在这里是防止以后混进来）
+node_modules/
+dist/
+build/
+*.log
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# 便携版工具（MinGit 之类放在扩展外面，这里兜个底）
+_tools/

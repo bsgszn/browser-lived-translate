@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>livedtranslate 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <div>
+          <h1>livedtranslate · 浏览器同声传译</h1>
+          <p class="lead">
+            捕获当前标签页的声音 → 实时语音识别 → 实时翻译 → 双语字幕悬浮在网页上。
+            配置只保存在本机浏览器里。
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button class="btn ghost" id="btnReset">恢复默认</button>
+          <button class="btn primary" id="btnSave">保存设置</button>
+        </div>
+      </header>
+
+      <div class="toast" id="toast" hidden></div>
+
+      <!-- ══════════ 0. 速度 / 准确度 ══════════ -->
+      <section class="card" id="cardPreset">
+        <h2>0 · 速度 / 准确度</h2>
+        <p class="hint">
+          「字幕出现得快」和「译文稳不跳」在实时翻译里基本是一对取舍。选一个预设就行，
+          下面各项会自动跟着变；手动改过任意一项就会显示成「自定义」。
+        </p>
+        <div class="grid">
+          <label class="field">
+            <span>预设</span>
+            <select id="presetSelect"></select>
+          </label>
+          <label class="field">
+            <span>强制断句上限（ms，0 = 不限制）</span>
+            <input type="number" id="asr-maxSegmentMs" min="0" max="60000" step="500" />
+          </label>
+        </div>
+        <p class="hint" id="presetHint"></p>
+        <p class="hint">
+          说话人长时间不停顿时，识别服务可能一直不给「最终结果」，字幕会无限长、也拿不到干净译文。
+          「强制断句上限」就是这种时候的兜底，默认 10 秒。
+        </p>
+        <p class="hint">
+          <b>翻译时机是固定的，没有旋钮：</b>字幕该上屏的时刻往前推 <b>0.7 秒</b>开始翻译，
+          翻完先等着、到点才上屏。剩下的时间都在等后文。
+          <br />
+          如果实测翻译比 0.7 秒慢，会自动提前开始 —— 否则字幕必然迟到。
+          当前用的窗口和实测翻译耗时都显示在播放页底部。
+        </p>
+      </section>
+
+      <!-- ══════════ 1. 语音识别 ══════════ -->
+      <section class="card" id="cardAsr">
+        <h2>1 · 语音识别（ASR）</h2>
+        <p class="hint">
+          把标签页里的声音转成文字。流式服务延迟最低（约 0.3–1 秒），分片模式延迟高但可以完全本地跑。
+        </p>
+
+        <div class="grid">
+          <label class="field">
+            <span>识别服务</span>
+            <select id="asrProvider"></select>
+          </label>
+          <label class="field">
+            <span>音频语言</span>
+            <select id="asrLanguage"></select>
+          </label>
+        </div>
+        <p class="hint" id="asrLangHint"></p>
+        <p class="hint" id="asrHint"></p>
+
+        <!-- Deepgram -->
+        <div class="panel" data-panel="deepgram">
+          <div class="grid">
+            <label class="field wide">
+              <span>Deepgram API Key <a href="https://console.deepgram.com/" target="_blank" rel="noreferrer">获取</a></span>
+              <input type="password" id="dg-apiKey" placeholder="在 console.deepgram.com 创建，形如 40 位字符串" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>识别模型</span>
+              <select id="dg-model">
+                <option value="nova-3">nova-3（推荐，多语种最好）</option>
+                <option value="nova-2">nova-2</option>
+                <option value="nova-2-general">nova-2-general</option>
+                <option value="nova-2-meeting">nova-2-meeting</option>
+                <option value="nova-2-phonecall">nova-2-phonecall</option>
+                <option value="enhanced">enhanced</option>
+                <option value="base">base</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>WebSocket 端点</span>
+              <input type="text" id="dg-endpoint" placeholder="wss://api.deepgram.com/v1/listen" />
+            </label>
+            <label class="field">
+              <span>断句静音阈值（ms，Deepgram 硬下限 1000，只能当兜底）</span>
+              <input type="number" id="dg-utteranceEndMs" min="1000" max="5000" step="100" />
+            </label>
+            <label class="field">
+              <span>endpointing（ms，<b>「一句有多长」就调它</b>：越大句子越长）</span>
+              <input type="number" id="dg-endpointing" min="10" max="2000" step="10" />
+            </label>
+            <label class="field wide">
+              <span>关键词表（可选，逗号分隔，提升专有名词识别）</span>
+              <input type="text" id="dg-keyterms" placeholder="livedtranslate, Kubernetes, 英伟达" />
+            </label>
+          </div>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="dg-interim" /> <span>输出中间结果（未说完就显示，体感更快）</span></label>
+            <label class="check">
+              <input type="checkbox" id="dg-smartFormat" />
+              <span>
+                智能格式化（把「二零二五年」写成「2025年」这类数字/日期/货币规整）
+                <b style="color: #ffd79a">——Deepgram 官方说明：流式下遇到疑似不完整的数字、日期，会等到说话人继续说，否则静默 3 秒后才定稿。做实时字幕建议关掉。</b>
+                标点不受影响，由 punctuate 单独提供。
+              </span>
+            </label>
+          </div>
+        </div>
+
+        <!-- OpenAI Realtime -->
+        <div class="panel" data-panel="openai-realtime">
+          <div class="grid">
+            <label class="field wide">
+              <span>OpenAI API Key <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">获取</a></span>
+              <input type="password" id="rt-apiKey" placeholder="sk-..." autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Base URL</span>
+              <input type="text" id="rt-baseUrl" placeholder="https://api.openai.com/v1" />
+            </label>
+            <label class="field">
+              <span>转写模型</span>
+              <select id="rt-model">
+                <option value="gpt-4o-mini-transcribe">gpt-4o-mini-transcribe（便宜、快）</option>
+                <option value="gpt-4o-transcribe">gpt-4o-transcribe（更准）</option>
+                <option value="whisper-1">whisper-1</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>静音断句（ms）</span>
+              <input type="number" id="rt-silenceDurationMs" min="200" max="3000" step="50" />
+            </label>
+            <label class="field wide">
+              <span>提示词（可选，写入专业术语/人名，提高识别率）</span>
+              <input type="text" id="rt-prompt" placeholder="讨论内容涉及 Kubernetes、向量数据库、livedtranslate" />
+            </label>
+          </div>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="rt-useAsrKeyFromChunked" /> <span>复用下方 Whisper 分片的 API Key（同一个 OpenAI 兼容网关时更省事）</span></label>
+          </div>
+        </div>
+
+        <!-- 本地 VAD 断句 -->
+        <div class="panel" data-panel="vad">
+          <div class="grid">
+            <label class="field">
+              <span>语速档位</span>
+              <select id="vd-rate"></select>
+              <small class="hint" id="vdRateHint"></small>
+            </label>
+            <label class="field">
+              <span>判定阈值</span>
+              <input type="number" id="vd-threshold" min="0.1" max="0.9" step="0.05" />
+              <small class="hint">Silero VAD 输出 0~1 的"有人在说话"概率。背景音乐吵就调高一点。</small>
+            </label>
+            <label class="field">
+              <span>静音确认（毫秒）</span>
+              <input type="number" id="vd-minSilenceMs" min="100" max="1500" step="50" />
+              <small class="hint"><b>这一项直接等于主要延迟</b>：静这么久才认定一句说完。<b>调大 → 字幕更整、但延迟更长</b>；调小更跟手，但容易把话切碎。代码里另有迟滞（退出阈值 = 进入阈值 × 0.7）专门防抖动切碎，所以不用靠把它调很大来防碎。</small>
+            </label>
+            <label class="field">
+              <span>收句静音（毫秒）</span>
+              <input type="number" id="vd-utteranceEndMs" min="400" max="3000" step="50" />
+              <small class="hint"><b>两级边界里的硬边界。</b>静音超过它才算"这句真的说完了"；介于两者之间的碎片会和后面拼成一句。另外<b>文本自带句末标点时也会立刻收句</b>（相当于 Deepgram 靠词判断的做法）。<b>调大 → 句子更整</b>。</small>
+            </label>
+            <label class="field">
+              <span>最短话段（毫秒）</span>
+              <input type="number" id="vd-minUtteranceMs" min="100" max="2000" step="50" />
+              <small class="hint">短于这个的当噪声丢掉，不单独出一条字幕。觉得字幕太碎可以往上调。</small>
+            </label>
+            <label class="field">
+              <span>单句上限（秒）</span>
+              <input type="number" id="vd-maxSpeechSec" min="5" max="60" step="1" />
+              <small class="hint">一句最长多久。超了强制切断 —— 否则有人一直不停顿就永远不出字幕。</small>
+            </label>
+            <label class="field">
+              <span>前后留白（毫秒）</span>
+              <input type="number" id="vd-padMs" min="0" max="800" step="50" />
+              <small class="hint">句子前后各多切一点。切在音节中间会让识别丢掉开头的字。</small>
+            </label>
+          </div>
+          <p class="note">
+            地址沿用下面「本地 Whisper 服务」那一栏 —— 和识别校正共用同一个服务，所以不用重复填。
+          </p>
+          <p class="note">
+            <b>音源不好怎么办（差麦克风 / 说话快）</b>——这三个旋钮是为此准备的，都可以单独试，
+            不满意就改回默认：
+          </p>
+          <div class="grid">
+            <label class="field">
+              <span>自动增益档位</span>
+              <select id="cp-agcProfile"></select>
+              <small class="hint" id="agcHint"></small>
+            </label>
+          </div>
+          <p class="note">
+            <b>差麦克风 / 说话快怎么办</b>——先试这里的「自动增益档位」调到<b>温和</b>，
+            再到下面「本地 Whisper 服务」那一栏填<b>提示词</b>引导识别。
+            <b>两项都可以单独试，不满意就改回默认</b>（默认 = 一直以来的行为）。
+          </p>
+          <p class="note">
+            这个模式<b>不需要分片</b>：VAD 当场判断"这句说完了"，把完整的一句交给本地 Whisper。
+            所以没有分片时长要调，也没有跨片等待 —— 延迟比 Whisper 分片低得多（约 0.3 秒 + 一次推理）。
+          </p>
+          <p class="note">
+            <b>用了它就可以把「识别校正」关掉</b>：这里的音频已经是完整的一句，
+            校正再听一遍是重复劳动，白白多花一次 GPU。
+          </p>
+        </div>
+
+        <!-- Whisper 分片 -->
+        <div class="panel" data-panel="whisper-chunked">
+          <div class="grid">
+            <label class="field">
+              <span>分片时长（秒）</span>
+              <input type="number" id="wc-chunkSeconds" min="2" max="30" step="1" />
+            </label>
+            <label class="field">
+              <span>静音判定阈值</span>
+              <input type="number" id="wc-silenceThreshold" min="0" max="0.2" step="0.001" />
+            </label>
+            <label class="field">
+              <span>断句停顿（秒）</span>
+              <input type="number" id="wc-pauseSec" min="0.1" max="1.5" step="0.05" />
+              <small class="hint">词与词之间静这么久就算一句说完。<b>调小 → 句子更短更容易断</b>；调大 → 更少断、句子更长。觉得字幕一句太长就往下调。</small>
+            </label>
+            <label class="field wide">
+              <span>提示词（可选）</span>
+              <input type="text" id="wc-prompt" placeholder="例：日语直播，说话快，有底噪。常见词：配信、スパチャ、切り抜き" />
+              <small class="hint">
+                用来引导识别。<b>差音源 + 快语速时尤其有用</b>，但写太长或写偏会把识别带跑，所以默认是空的。
+                <br />
+                <b>这一项以前在 VAD 模式下不起作用</b>（接线漏了，分片模式才会发）—— 现在两种模式都会发出去。
+              </small>
+            </label>
+          </div>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="wc-skipSilence" /> <span>跳过静音片段（省算力、避免幻听）</span></label>
+          </div>
+          <p class="hint">
+            <b>服务地址在上面那一栏</b>（「本地 Whisper 服务」）—— 它和识别校正共用同一个地址，
+            所以没有放在这里，免得两个地方各填一份。
+          </p>
+        </div>
+
+        <!--
+          本地 Whisper 服务是**两个功能共用**的：Whisper 分片识别（当流式用）和识别校正（定文本）。
+          所以放在所有 data-panel 之外 —— 选哪家流式识别都能看见、都能改。
+          否则「流式用 Deepgram + 本地定文本」这个主力用法会变成"要填的地址藏在一个看不见的面板里"。
+        -->
+        <h4>本地 Whisper 服务<span class="sub">分片识别 与 识别校正 共用这个地址</span></h4>
+        <div class="grid">
+          <label class="field wide">
+            <span>服务地址（OpenAI 兼容，填到 /v1 为止）</span>
+            <input type="text" id="wc-baseUrl" placeholder="http://127.0.0.1:8080/v1" />
+          </label>
+          <label class="field">
+            <span>API Key（本地服务可留空）</span>
+            <input type="password" id="wc-apiKey" placeholder="本地服务通常不需要" autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>模型名（whisper.cpp 会忽略这一栏）</span>
+            <input type="text" id="wc-model" placeholder="Systran/faster-whisper-large-v3" />
+          </label>
+        </div>
+        <p class="hint">
+          本地起一个兼容服务，例如：
+          <code>pip install faster-whisper-server &amp;&amp; faster-whisper-server --model large-v3 --port 8000</code>
+          或 <code>whisper.cpp</code> 自带的 <code>server</code>。
+        </p>
+        <p class="hint">
+          ⚠️ <b>主机名用 <code>127.0.0.1</code>，别用 <code>localhost</code></b> —— 服务通常只监听 IPv4，
+          而 localhost 可能被解析成 IPv6 的 <code>::1</code>，那样浏览器只会含糊地报
+          <code>Failed to fetch</code>。
+          <br />
+          ⚠️ <b>whisper.cpp 完全忽略「模型名」那一栏</b> —— 模型由它启动时的 <code>-m</code> 参数决定。
+          填错也不影响，但别指望改这里能换模型。
+        </p>
+
+        <!--
+          ⚠️ 识别校正必须放在**所有 data-panel 之外**。
+          它跟具体哪家流式识别是正交的（尤其「Deepgram 定时间轴 + 本地定文本」才是主力用法），
+          一开始误放进 whisper-chunked 那个 panel 里，结果只有选本地分片才看得见 —— 正好反了。
+        -->
+        <h4>识别校正（流式定时间轴 + 本地模型定文本）</h4>
+        <div class="grid">
+          <label class="field">
+            <span>重识别方式</span>
+            <select id="rf-provider">
+              <option value="auto">自动（跟着流式识别走）</option>
+              <option value="whisper">本地 Whisper（推荐）</option>
+              <option value="deepgram">Deepgram 非流式</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>重识别模型（留空沿用上面的）</span>
+            <input type="text" id="rf-model" placeholder="留空即可" />
+          </label>
+          <label class="field">
+            <span>重识别语言（留空沿用源语言）</span>
+            <input type="text" id="rf-language" placeholder="留空即可，例如 ja" />
+          </label>
+          <label class="field wide">
+            <span>重识别提示词（可选，<b>建议留空</b>）</span>
+            <input type="text" id="rf-prompt" placeholder="只填反复听错的专有名词，用逗号分隔" />
+          </label>
+        </div>
+        <div class="checks">
+          <label class="check">
+            <input type="checkbox" id="rf-enabled" />
+            <span>开启识别校正（<b>默认关</b>）</span>
+          </label>
+        </div>
+        <p class="hint">
+          <b>分工是固定的：</b>流式识别的时间戳决定字幕<b>什么时候</b>上屏（这条不动），
+          本地模型重新识别一遍决定字幕<b>写什么</b>。所以重识别失败、超时、或者服务没起，
+          <b>都不会影响字幕的时序</b>，只是没拿到那份加成。
+        </p>
+        <p class="hint">
+          <b>用哪个地址：</b>选「本地 Whisper」时用的是上面<b>「本地 Whisper 服务」</b>那一栏的地址，
+          <b>跟当前选的是哪家流式识别无关</b> —— 即使流式用 Deepgram，本地地址也照样在那里填。
+        </p>
+        <p class="hint">
+          ⚠️ <b>「自动」的含义容易误会</b>：它是「跟着流式识别走」——
+          流式选了 Deepgram，自动就等于用 <b>Deepgram 非流式</b>再识别一遍，<b>不是</b>本地 Whisper。
+          <br />
+          <b>想让本地模型定文本（流式 Deepgram 定时间轴），必须显式选「本地 Whisper」。</b>
+        </p>
+        <p class="hint">
+          ⚠️ <b>「重识别提示词」为什么建议留空</b>：实测 prompt 更容易把 Whisper 带偏，而不是帮它听准。
+          同一段真实日语：
+          <br />
+          　不加 → 「そうなんだよね / ティールで一瞬で流れたりするからね / あれピンクと黒の髪の毛の色はあれひなのじゃん」<b>全对</b>
+          <br />
+          　加日文相关词 → 丢掉第一句，还把「ひなの」听成「ひなうの」
+          <br />
+          　加一堵英文术语 → <b>严重损坏</b>（旧版就是把翻译术语表拼进来，正好是这个后果）
+          <br />
+          <b>翻译术语表不再参与识别</b> —— 那是给翻译用的。这里只认你显式填的、以及 Deepgram 那栏的
+          <code>keyterms</code>。
+        </p>
+        <p class="hint">
+          ⚠️ <b>为什么默认关</b>：一开启就会按上面那个地址发请求，没在本地跑服务的话，
+          每句都会打一次空请求。连续失败 2 次会自动暂停 30 秒，不会一直空转。
+          <br />
+          另外，<b>如果流式识别本身就是本地 Whisper 分片</b>，开了它相当于用同一个模型再听一遍，
+          收益很小，可以关掉。延迟模式（画面推迟）才用得上 —— 叠加模式手里没有留存的音频。
+        </p>
+
+        <div class="actions">
+          <button class="btn" id="btnTestAsr">测试识别连接</button>
+          <span class="result" id="asrTestResult"></span>
+        </div>
+      </section>
+
+      <!-- ══════════ 1.5 延迟画面画质 ══════════ -->
+      <section class="card" id="cardQuality">
+        <h2>1.5 · 延迟画面画质</h2>
+        <p class="hint">
+          <b>只在延迟模式下生效。</b>延迟模式要把画面录下来再晚几秒播，
+          这中间视频会被重新编码一次 —— <b>码率给不够，画面一动就糊</b>
+          （静止时帧间几乎没变化，很省；一运动编码器只能丢细节去凑码率）。
+        </p>
+        <div class="grid">
+          <label class="field">
+            <span>画质档位</span>
+            <select id="delayQuality"></select>
+          </label>
+          <label class="field">
+            <span>采集帧率上限（fps，0 = 不限制）</span>
+            <input type="number" id="cp-maxFrameRate" min="0" max="120" step="5" />
+          </label>
+        </div>
+        <p class="hint">
+          <b>帧率这一项容易白丢一半。</b>不显式给的话，Chrome 对标签页采集常只给 30fps ——
+          源本身是 60fps 时运动画面就发顿。它是<b>上限不是强制值</b>，源只有 30fps 时没有副作用。
+          <br />
+          ⚠️ 但帧率翻倍会让<b>自动码率也跟着翻倍</b>（保持同样的 bpp），编码压力也翻倍：
+          4K30 高画质 ≈ 64 Mbps，4K60 ≈ 128 Mbps。如果变卡，先把画质档位降一档。
+        </p>
+        <p class="hint" id="qualityHint"></p>
+        <p class="hint">
+          档位是<b>相对「标准档」的倍率</b>，实际码率按你的画面尺寸算，所以换分辨率不用重调。
+          参考值（基准：1920×1080 ≈ 10 Mbps · 2560×1440 ≈ 17 · 3840×2160 ≈ 40）：<br />
+          <b>省资源</b> 4K ≈ 20 Mbps · <b>标准</b> 4K ≈ 40 · <b>高画质</b> 4K ≈ 64 · <b>极致</b> 4K ≈ 96。
+          <br />
+          衡量够不够的通用指标是 <b>bpp</b>（每像素每帧位数）：<b>0.16 以下运动画面会糊</b>，
+          0.26 左右干净，0.39 基本看不出二次压缩。H.264 效率低于 VP9/AV1，所以它需要更高码率。
+        </p>
+      </section>
+
+      <!-- ══════════ 2. 翻译 ══════════ -->
+      <section class="card" id="cardTranslate">
+        <h2>2 · 翻译</h2>
+        <div class="grid">
+          <label class="field">
+            <span>翻译服务</span>
+            <select id="tr-provider"></select>
+          </label>
+          <label class="field">
+            <span>目标语言（字幕语言）</span>
+            <select id="tr-target"></select>
+          </label>
+          <label class="field">
+            <span>源语言</span>
+            <select id="tr-source"></select>
+          </label>
+          <label class="field">
+            <span>中间结果翻译最短间隔（ms）</span>
+            <input type="number" id="tr-interimIntervalMs" min="200" max="5000" step="100" />
+          </label>
+          <label class="field">
+            <span>中间结果最短字数（短于此不翻译）</span>
+            <input type="number" id="tr-interimMinChars" min="0" max="60" step="1" />
+          </label>
+          <label class="field">
+            <span>翻译上下文句数（带上前几句，改善指代与连贯）</span>
+            <input type="number" id="tr-contextSegments" min="0" max="5" step="1" />
+          </label>
+        </div>
+        <div class="checks">
+          <label class="check">
+            <input type="checkbox" id="tr-translateInterim" />
+            <span>也翻译中间结果（字幕出现更快，但译文会边听边改、来回跳，且更费额度）</span>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="tr-reviewPass" />
+            <span>
+              <b>复核校正</b>——初译出来后再让模型对照原文校一遍，只改错不润色。
+              <b style="color:#ffd79a">仅 OpenAI 生效</b>（其它服务商没有"再想一遍"的接口），会多一次调用。
+              <b>只在延迟模式下生效</b>（叠加模式没有预算，硬做会把调用次数翻倍）。
+            </span>
+          </label>
+        </div>
+
+        <div class="panel" data-panel="google-free">
+          <label class="field wide">
+            <span>端点（一般不用改）</span>
+            <input type="text" id="g-endpoint" />
+          </label>
+          <p class="hint">使用 Google 翻译的公开免密通道，零配置。若所在网络无法访问，请改用其他服务。</p>
+        </div>
+
+        <div class="panel" data-panel="openai">
+          <div class="grid">
+            <label class="field wide">
+              <span>OpenAI API Key</span>
+              <input type="password" id="o-apiKey" placeholder="sk-..." autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Base URL</span>
+              <input type="text" id="o-baseUrl" />
+            </label>
+            <label class="field">
+              <span>模型</span>
+              <input type="text" id="o-model" placeholder="gpt-4o-mini" />
+            </label>
+          </div>
+          <label class="field wide">
+            <span>系统提示词</span>
+            <textarea id="o-systemPrompt" rows="3"></textarea>
+          </label>
+        </div>
+
+        <div class="panel" data-panel="deepseek">
+          <p class="hint">
+            DeepSeek 走的是 <b>OpenAI 兼容协议</b>，填法和 OpenAI 一样。
+            价格比 OpenAI 低不少，中文语感也好 —— 长时间挂着直播同传比较划算。
+            <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noreferrer">获取 API Key</a>
+          </p>
+          <div class="grid">
+            <label class="field wide">
+              <span>DeepSeek API Key</span>
+              <input type="password" id="ds-apiKey" placeholder="sk-..." autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>Base URL</span>
+              <input type="text" id="ds-baseUrl" />
+            </label>
+            <label class="field">
+              <span>模型</span>
+              <input type="text" id="ds-model" placeholder="deepseek-chat" />
+            </label>
+          </div>
+          <label class="field wide">
+            <span>系统提示词</span>
+            <textarea id="ds-systemPrompt" rows="3"></textarea>
+          </label>
+        </div>
+
+        <div class="panel" data-panel="ollama">
+          <p class="hint">
+            <b>本机跑的大模型：不需要 API Key、不联网、零成本。</b>
+            前提是你已经在本机跑着 Ollama，并且拉过模型（<code>ollama pull qwen2.5:7b</code>）。
+            <br />
+            ⚠️ 7B 级别在同传这种短句、口语、缺少上下文的场景下，<b>质量不如云端服务</b> ——
+            它的价值是"完全离线、不看网络脸色"。机器够好可以换更大的模型。
+          </p>
+          <div class="grid">
+            <label class="field">
+              <span>Base URL</span>
+              <input type="text" id="ol-baseUrl" />
+            </label>
+            <label class="field">
+              <span>模型</span>
+              <input type="text" id="ol-model" placeholder="qwen2.5:7b" />
+            </label>
+          </div>
+          <label class="field wide">
+            <span>系统提示词</span>
+            <textarea id="ol-systemPrompt" rows="3"></textarea>
+          </label>
+        </div>
+
+        <div class="panel" data-panel="baidu">
+          <p class="hint">
+            用的百度「通用文本翻译」接口，<b>国内直连不需要代理</b>。
+            <a href="https://fanyi-api.baidu.com/ordertrial/advance/list" target="_blank" rel="noreferrer">申请 APPID 与密钥</a>
+            <br />
+            ⚠️ <b>免费版每秒只能请求一次</b>（QPS=1）。同传的中间结果刷新很快，容易撞限流报 54003 ——
+            真遇到了就把「中间结果翻译」关掉，只在句子定稿时翻译。
+          </p>
+          <div class="grid">
+            <label class="field">
+              <span>APPID</span>
+              <input type="text" id="bd-appid" placeholder="2024..." autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>密钥</span>
+              <input type="password" id="bd-key" autocomplete="off" />
+            </label>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="tencent">
+          <p class="hint">
+            用的是腾讯云「机器翻译」的 <code>TextTranslate</code> 接口，<b>国内直连不需要代理</b>。
+            <a href="https://console.cloud.tencent.com/cam/capi" target="_blank" rel="noreferrer">创建 SecretId / SecretKey</a>
+            <br />
+            ⚠️ <b>地域（Region）是必填的</b> —— 腾讯云 API 要求声明地域，不填会被直接拒掉。
+            就近选一个即可，不确定就用 <code>ap-guangzhou</code>。
+          </p>
+          <div class="grid">
+            <label class="field">
+              <span>SecretId</span>
+              <input type="text" id="tc-secretId" placeholder="AKID..." autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>SecretKey</span>
+              <input type="password" id="tc-secretKey" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>地域 Region</span>
+              <input type="text" id="tc-region" placeholder="ap-guangzhou" autocomplete="off" />
+              <small class="hint">必填。常见值：ap-guangzhou / ap-shanghai / ap-beijing / ap-hongkong。</small>
+            </label>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="ali">
+          <p class="hint">
+            用的是阿里云「机器翻译通用版」的 <code>TranslateGeneral</code> 接口，<b>国内直连不需要代理</b>。
+            <a href="https://ram.console.aliyun.com/manage/ak" target="_blank" rel="noreferrer">创建 AccessKey</a>
+            <br />
+            QPS 50、单次上限 5000 字符，<b>比百度的免费版宽松得多</b>。
+            ⚠️ 建议用 <b>RAM 子账号</b>的密钥，只授予 <code>AliyunMTFullAccess</code>，别直接用主账号的。
+          </p>
+          <div class="grid">
+            <label class="field">
+              <span>AccessKeyId</span>
+              <input type="text" id="al-keyId" placeholder="LTAI..." autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>AccessKeySecret</span>
+              <input type="password" id="al-keySecret" autocomplete="off" />
+            </label>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="deepl">
+          <div class="grid">
+            <label class="field wide">
+              <span>DeepL API Key <a href="https://www.deepl.com/pro-api" target="_blank" rel="noreferrer">获取</a></span>
+              <input type="password" id="d-apiKey" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx:fx" autocomplete="off" />
+            </label>
+          </div>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="d-pro" /> <span>使用 DeepL Pro 端点（api.deepl.com，付费版才勾）</span></label>
+          </div>
+        </div>
+
+        <div class="panel" data-panel="none">
+          <p class="hint">只做语音识别，不翻译。字幕只显示原文。</p>
+        </div>
+
+        <!-- ══ 术语表：对所有翻译服务生效，所以放在服务商面板外面 ══ -->
+        <div class="glossary-block">
+          <h3>术语表</h3>
+          <p class="hint" id="glossaryHint"></p>
+          <div class="checks">
+            <label class="check">
+              <input type="checkbox" id="tr-liveGlossary" />
+              <span>
+                <b>并入内置直播术语表</b>——superchat / membership / collab / clip，
+                以及日文的 配信 / スパチャ / 切り抜き / 凸待ち / 概要欄 这类。
+                这些词在直播里几乎必然出现，所以<b>默认开启</b>。
+              </span>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="tr-gamingGlossary" />
+              <span>
+                <b>并入内置游戏术语表</b>——carry/gank/lane/jungler 这类在游戏之外几乎不会出现的词，整词匹配替换成游戏惯用译法。
+                只有看游戏直播才该开：术语表是全局生效的，开着看普通内容会把译文带偏。
+              </span>
+            </label>
+          </div>
+          <label class="field wide" style="margin-top: 12px">
+            <span>自定义术语表（每行一条 <code>原文=译文</code>；<code>#</code> 开头的行会被忽略）</span>
+            <textarea
+              id="tr-glossary"
+              rows="6"
+              placeholder="livedtranslate=livedtranslate&#10;Kubernetes=Kubernetes&#10;aggro=仇恨&#10;last hit=补刀"
+            ></textarea>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="btn" id="btnTestTranslate">测试翻译</button>
+          <span class="result" id="trTestResult"></span>
+        </div>
+      </section>
+
+      <!-- ══════════ 3. 字幕外观 ══════════ -->
+      <section class="card">
+        <h2>3 · 字幕外观</h2>
+        <div class="grid">
+          <label class="field">
+            <span>位置</span>
+            <select id="ui-position">
+              <option value="bottom">屏幕底部</option>
+              <option value="top">屏幕顶部</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>双语顺序</span>
+            <select id="ui-bilingualOrder">
+              <option value="translation-first">译文在上，原文在下</option>
+              <option value="original-first">原文在上，译文在下</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>字号 <b id="ui-fontSizeVal"></b></span>
+            <input type="range" id="ui-fontSize" min="14" max="48" step="1" />
+          </label>
+          <label class="field">
+            <span>背景不透明度 <b id="ui-opacityVal"></b></span>
+            <input type="range" id="ui-opacity" min="0.2" max="1" step="0.02" />
+          </label>
+          <label class="field">
+            <span>保留历史行数</span>
+            <input type="number" id="ui-historyLines" min="0" max="6" step="1" />
+          </label>
+          <label class="field">
+            <span>无新字幕后自动隐藏（ms）</span>
+            <input type="number" id="ui-hideAfterMs" min="1000" max="60000" step="500" />
+          </label>
+        </div>
+        <div class="checks">
+          <label class="check"><input type="checkbox" id="ui-showOriginal" /> <span>显示原文</span></label>
+          <label class="check">
+            <input type="checkbox" id="ui-showDiag" />
+            <span>显示诊断信息（把识别/翻译耗时画在字幕上方，并把每次翻译的开始/完成/失败打到页面控制台）</span>
+          </label>
+          <label class="check"><input type="checkbox" id="audio-muteOriginal" /> <span>启动时静音原声（只听翻译字幕，适合会议学习场景）</span></label>
+          <label class="check"><input type="checkbox" id="audio-autoGain" /> <span>安静音源自动增益（只提升不衰减，静音时冻结；对说话人偏轻的直播/会议帮助很大）</span></label>
+        </div>
+      </section>
+
+      <!-- ══════════ 4. 其它 ══════════ -->
+      <section class="card">
+        <h2>4 · 其它</h2>
+        <div class="grid">
+          <label class="field">
+            <span>本机字幕历史保留条数</span>
+            <input type="number" id="history-keep" min="0" max="2000" step="50" />
+          </label>
+        </div>
+        <p class="hint">
+          历史只写入 <code>chrome.storage.session</code>（浏览器关闭即清空），不会上传。
+        </p>
+      </section>
+
+      <footer class="foot">
+        <span>快捷键 <code>Alt+Shift+S</code> 可在任意页面开始 / 停止。</span>
+        <span class="ver" id="verInfo"></span>
+      </footer>
+    </div>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

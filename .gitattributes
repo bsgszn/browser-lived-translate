@@ -1,0 +1,10 @@
+# 这个项目的源码全部用 LF。显式写死，免得 Windows 上的 git 把行尾改成 CRLF，
+# 导致每次提交都显示"整个文件都改了"。
+* text=auto eol=lf
+
+# 二进制文件不做任何转换
+*.png binary
+*.ico binary
+*.zip binary
+*.woff binary
+*.woff2 binary
