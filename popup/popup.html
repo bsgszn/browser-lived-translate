@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>livedtranslate</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="head">
+      <div class="brand">
+        <span class="dot" id="brandDot"></span>
+        <span class="name">livedtranslate</span>
+        <span class="sub">同声传译</span>
+      </div>
+      <button class="icon-btn" id="openOptions" title="设置">⚙</button>
+    </header>
+
+    <section class="status" id="statusCard">
+      <div class="status-line">
+        <span class="pill" id="statusPill">未运行</span>
+        <span class="tab-title" id="tabTitle">—</span>
+      </div>
+      <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
+      <div class="meta">
+        <span id="asrInfo">—</span>
+        <span id="lagInfo"></span>
+        <span id="segInfo">0 句</span>
+      </div>
+    </section>
+
+    <section class="banner error" id="errorBanner" hidden></section>
+    <section class="banner warn" id="warnBanner" hidden>
+      <span id="warnText"></span>
+      <button class="banner-btn" id="warnAction" hidden></button>
+    </section>
+
+    <!-- 呈现方式决定"开始"按钮到底做什么，所以放在按钮正上方 -->
+    <section class="mode-card">
+      <div class="mode-head">
+        <span class="mode-label">呈现方式</span>
+        <div class="seg" id="captureMode">
+          <button type="button" class="seg-btn" data-mode="overlay">字幕叠加</button>
+          <button type="button" class="seg-btn" data-mode="delayed">延迟画面</button>
+        </div>
+      </div>
+      <label class="row" id="delayRow" hidden>
+        <span>画面延迟 <b id="delayVal">2.5s</b></span>
+        <input type="range" id="delaySec" min="0.5" max="8" step="0.1" />
+      </label>
+      <p class="hint" id="delayHint" hidden>
+        画面推迟这个秒数再显示，这几秒就是识别与翻译的提前量，字幕因此能和画面同时出现。
+        标红说明：会新开一个播放标签页，原标签页被自动静音（tabCapture 的固有行为）。
+      </p>
+      <p class="hint" id="modeHint">字幕直接叠在你的页面上，零延迟；字幕会晚于画面 1–3 秒。</p>
+    </section>
+
+    <button class="primary" id="toggleBtn">开始同声传译</button>
+
+    <section class="controls">
+      <label class="row">
+        <span>目标语言</span>
+        <select id="targetLang"></select>
+      </label>
+      <label class="row">
+        <span>字幕位置</span>
+        <select id="position">
+          <option value="bottom">底部</option>
+          <option value="top">顶部</option>
+        </select>
+      </label>
+      <label class="row switch">
+        <span>静音原声</span>
+        <input type="checkbox" id="muteOriginal" />
+      </label>
+      <label class="row switch">
+        <span>显示原文</span>
+        <input type="checkbox" id="showOriginal" />
+      </label>
+      <label class="row switch">
+        <span>显示诊断信息（字幕上方）</span>
+        <input type="checkbox" id="showDiag" />
+      </label>
+      <label class="row">
+        <span>字幕字号 <b id="fontSizeVal">24</b></span>
+        <input type="range" id="fontSize" min="14" max="44" step="1" />
+      </label>
+    </section>
+
+    <section class="history-wrap">
+      <div class="history-head">
+        <span>最近字幕</span>
+        <div>
+          <button class="mini" id="copyAll">复制</button>
+          <button class="mini" id="clearAll">清空</button>
+        </div>
+      </div>
+      <div class="history" id="history"></div>
+    </section>
+
+    <footer class="foot">
+      <span id="providerInfo">—</span>
+      <span><b class="ver" id="verInfo"></b> <span class="kbd">Alt+Shift+S</span></span>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

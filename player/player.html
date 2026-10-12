@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>livedtranslate · 延迟同传</title>
+    <link rel="stylesheet" href="player.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <span class="dot" id="dot"></span>
+        <span class="name">livedtranslate 延迟同传</span>
+        <span class="ver" id="verInfo"></span>
+        <span class="src" id="srcInfo">等待开始…</span>
+      </div>
+      <div class="stats">
+        <span id="statDelay">延迟 —</span>
+        <span id="statAsr">识别 —</span>
+        <span id="statTr">翻译 —</span>
+        <span id="statBuf">缓冲 —</span>
+      </div>
+      <div class="acts">
+        <button class="btn" id="btnFull" title="整页全屏（而不是视频原生全屏）—— 这样字幕层才不会被一起藏掉">全屏</button>
+        <button class="btn" id="btnBack">回到原页面</button>
+        <button class="btn danger" id="btnStop">停止</button>
+      </div>
+    </header>
+
+    <main class="stage">
+      <div class="frame" id="frame">
+        <video id="video" playsinline></video>
+
+        <!-- 字幕：跟着延迟画面走，按音频时间戳排期上屏 -->
+        <div class="subs" id="subs"></div>
+
+        <!-- 诊断：和画面同页，不经过任何状态通道 -->
+        <div class="diag" id="diag"></div>
+
+        <div class="overlay" id="overlay">
+          <div class="card">
+            <h1 id="ovTitle">正在准备延迟画面…</h1>
+            <p id="ovBody">正在建立缓冲。视频会推迟几秒出现，这几秒就是识别和翻译的提前量。</p>
+            <p class="err" id="ovErr"></p>
+            <button class="btn primary" id="ovAction" hidden></button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="panel">
+      <label class="ctl">
+        <span>画面延迟 <b id="delayVal">2.5s</b></span>
+        <input type="range" id="delay" min="0.5" max="8" step="0.1" />
+      </label>
+      <label class="ctl">
+        <span>字幕同步微调 <b id="syncVal">0ms</b></span>
+        <input type="range" id="sync" min="-2000" max="2000" step="50" />
+      </label>
+      <label class="ctl narrow">
+        <span>音量 <b id="volVal">100%</b></span>
+        <input type="range" id="vol" min="0" max="1" step="0.05" />
+      </label>
+      <label class="ctl check" title="用 ±6% 变速把延迟拉回目标值。开着延迟更稳，但 4K 画面上能看出变速顿挫；关掉画面更顺，延迟会慢慢漂移（字幕依然对得上，因为排期用的是实测延迟）。改完要重新开始捕获。">
+        <input type="checkbox" id="smoothRate" />
+        <span>变速纠偏</span>
+      </label>
+      <label class="ctl check" title="流式识别定时间轴，本地模型定文本。需要 asr.whisperChunked.baseUrl 指向正在跑的本地服务">
+        <input type="checkbox" id="refineOn" />
+        <span>识别校正</span>
+      </label>
+      <label class="ctl narrow" title="延迟画面会被重新编码一遍，分辨率越高越吃 CPU/GPU。4K 源下如果画面发顿，降一档试试。改完要重新开始捕获才生效。">
+        <span>延迟画质</span>
+        <select id="quality">
+          <option value="0">原样</option>
+          <option value="1440">1440p</option>
+          <option value="1080">1080p</option>
+          <option value="720">720p</option>
+          <option value="480">480p</option>
+        </select>
+      </label>
+      <label class="ctl check">
+        <input type="checkbox" id="diagOn" />
+        <span>诊断面板</span>
+      </label>
+      <button class="btn tiny" id="btnCopyDiag" title="复制完整日志（含面板没显示的部分），方便贴出来排查">复制日志</button>
+      <span class="hint" id="hint"></span>
+    </footer>
+
+    <!--
+      onnxruntime-web（本地 VAD 用）。
+      ⚠️ 必须**本地文件**，不能从 CDN 加载 —— MV3 的 CSP 只允许 'self'。
+      它是个 UMD 脚本，加载后在 window.ort 上；WASM 与模型都从 vendor/ 读。
+      manifest 里的 CSP 必须带 'wasm-unsafe-eval'，否则 WASM 编译会被拒绝。
+    -->
+    <script src="../vendor/ort.min.js"></script>
+    <script type="module" src="player.js"></script>
+  </body>
+</html>

@@ -1,0 +1,144 @@
+:root {
+  color-scheme: dark;
+  --bg: #0d1015;
+  --card: #151a20;
+  --card-2: #1b2129;
+  --line: #262e38;
+  --text: #e8edf4;
+  --muted: #8d99a8;
+  --accent: #4a9eff;
+  --accent-2: #2f7fe0;
+  --ok: #35c07a;
+  --danger: #e5484d;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+.page { max-width: 880px; margin: 0 auto; padding: 28px 22px 60px; }
+
+.hero { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 20px; }
+.hero h1 { font-size: 21px; margin: 0 0 6px; letter-spacing: .2px; }
+.lead { margin: 0; color: var(--muted); font-size: 13px; max-width: 520px; }
+.hero-actions { display: flex; gap: 8px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 18px 20px 20px;
+  margin-bottom: 16px;
+}
+.card h2 { font-size: 15px; margin: 0 0 4px; letter-spacing: .2px; }
+
+/*
+ * 分区小标题：用于「本地 Whisper 服务」「识别校正」这类**跨服务商共用**的区块。
+ * 带一条上分隔线，因为它们在视觉上不属于上面任何一个 data-panel。
+ */
+.card h4 {
+  font-size: 13px; margin: 20px 0 8px; padding-top: 14px;
+  border-top: 1px solid var(--line); color: var(--text); letter-spacing: .2px;
+}
+.card h4 .sub { font-weight: 400; font-size: 12px; color: var(--muted); margin-left: 8px; }
+
+.hint { color: var(--muted); font-size: 12.5px; margin: 6px 0 12px; }
+.hint code {
+  background: var(--card-2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 5px; font-size: 11.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px 16px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.field.wide { grid-column: 1 / -1; }
+.field > span { display: flex; align-items: center; gap: 6px; }
+.field a { color: var(--accent); text-decoration: none; font-size: 11.5px; }
+.field a:hover { text-decoration: underline; }
+.field b { color: var(--text); font-weight: 600; }
+
+input[type="text"], input[type="password"], input[type="number"], select, textarea {
+  background: var(--card-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 7px;
+  padding: 7px 9px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  width: 100%;
+  transition: border-color .15s, box-shadow .15s;
+}
+textarea { resize: vertical; line-height: 1.5; }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(74, 158, 255, .15); }
+input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; background: transparent; border: 0; }
+
+.panel {
+  display: none;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--line);
+}
+.panel.active { display: block; }
+
+.glossary-block {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--line);
+}
+.glossary-block h3 { font-size: 13.5px; margin: 0 0 4px; }
+
+.checks { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); }
+.check input { accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; }
+
+.actions { display: flex; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
+.result { font-size: 12.5px; color: var(--muted); }
+.result.ok { color: var(--ok); }
+.result.err { color: #ff9a9c; }
+
+.btn {
+  border: 1px solid var(--line);
+  background: var(--card-2);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: filter .15s, background .15s, border-color .15s;
+}
+.btn:hover { border-color: #3a4653; filter: brightness(1.1); }
+.btn:disabled { opacity: .55; cursor: default; filter: none; }
+.btn.primary { background: linear-gradient(180deg, var(--accent), var(--accent-2)); border-color: transparent; font-weight: 600; }
+.btn.ghost { background: transparent; }
+
+.toast {
+  position: fixed;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1f2a1f;
+  border: 1px solid rgba(53, 192, 122, .5);
+  color: #b9f3d3;
+  padding: 9px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  z-index: 999;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .5);
+}
+.toast.err { background: #2a1c1d; border-color: rgba(229, 72, 77, .5); color: #ffb3b5; }
+
+.foot {
+  display: flex; justify-content: space-between; align-items: center;
+  color: #5f6a78; font-size: 12px; padding: 0 4px;
+}
+.foot code {
+  background: var(--card-2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 1px 5px; font-size: 11.5px; font-family: ui-monospace, Menlo, monospace;
+}
