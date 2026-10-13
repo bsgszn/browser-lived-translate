@@ -238,7 +238,7 @@ Deepgram 在国内要代理才能注册和使用，直接卡死了大部分用�
 
 ### 方案 B：完全本地（推荐给折腾党，音频不出本机）
 
-**照着做就行。** 这条路**不需要装 Python、也不需要装任何东西** ——
+**照着做就行。** 这条路**不需要装 Python、不需要 pip、不需要命令行联网** ——
 要下的两个文件都在浏览器里下（看得见进度），命令行只用来**启动**服务。
 
 **第 1 步 · 下 whisper.cpp 的 Windows 包**
@@ -249,11 +249,29 @@ Deepgram 在国内要代理才能注册和使用，直接卡死了大部分用�
 > **⚠️ 别只看最上面那个"Latest"版本** —— 那个页面上的**正式版本往往不带附件**，
 > 二进制挂在标着 **nightly** 的那些构建里（比如 `b5454` 这种纯数字 tag）。
 > 往列表下面翻，找带 `.zip` 附件的那一条。
-> 下下来**解压到一个好找的地方**，比如 `D:\whisper\`，里面应该有 `whisper-server.exe`。
+> 下下来**解压到一个好找的地方**，比如 `D:\whisper\`。
 
-> ⚠️ **这一段是照官方仓库整理的，我们自己没在 Windows 上解压运行过。**
-> 如果你下下来的包里没有 `whisper-server.exe`（只有 `whisper-cli.exe` 之类），
-> 说明那个包不含服务端 —— 换一个附件，或者退到下面的 faster-whisper 那条路。
+> **⚠️ 解压完 exe 不在最外层** —— 它在一个叫 `Release` 的子文件夹里，配套的 DLL 也在那儿：
+>
+> ```
+> D:\whisper\                 ← 你解压出来的目录
+>   └─ Release\               ← ★ 后面两步都在这一层做
+>        whisper-server.exe
+>        ggml-base.dll · ggml.dll · SDL2.dll …（一堆 DLL）
+> ```
+>
+> **别把 exe 单独拖出来** —— 它和那些 DLL 放在一起才能跑。
+> 后面第 2、3 步说的"同一个目录"，指的都是这个 `Release\`。
+>
+> **这段里哪些是验过的、哪些不是：**
+>
+> - ✅ **验过** —— 包里有 `whisper-server.exe`；exe 在 `Release\` 子目录里（不在根目录）；
+>   文件名是 `whisper-bin-x64.zip`（约 8.5 MB）；包里自带 `ggml-base.dll` / `ggml.dll` / `SDL2.dll` 等一串 DLL。
+> - ❌ **没验过** —— 我们没有真的在 Windows 上解压并启动过它，也没跑过第 3 步那条完整命令。
+> - ⚠️ 自带那些 DLL **不等于"什么都不用装"** —— 如果启动时报缺 DLL，装一次
+>   [Microsoft Visual C++ 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe) 再试。
+> - 万一你下到的包里**没有** `whisper-server.exe`（只有 `whisper-cli.exe` 之类），
+>   说明那个附件不含服务端 —— 换一个带 `.zip` 的 nightly 附件，或退到下面折叠块里的 faster-whisper。
 
 **第 2 步 · 下模型，放进同一个目录**
 
@@ -262,19 +280,21 @@ Deepgram 在国内要代理才能注册和使用，直接卡死了大部分用�
 
 > - **⚠️ 国内下 HuggingFace 常常很慢或者连不上** —— 慢的话看下面折叠块里的「国内下载」。
 > - 不想等大模型：下 `ggml-small.bin`（约 466 MB）就行，质量差一些，但几分钟就能验证整条链路通不通。
-> - **放进第 1 步解压出来的那个目录**（和 `whisper-server.exe` 放一起）——
+> - **放进 `Release\` 里**（和第 1 步那个 `whisper-server.exe` 放在一起）——
 >   这样下一步那条命令不用写一长串路径。
 
 **第 3 步 · 起服务**
 
-在解压出来的那个目录里打开命令行（在文件夹空白处**右键 → 「在终端中打开」**，或按住 Shift 右键 → 「在此处打开 PowerShell 窗口」），然后跑：
+**先进第 1 步那个 `Release\` 文件夹**，在它里面打开命令行（在文件夹空白处**右键 → 「在终端中打开」**，或按住 Shift 右键 → 「在此处打开 PowerShell 窗口」），然后跑：
 
 ```bash
 whisper-server.exe -m ggml-large-v3.bin -l ja --inference-path /v1/audio/transcriptions --host 127.0.0.1 --port 8080
 ```
 
 > - **这个窗口别关** —— 关掉服务就停了。（`-l ja` 是日语；识别中文就换 `-l zh`。）
-> - 模型不在同一个目录时，`-m` 后面要写**你实际放它的完整路径**，不是文件名。
+> - 模型**没**放在 `Release\` 里时，`-m` 后面要写**你实际放它的完整路径**（比如 `-m D:\models\ggml-large-v3.bin`），不是文件名。
+> - **如果报「不是内部或外部命令」**：多半是当前目录不对 —— 你现在应该站在 `Release\` 里，
+>   敲 `dir whisper-server.exe` 能列出来才对。
 > - `--inference-path /v1/audio/transcriptions` 是**故意**加的：这个服务默认挂在 `/inference` 上，
 >   而扩展要的是 OpenAI 兼容路径。加了它，下一步的地址才填 `/v1` 结尾。
 
@@ -351,8 +371,9 @@ whisper-server.exe -m D:\models\ggml-large-v3.bin -l ja --inference-path /v1/aud
 | 用 `--inference-path /v1/audio/transcriptions`（上面那条命令就是） | `http://127.0.0.1:8080/v1` |
 | 直接挂在 `/audio/transcriptions`（有些服务默认如此） | `http://127.0.0.1:8080` |
 
-**怎么判断**：浏览器打开「你打算填的地址 + `/audio/transcriptions`」，或者打开它的 `/models` ——
-哪个前缀下能通就填哪个。
+**怎么判断**：**别用浏览器去看** —— 那条路径只接受 POST，浏览器打开只会报错，
+分不清是"路径不存在"还是"方法不对"。**直接用扩展里的「测试识别连接」按钮**，
+它真的发一次请求；报「未找到文件」就换另一个前缀再试。
 
 </details>
 
