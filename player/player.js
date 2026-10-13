@@ -393,9 +393,35 @@ async function startCapture() {
   }, 300);
   setTimeout(() => {
     clearInterval(waitPlaying);
-    // ⚠️ 被自动播放策略拒绝时，那个「开始播放」按钮是**唯一的恢复途径**，绝不能收掉。
-    // 否则用户面对的就是一个看不出任何原因的静止画面。
-    if (!playback?.playBlocked) hideOverlay();
+    /**
+     * ⚠️ 只有「真的开始播了」或「被自动播放策略拒了」才允许收遮罩。
+     *
+     * 原来这里写的是 `if (!playback?.playBlocked) hideOverlay()` ——
+     * **而 `playBlocked` 只表示"play() 被拒了"。「压根没走到播放」时它同样是 false**，
+     * 于是遮罩照样被收掉，用户面对的是**黑屏 + 零提示**。
+     *
+     * 实测踩到的场景（用户的真实日志）：**源画面静止 → tabCapture 一帧都不给**
+     *   `缓冲 · 前方 0.0s · 见底 0 次 · 掉帧 0/0`、`输入电平 0.0000`，33 秒一次没涨。
+     * 于是 `bufferedEnd()` 一直是 null → `_tick()` 早早 return → `locked` 从没置真 →
+     * `play()` 压根没被调用 → `playBlocked` 保持 false → **遮罩被这一行收掉**。
+     * 用户只看到黑屏，完全不知道是"采集没数据"还是"播放被拒"。
+     *
+     * 现在：留着遮罩，**并把实际读数写出来** —— 下一个遇到的人一眼就能分辨。
+     */
+    if (playback?.locked || playback?.playBlocked) {
+      hideOverlay();
+      return;
+    }
+    const ahead = Number.isFinite(playback?.bufferAheadSec) ? `${playback.bufferAheadSec.toFixed(1)}s` : '—';
+    const total = playback?.totalFrames || 0;
+    const dropped = playback?.droppedFrames || 0;
+    const stalls = playback?.stallCount || 0;
+    showOverlay(
+      '还没收到画面数据…',
+      `已等 15 秒 · 缓冲 ${ahead} · 收到 ${total} 帧（掉 ${dropped}） · 见底 ${stalls} 次。` +
+        '通常是来源画面静止、或那个标签页没有画面输出 —— 让它动起来试试。',
+      '',
+    );
   }, 15000);
 
   void chrome.runtime

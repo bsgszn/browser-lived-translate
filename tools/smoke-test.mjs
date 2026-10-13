@@ -5266,5 +5266,48 @@ check('能创建 ASR 会话的页面必须引入 onnxruntime（否则本地 VAD 
   }
 });
 
+check('播放压根没开始过时，遮罩不许被收掉（否则黑屏 + 零提示）', () => {
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const at = pj.indexOf('}, 15000)');
+  if (at < 0) throw new Error('找不到 15000 那个兜底');
+  // 往前取足够长的一段（那个 setTimeout 的回调体）
+  const body = pj.slice(Math.max(0, at - 1600), at);
+  /**
+   * ⚠️ 真实事故（用户的实测日志）：源画面静止 → tabCapture 一帧都不给 →
+   * bufferedEnd() 一直是 null → _tick() 早早 return → locked 从没置真 →
+   * play() 压根没被调用 → playBlocked 保持 false →
+   * 而这里原来写的是 `if (!playback?.playBlocked) hideOverlay()`，
+   * **于是遮罩被收掉，用户面对黑屏 + 零提示。**
+   *
+   * 关键在于：playBlocked 只表示"play() 被拒了"，
+   * 「被拒」和「压根没走到播放」是两件事，而它对两者都是 false。
+   */
+  if (!/playback\?\.locked/.test(body)) {
+    throw new Error('那个 15 秒兜底没有检查 playback.locked —— 「没走到播放」时遮罩会被误收');
+  }
+  if (!/playback\?\.playBlocked/.test(body)) {
+    throw new Error('那个 15 秒兜底没有检查 playback.playBlocked —— 被拒时不该收遮罩');
+  }
+  // 留着遮罩时必须把读数写出来，否则用户仍然无从判断
+  if (!/showOverlay\(/.test(body)) {
+    throw new Error('留着遮罩时没有写原因/读数 —— 用户还是只能看到一个黑屏');
+  }
+  for (const kw of ['bufferAheadSec', 'totalFrames', 'droppedFrames', 'stallCount']) {
+    if (!body.includes(kw)) throw new Error(`遮罩里没显示 ${kw} —— 少了能自诊断的数字`);
+  }
+});
+
+check('那句关于 SharedArrayBuffer 的注释必须是准确的（它误导过一次排查）', () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8');
+  // 实测结论：这个 WASM 的 memory import 声明为 shared，所以 SAB 是必需的，
+  // 与 numThreads 无关；扩展页面天然就有 SAB、不需要 COEP/COOP。
+  if (!/必需/.test(src)) {
+    throw new Error('vad.js 里没有说明「SharedArrayBuffer 是必需的」—— 那句错的注释可能被改回来了');
+  }
+  if (/省掉 SharedArrayBuffer/.test(src)) {
+    throw new Error('又出现了「省掉 SharedArrayBuffer 的要求」这种错误说法');
+  }
+});
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
