@@ -235,72 +235,82 @@ Deepgram 在国内要代理才能注册和使用，直接卡死了大部分用�
 3. **翻译** → 翻译服务选 `Google 翻译（免 Key 通道）`，目标语言选 `简体中文`
 4. 点「测试识别连接」看到成功提示 → 保存
 5. 打开一个有声音的页面（YouTube / B站 / 播客 / 线上会议），点扩展图标 → **开始同声传译**
+### 方案 B：完全本地（音频不出本机）
 
-### 方案 B：完全本地（推荐给折腾党，音频不出本机）
+**把识别服务跑在你自己机器上** —— 音频不出本机，也不用装 Python、不用 pip、不用命令行联网。
+要下的两个文件都在**浏览器里**下（看得见进度），命令行只用来**启动**服务。
 
-**照着做就行。** 这条路**不需要装 Python、不需要 pip、不需要命令行联网** ——
-要下的两个文件都在浏览器里下（看得见进度），命令行只用来**启动**服务。
+> **作者自己用的就是这个。**
 
 **第 1 步 · 下 whisper.cpp 的 Windows 包**
 
-去 [whisper.cpp 的 releases 页](https://github.com/ggml-org/whisper.cpp/releases) 找 **Windows 预编译包**
-（文件名形如 `whisper-bin-x64.zip`）。
+去 [whisper.cpp 的 releases 页](https://github.com/ggml-org/whisper.cpp/releases) 下载
+**`whisper-bin-x64.zip`**（约 8.5 MB），解压到一个好找的地方，比如 `D:\whisper\`。
 
-> **⚠️ 别只看最上面那个"Latest"版本** —— 那个页面上的**正式版本往往不带附件**，
-> 二进制挂在标着 **nightly** 的那些构建里（比如 `b5454` 这种纯数字 tag）。
+> **⚠️ 别只看最上面那个 "Latest"** —— 正式版本的附件列表**常常是空的**，
+> 二进制挂在标着 **nightly** 的构建里（tag 是 `b5454` 这种纯数字）。
 > 往列表下面翻，找带 `.zip` 附件的那一条。
-> 下下来**解压到一个好找的地方**，比如 `D:\whisper\`。
 
-> **⚠️ 解压完 exe 不在最外层** —— 它在一个叫 `Release` 的子文件夹里，配套的 DLL 也在那儿：
+**⚠️ 解压完 exe 不在最外层** —— 它在一个叫 `Release` 的子文件夹里，配套的 DLL 也在那儿：
+
+```
+D:\whisper\                 ← 你解压出来的目录
+  └─ Release\               ← ★ 后面两步都在这一层里做
+       whisper-server.exe
+       ggml-base.dll · ggml.dll · SDL2.dll …（一堆 DLL）
+```
+
+**别把 exe 单独拖出来** —— 它要和那些 DLL 待在一起才能跑。后面说的"同一个目录"，
+指的都是这个 `Release\`。
+
+> **这段里哪些是验过的：**
 >
-> ```
-> D:\whisper\                 ← 你解压出来的目录
->   └─ Release\               ← ★ 后面两步都在这一层做
->        whisper-server.exe
->        ggml-base.dll · ggml.dll · SDL2.dll …（一堆 DLL）
-> ```
->
-> **别把 exe 单独拖出来** —— 它和那些 DLL 放在一起才能跑。
-> 后面第 2、3 步说的"同一个目录"，指的都是这个 `Release\`。
->
-> **这段里哪些是验过的、哪些不是：**
->
-> - ✅ **验过** —— 包里有 `whisper-server.exe`；exe 在 `Release\` 子目录里（不在根目录）；
+> - ✅ **验过** —— 包里确实有 `whisper-server.exe`；它在 `Release\` 子目录里（不在根目录）；
 >   文件名是 `whisper-bin-x64.zip`（约 8.5 MB）；包里自带 `ggml-base.dll` / `ggml.dll` / `SDL2.dll` 等一串 DLL。
 > - ❌ **没验过** —— 我们没有真的在 Windows 上解压并启动过它，也没跑过第 3 步那条完整命令。
-> - ⚠️ 自带那些 DLL **不等于"什么都不用装"** —— 如果启动时报缺 DLL，装一次
+> - ⚠️ 自带那些 DLL **不等于"什么都不用装"** —— 启动时报缺 DLL 的话，装一次
 >   [Microsoft Visual C++ 运行库](https://aka.ms/vs/17/release/vc_redist.x64.exe) 再试。
-> - 万一你下到的包里**没有** `whisper-server.exe`（只有 `whisper-cli.exe` 之类），
->   说明那个附件不含服务端 —— 换一个带 `.zip` 的 nightly 附件，或退到下面折叠块里的 faster-whisper。
+> - 万一下到的包里**没有** `whisper-server.exe`（只有 `whisper-cli.exe` 之类），
+>   说明那个附件不含服务端 —— 换一个带 `.zip` 的 nightly 附件，或者退到下面折叠块里的 faster-whisper。
 
-**第 2 步 · 下模型，放进同一个目录**
+**第 2 步 · 下模型，放进 `Release\`**
 
-到 HuggingFace 的 [`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp) 仓库下
-**`ggml-large-v3.bin`**（约 2.9 GB）—— **只需要这一个文件**。
+**⚠️ whisper.cpp 不会自己下模型** —— 得你手动去拿。到 HuggingFace 的
+[`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp) 仓库下**一个** `.bin` 文件：
 
-> - **⚠️ 国内下 HuggingFace 常常很慢或者连不上** —— 慢的话看下面折叠块里的「国内下载」。
-> - 不想等大模型：下 `ggml-small.bin`（约 466 MB）就行，质量差一些，但几分钟就能验证整条链路通不通。
-> - **放进 `Release\` 里**（和第 1 步那个 `whisper-server.exe` 放在一起）——
->   这样下一步那条命令不用写一长串路径。
+| 文件 | 大小 | 什么时候选它 |
+|---|---|---|
+| `ggml-large-v3.bin` | 约 2.9 GB | 质量最好，机器也够 —— **默认就下这个** |
+| `ggml-large-v3-turbo.bin` | 约 1.5 GB | **不想等 2.9 GB 就用这个** —— 体积不到一半，质量接近 large-v3 |
+| `ggml-medium.bin` | 约 1.5 GB | 同上，另一个选择 |
+| `ggml-small.bin` | 约 466 MB | 只想先验证整条链路通不通 |
+
+下好**放进 `Release\`**（和第 1 步那个 `whisper-server.exe` 放一起）——
+这样下一步那条命令不用写一长串路径。
+
+> **⚠️ 国内下 HuggingFace 常常很慢或者连不上** —— 慢的话看下面折叠块里的「国内下载模型」。
+> 这一步**用浏览器下就行**，不依赖命令行联网。
 
 **第 3 步 · 起服务**
 
-**先进第 1 步那个 `Release\` 文件夹**，在它里面打开命令行（在文件夹空白处**右键 → 「在终端中打开」**，或按住 Shift 右键 → 「在此处打开 PowerShell 窗口」），然后跑：
+**先进第 1 步那个 `Release\` 文件夹**，在里面打开命令行（在文件夹空白处**右键 →「在终端中打开」**，
+或者按住 Shift 右键 →「在此处打开 PowerShell 窗口」），然后照抄这一行：
 
 ```bash
 whisper-server.exe -m ggml-large-v3.bin -l ja --inference-path /v1/audio/transcriptions --host 127.0.0.1 --port 8080
 ```
 
-> - **这个窗口别关** —— 关掉服务就停了。（`-l ja` 是日语；识别中文就换 `-l zh`。）
-> - 模型**没**放在 `Release\` 里时，`-m` 后面要写**你实际放它的完整路径**（比如 `-m D:\models\ggml-large-v3.bin`），不是文件名。
-> - **如果报「不是内部或外部命令」**：多半是当前目录不对 —— 你现在应该站在 `Release\` 里，
->   敲 `dir whisper-server.exe` 能列出来才对。
+> - **这个窗口别关** —— 关掉服务就停了。
+> - `-l ja` 是日语；识别中文换成 `-l zh`。
+> - **模型没放在 `Release\` 里**的话，`-m` 后面要写**你实际放它的完整路径**
+>   （比如 `-m D:\models\ggml-large-v3.bin`），不是文件名。
+> - **报「不是内部或外部命令」** → 多半是当前目录不对。敲 `dir whisper-server.exe`，
+>   能列出来才说明你站在 `Release\` 里。
 > - `--inference-path /v1/audio/transcriptions` 是**故意**加的：这个服务默认挂在 `/inference` 上，
->   而扩展要的是 OpenAI 兼容路径。加了它，下一步的地址才填 `/v1` 结尾。
+>   而扩展要的是 OpenAI 兼容路径。加了它，下一步的地址才是 `/v1` 结尾。
 
-**怎么知道服务起来了**：启动后那个命令行窗口会打印加载模型的日志，**窗口不报错、停在那儿不动**
-就是起好了。真正确认用下一步的「测试识别连接」—— **那个按钮会真的发一次请求**，
-比这里的任何说法都可靠。
+**怎么知道服务起来了**：启动后那个窗口会打印加载模型的日志。**窗口不报错、停在那儿不动**就是起好了。
+真正确认用下一步的「测试识别连接」—— **那个按钮会真的发一次请求**，比这里的任何说法都可靠。
 
 **第 4 步 · 在扩展里填地址**
 
@@ -308,22 +318,24 @@ whisper-server.exe -m ggml-large-v3.bin -l ja --inference-path /v1/audio/transcr
 2. **服务地址**填 `http://127.0.0.1:8080/v1`
 3. 点「测试识别连接」看到成功提示 → 保存
 
-> **⚠️ 如果报「未找到文件」或者 404**：那是地址前缀多了一段、或者少了一段 ——
-> 把 `/v1` 去掉再试一次（填 `http://127.0.0.1:8080`），两个都试一下就知道哪个对。
+> **⚠️ 报「未找到文件」或者 404** —— 那是地址前缀多了一段或少了一段：
+> 把 `/v1` 去掉再试一次（填 `http://127.0.0.1:8080`）。**两个都试一下就知道哪个对。**
 > **这时候服务本身是好的**，不用去重装。
 
+**断句仍然在浏览器里做** —— 和上面那个服务无关，用的是同一套 Silero VAD 引擎。
+所以设置页那块 VAD 面板（「语速档位」和几个断句旋钮）对它一样有效，细节见本节后面。
+
 <details>
-<summary><b>国内下载慢 · 想改用 faster-whisper · 想搞清楚地址为什么有时要带 /v1 —— 点开</b></summary>
+<summary><b>国内下载慢 · 想改用 faster-whisper · 地址到底填到哪为止 —— 点开</b></summary>
 
 #### 国内下载模型
 
 HuggingFace 在国内常常很慢或者不通。两条路分开说：
 
-- **主线（whisper.cpp）用浏览器下** —— 直接在镜像站网页上点着下就行，
-  或者用任何下载工具。**这一步不依赖命令行联网**，所以不受下面那条限制。
+- **主线（whisper.cpp）用浏览器下** —— 在镜像站网页上点着下就行，或者用任何下载工具。
+  **这一步不依赖命令行联网**，所以不受下面那条限制。
 - **只有走 faster-whisper（它自己从 HuggingFace 拉模型）时**，才需要用镜像端点 ——
-  设一个环境变量再启动服务（**hf-mirror 自己的文档就是这么写的，
-  这条路我们没实测过，是照它的文档写的**）：
+  设一个环境变量再启动服务（**hf-mirror 自己的文档就是这么写的，这条路我们没实测过**）：
 
 ```powershell
 $env:HF_ENDPOINT = "https://hf-mirror.com"
@@ -337,7 +349,7 @@ $env:HF_ENDPOINT = "https://hf-mirror.com"
    **⚠️ 安装第一屏一定要勾上「Add Python to PATH」** —— 不勾的话下一步会报
    「'pip' 不是内部或外部命令」，而且装完了还是同一个错，很容易以为是扩展的问题。
 2. `pip install faster-whisper-server`（国内 pip 可能慢，可以换源）
-3. 起服务，**模型它会自己从 HuggingFace 下**：
+3. 起服务 —— **模型它会自己从 HuggingFace 下**：
 
 ```bash
 faster-whisper-server --model large-v3 --port 8000
@@ -347,18 +359,6 @@ faster-whisper-server --model large-v3 --port 8000
 > 国内连 HuggingFace 常失败 → 见上面的「国内下载模型」。
 > 地址那一栏填 `http://127.0.0.1:8000/v1`（端口是 **8000**，和 whisper.cpp 那条的 8080 不一样）。
 > 起没起来用扩展的「测试识别连接」确认 —— 它真的发一次请求。
-
-#### 改用 whisper.cpp（作者用的就是这个）
-
-**⚠️ whisper.cpp 完全不自动下载模型** —— 得你自己拿 ggml 文件：
-
-- 模型在 HuggingFace 的 [`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp) 仓库，
-  文件名形如 `ggml-large-v3.bin`（还有 `ggml-large-v3-turbo.bin` 约 1.5 GB、`ggml-medium.bin` 等）。
-- ⚠️ `-m` 后面必须是**你实际放模型的那个路径**，不是文件名：
-
-```bash
-whisper-server.exe -m D:\models\ggml-large-v3.bin -l ja --inference-path /v1/audio/transcriptions --host 127.0.0.1 --port 8080
-```
 
 #### 地址到底填到哪为止
 
