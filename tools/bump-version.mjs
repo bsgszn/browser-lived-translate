@@ -84,7 +84,18 @@ try {
   console.log(`\n已自动存档：${r.dirName}`);
   console.log(`  ${r.files} 个文件，${(r.bytes / 1024).toFixed(0)} KB（node tools/snapshot.mjs --list 可列出全部）`);
 } catch (e) {
-  console.log(`\n⚠️ 自动存档失败（版本号已经改好了，不受影响）：${e?.message || e}`);
+  /**
+   * ⚠️ 这里**必须把话说重**。以前只打一行「⚠️ 自动存档失败（版本号已经改好了，不受影响）」，
+   * 在长输出里一滚就过去了 —— 而快照是**这个项目唯一的回退手段**，没存上是要紧事。
+   *
+   * 这条消息之所以存在，是因为真的出过事：`createSnapshot` 中途抛错、残留半个目录，
+   * 而这里把错误吞成一行 ⚠️ —— 磁盘上于是留下一份"2 个文件、没有 manifest.json"的
+   * 残缺快照，看起来像成功了。现在 snapshot.mjs 保证失败必清理，这里保证失败能被看见。
+   */
+  console.log(`\n⚠️⚠️ 自动存档失败 —— **这次没有存下任何快照**`);
+  console.log(`   原因：${e?.message || e}`);
+  console.log(`   版本号已经改好了（不受影响），但历史版本里会缺这一份。`);
+  console.log(`   可以稍后手动补：node tools/snapshot.mjs release`);
 }
 
 // 顺便提交一次，这样每个版本号在 git 里都有一个带说明的提交。

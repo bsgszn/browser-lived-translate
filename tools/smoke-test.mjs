@@ -5541,5 +5541,69 @@ check('画面延迟下限必须是 3 秒，而且老用户 storage 里的旧值�
   if (!/DELAY_MIN_SEC/.test(pj)) throw new Error('player.js 没有引用 DELAY_MIN_SEC —— 兜底会退回旧值');
 });
 
+check('快照完整性自检：残缺快照必须被抓到，完好快照不许误报（快照是唯一的回退手段）', () => {
+  /**
+   * ⚠️ 这条断言是被两次真实事故逼出来的：
+   *   ① createSnapshot 在复制循环中途抛错时不清理，bump-version 又把错吞成一行 ⚠️
+   *      → 磁盘上留下「2 个文件、没有 manifest.json」的残缺快照，看起来像成功了。
+   *      **而快照是这个项目唯一的回退手段** —— 等真要回退时才发现是坏的。
+   *   ② 有人另写了一份完整性检查，判据是**顶层**文件数 ≥ 40，
+   *      而快照的文件大多在子目录里（顶层只有 7 个）→ 103 份**完好**的快照全被判成坏，
+   *      删除循环把 5 份真快照删了。**检查写错比没有检查更危险。**
+   *
+   * 所以这里验两件事：**递归能覆盖子目录** + **拿源目录对齐、不用魔数**。
+   */
+  const snap = loaded['tools/snapshot.mjs'];
+  if (typeof snap.verifySnapshot !== 'function') throw new Error('没有 verifySnapshot —— 自检不存在');
+
+  const tmp = path.join(process.cwd(), '.snapchk-tmp');
+  fs.rmSync(tmp, { recursive: true, force: true });
+  try {
+    // 造一份「完好」的：按源目录清单建同构文件
+    const all = snap.listFiles(process.cwd()).filter((f) => !f.startsWith('.snapchk-tmp'));
+    const body = all.filter((f) => f !== 'manifest.json');
+    for (const rel of body) {
+      const to = path.join(tmp, rel);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.writeFileSync(to, 'x');
+    }
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), '{}');
+
+    const okRes = snap.verifySnapshot(tmp, all);
+    if (!okRes.ok) throw new Error(`完好快照被误报：缺 ${okRes.missing.slice(0, 3).join('、')}`);
+
+    // ① 删掉 manifest.json → 必须抓到
+    fs.rmSync(path.join(tmp, 'manifest.json'));
+    if (snap.verifySnapshot(tmp, all).ok) throw new Error('少了 manifest.json 却没抓到');
+    fs.writeFileSync(path.join(tmp, 'manifest.json'), '{}');
+
+    // ② 只删一个**子目录**里的文件 → 必须抓到（顶层计数会漏掉这条）
+    const deep = body.find((f) => f.includes(path.sep) || f.includes('/'));
+    if (!deep) throw new Error('测试前提不成立：源目录里没有子目录文件');
+    fs.rmSync(path.join(tmp, deep));
+    const r2 = snap.verifySnapshot(tmp, all);
+    if (r2.ok) throw new Error(`少了子目录文件 ${deep} 却没抓到 —— 判据不是递归的`);
+
+    // ③ 判据必须拿**源目录**对齐，不能是魔数
+    if (r2.expected !== all.length) {
+      throw new Error(`期望值应当等于源目录清单长度 ${all.length}，实际 ${r2.expected}`);
+    }
+
+    // ④ 失败必须**清理**，不留残骸 —— 这要靠读 createSnapshot 的源码确认
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'tools', 'snapshot.mjs'), 'utf8'));
+    const fn = src.slice(src.indexOf('export function createSnapshot'));
+    if (!/catch\s*\(e\)\s*\{[\s\S]{0,400}rmSync\(dest/.test(fn)) {
+      throw new Error('createSnapshot 失败时没有清理残留目录 —— 会留下残缺快照');
+    }
+    // ⑤ 存完必须自检
+    if (!/verifySnapshot\(dest/.test(fn)) {
+      throw new Error('createSnapshot 存完没有自检 —— 复制的循环没抛错不等于存全了');
+    }
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);

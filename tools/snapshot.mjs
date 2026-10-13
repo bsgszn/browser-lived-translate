@@ -58,6 +58,36 @@ function readVersion() {
   }
 }
 
+/**
+ * 快照完整性判据 —— **只此一处**，别在别处另写一套。
+ *
+ * ⚠️ 这份判据是被两次真实事故逼出来的：
+ *   ① `createSnapshot` 在复制循环中途抛错时不清理 —— 残留半个目录
+ *      而 `bump-version` 捕获后只打一行 ⚠️（长输出里一滚就过去）
+ *      → 磁盘上留下"2 个文件 / 6 个文件、没有 manifest.json"的残缺快照，
+ *        用户以为存好了，等真要回退时才发现是坏的。
+ *      **快照是这个项目唯一的回退手段**，所以这条必须挡住。
+ *   ② 有人另写了一份"完整性检查"，判据是**顶层文件数 ≥ 40** ——
+ *      而快照里 `lib/`、`player/` 都是**子目录**，顶层只有 7 个文件
+ *      → 103 份**完好**的快照全被判成"坏"，删除循环把 5 份真快照删掉了。
+ *
+ * 所以这里的判据有两条硬要求：
+ *   - **必须递归**（用 listFiles，不是 readdirSync 顶层）
+ *   - **不能靠魔数**：拿"源目录该有哪些文件"当基准逐个对齐，
+ *     少一个就是残缺。这样文件数变了它自己跟着变，不会腐坏。
+ */
+export function verifySnapshot(dest, expected = null) {
+  const want = expected || listFiles(ROOT);
+  const got = listFiles(dest);
+  const missing = want.filter((rel) => !got.includes(rel));
+  return {
+    ok: missing.length === 0,
+    files: got.length,
+    expected: want.length,
+    missing,
+  };
+}
+
 function stamp(d = new Date()) {
   const p = (n) => String(n).padStart(2, '0');
   return (
@@ -134,7 +164,7 @@ export function safeLabel(label) {
   return String(label ?? '').replace(/[^\w\u4e00-\u9fa5.-]/g, '') || 'auto';
 }
 
-/** 存一份快照。返回 {dirName, dest, files, bytes}；失败会抛。 */
+/** 存一份快照。返回 {dirName, dest, files, bytes}；失败会抛，**并且一定不留残骸**。 */
 export function createSnapshot(label = 'auto') {
   const safe = safeLabel(label);
   const version = readVersion();
@@ -144,12 +174,34 @@ export function createSnapshot(label = 'auto') {
   fs.mkdirSync(dest, { recursive: true });
   const files = listFiles(ROOT);
   let bytes = 0;
-  for (const rel of files) {
-    const from = path.join(ROOT, rel);
-    const to = path.join(dest, rel);
-    fs.mkdirSync(path.dirname(to), { recursive: true });
-    fs.copyFileSync(from, to);
-    bytes += fs.statSync(from).size;
+  try {
+    for (const rel of files) {
+      const from = path.join(ROOT, rel);
+      const to = path.join(dest, rel);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.copyFileSync(from, to);
+      bytes += fs.statSync(from).size;
+    }
+    /**
+     * ⚠️ 存完必须自检 —— 这是补上那次事故的关键一步。
+     * 光靠"复制循环没抛错"是不够的（比如某个文件被跳过、或者源目录在循环
+     * 期间变了）；而**残缺的快照比没有快照更危险**，因为它看起来是成功的。
+     */
+    const v = verifySnapshot(dest, files);
+    if (!v.ok) {
+      throw new Error(
+        `快照不完整：应有 ${v.expected} 个文件，实际 ${v.files} 个，缺 ${v.missing.length} 个` +
+          `（前几个：${v.missing.slice(0, 3).join('、')}）`
+      );
+    }
+  } catch (e) {
+    // 留半份比不留更糟 —— 用户会以为存好了。清掉再抛。
+    try {
+      fs.rmSync(dest, { recursive: true, force: true });
+    } catch {
+      /* 清理失败也要把原始错误抛出去 */
+    }
+    throw e;
   }
   writeIndex();
   return { dirName, dest, files: files.length, bytes, version };
@@ -182,6 +234,39 @@ function main() {
   if (pruneAt >= 0) {
     const n = pruneSnapshots(parseInt(args[pruneAt + 1], 10) || 20);
     console.log(`已删除 ${n} 份旧快照。`);
+    return;
+  }
+
+  /**
+   * 完整性体检。
+   *
+   * ⚠️ 存在的理由：曾经有人手写了一份"完整性检查"，判据是**顶层**文件数 ≥ 40，
+   * 而快照的文件大多在子目录里（顶层只有 7 个）→ 103 份**完好**的快照全被判成坏的，
+   * 然后被删除循环删掉了 5 份。**检查本身写错比没有检查更危险。**
+   * 所以这里用唯一那份判据（verifySnapshot，递归 + 拿源目录对齐）。
+   */
+  if (args.includes('--verify')) {
+    const items = listSnapshots();
+    if (!items.length) {
+      console.log('还没有任何快照。');
+      return;
+    }
+    const want = listFiles(ROOT);
+    let bad = 0;
+    for (const it of items) {
+      const v = verifySnapshot(path.join(STORE, it.dir), want);
+      if (!v.ok) {
+        bad += 1;
+        console.log(
+          `  ✗ ${it.dir}  —— 应有 ${v.expected} 个文件，实际 ${v.files} 个，缺 ${v.missing.length} 个`
+        );
+      }
+    }
+    console.log(
+      `\n共 ${items.length} 份快照，不完整 ${bad} 份。` +
+        (bad ? '\n⚠️ 不完整的快照**不能用来回退**，建议删掉重存。' : '')
+    );
+    process.exitCode = bad ? 1 : 0;
     return;
   }
 
