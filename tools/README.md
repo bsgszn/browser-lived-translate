@@ -153,6 +153,21 @@ OFFSCREEN_START → getUserMedia 约束 → AudioWorklet 加载 → 分析支路
 配合 `.gitattributes` 里的 `* text=auto eol=lf`，行尾锁死 LF，
 否则 Windows 上每次提交都会显示"整个文件都改了"。
 
+#### ⚠️ 发布之后：不要重写历史
+
+首次公开发布（v2.60.0）时，历史被**刻意压成过一条提交** —— 目的是去掉开发史、旧截图、
+本机路径，让第一次见到这个仓库的人是干净的。
+
+**那次之后不要再 `--amend`、不要再 `--force`。** 改动一律**新增提交**，用普通 `git push`。
+
+理由：Release 已经发出去了，继续重写已发布的历史，会给 clone / fork 过的人造成冲突。
+（这个项目在 v2.60.0 之后又 amend 过六次、force push 了三次，才把这条定下来 ——
+每一次都是一次"重写公开历史"的机会。）
+
+连带的一条：`node tools/bump-version.mjs` **会自动提交**。
+以前为了让"发布只有一条提交"，每次都要 `git reset --soft HEAD~1` 再 amend 回去 ——
+**现在不用了，让它留着那条提交就行。**
+
 ### `_versions` 快照
 
 **这台机器上没有 git**（后来才装的便携版），而这个扩展被反复大改过。有一次需要
@@ -188,6 +203,35 @@ robocopy ..\_versions\<目录名> . /MIR /XD node_modules .git
 
 2. **静态检查要先剥注释。** 注释里出现 `execFileSync` / `new AudioWorkletNode` 这类词
    会让正则检查误报。这个项目因为不剥注释产生过三次假阳性。
+
+## ⚠️ 不要用 PowerShell 往返文本
+
+**这个项目被同一类问题咬了四次，四个不同的人踩过 —— 同一个根因，四个不同的入口：**
+
+| 入口 | 默认编码 | 后果（都真实发生过） |
+|---|---|---|
+| `Set-Content` | **GBK** | 中文全变乱码，README 从 1283 行掉到 874 行 |
+| `Set-Content` | GBK | 又一次 |
+| `Set-Content` | GBK | 又一次 |
+| `>` 重定向 | **UTF-16LE** | `git log … > msg.txt` 读回来是 `��v 2 . 6 5 . 0` |
+
+**规矩：改文件、读命令输出，一律走 Node + 显式 `utf8`。**
+
+```js
+const fs = require('fs');
+const s = fs.readFileSync(p, 'utf8');   // ← 显式 utf8，别省
+fs.writeFileSync(p, s, 'utf8');         // ← 同上
+```
+
+**不要用** PowerShell 的 `Set-Content` / `Out-File` / `>` / `>>` **往返任何含中文的文本**。
+
+### 还有一条相关的：`node -e` 里的 `${}` 会被 PowerShell 吃掉
+
+PowerShell 会把内联 `node -e "…${var}…"` 里的 `${}` 当成自己的变量引用，
+导致脚本报 `Expected ',', got '<eof>'` 之类的语法错。这个坑也踩过不止一次。
+
+**所以稍复杂一点的脚本，写成 `.cjs` 文件再 `node xxx.cjs` 跑**，不要硬扛内联字符串。
+（`.mjs` 里没有 `require`，要用 `import`；这类小脚本用 `.cjs` 最省事。）
 
 ## 改版本号
 
