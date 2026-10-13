@@ -381,14 +381,54 @@ function updateGlossaryHint() {
   $('glossaryHint').textContent = notes.join(' ');
 }
 
+/**
+ * `data-panel` 是**空格分隔的 id 列表**，不是单个 id。
+ *
+ * ⚠️ 为什么需要多个：断句由浏览器内的 Silero VAD 做，而**不止一个识别服务**用它 ——
+ * 「本地 VAD 断句」（backend 默认 whisper）和「阿里云百炼」（`dashscope.js` 复用
+ * `vad.js` 的 `createSession`，只把 backend 换成 dashscope）**是同一套断句引擎**。
+ *
+ * 踩过的坑：原来这里是 `panel.dataset.panel === asrId`（精确匹配单个 id），
+ * 于是选中「阿里云百炼」时，装着「语速档位 / 静音确认 / 收句静音 / 最短话段 /
+ * 单句上限 / 前后留白 / 判定阈值 / 自动增益档位」的那个面板**整块消失** ——
+ * 而那些旋钮对阿里**照样生效**（切句还在浏览器里做）。
+ * 用户的原话是「我就是想问这个 我看不到了」。
+ */
+function panelShown(panel, id) {
+  return (panel.dataset.panel || '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .includes(id);
+}
+
+/**
+ * 面板里有些文案**只对其中一个 backend 成立** ——
+ * 比如「把完整的一句交给**本地 Whisper**」在选阿里时是错的
+ *（阿里用的是 DashScope 的 HTTP 接口，压根没有"本地 Whisper 服务"那回事）。
+ *
+ * 所以这些块带 `data-backend="whisper"` / `data-backend="dashscope"`，按当前 backend 显隐。
+ * **公共说明不加属性，两边都显示。**
+ *
+ * ⚠️ backend 的判定与 `lib/asr/vad.js` 的 `config.backend || 'whisper'` 对齐；
+ * 复用 VAD 引擎的服务由各自 adapter 设 backend（见 `lib/asr/dashscope.js`）。
+ * 这一处和 smoke-test 里那条"VAD 支撑的服务必须能看到 VAD 旋钮"的断言是同一条规则的两种写法。
+ */
+function currentVadBackend() {
+  return $('asrProvider').value === 'dashscope' ? 'dashscope' : 'whisper';
+}
+
 function syncPanels() {
   const asrId = $('asrProvider').value;
   for (const panel of document.querySelectorAll('#cardAsr .panel')) {
-    panel.classList.toggle('active', panel.dataset.panel === asrId);
+    panel.classList.toggle('active', panelShown(panel, asrId));
+  }
+  const backend = currentVadBackend();
+  for (const el of document.querySelectorAll('#cardAsr [data-backend]')) {
+    el.hidden = el.dataset.backend !== backend;
   }
   const trId = $('tr-provider').value;
   for (const panel of document.querySelectorAll('#cardTranslate .panel')) {
-    panel.classList.toggle('active', panel.dataset.panel === trId);
+    panel.classList.toggle('active', panelShown(panel, trId));
   }
 }
 

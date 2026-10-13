@@ -216,7 +216,8 @@
           </div>
           <p class="note">
             <b>断句仍然在浏览器里做</b> —— 和「本地 VAD」用的是同一套 Silero VAD 引擎，
-            所以上面那块 VAD 的「语速档位」和几个旋钮<b>对它一样有效</b>。
+            所以下面那块 VAD 的「语速档位」和几个旋钮<b>对它一样有效</b>（那些旋钮是调切句的，
+            不是调文本来源的）。
           </p>
           <p class="note">
             ⚠️ <b>它不是流式</b>：一句话说完才发给阿里云，比流式多一句的延迟 ——
@@ -262,8 +263,14 @@
           </div>
         </div>
 
-        <!-- 本地 VAD 断句 -->
-        <div class="panel" data-panel="vad">
+        <!--
+          本地 VAD 断句 —— ⚠️ 这个面板对**两个**识别服务都显示：
+            vad        本地 VAD 定轴 + 本地 Whisper 出文本
+            dashscope  同一套 VAD 定轴，只是文本换成阿里云（见 lib/asr/dashscope.js）
+          两者由同一个 Silero VAD 引擎切句，所以这些旋钮对两者都生效。
+          data-panel 是空格分隔的列表，见 options.js 的 panelShown()。
+        -->
+        <div class="panel" data-panel="vad dashscope">
           <div class="grid">
             <label class="field">
               <span>语速档位</span>
@@ -301,29 +308,50 @@
               <small class="hint">句子前后各多切一点。切在音节中间会让识别丢掉开头的字。</small>
             </label>
           </div>
-          <p class="note">
+          <!-- ⚠️ 文本从哪来 —— 两个 backend 说法不同，见 options.js 的 currentVadBackend() -->
+          <p class="note" data-backend="whisper">
             地址沿用下面「本地 Whisper 服务」那一栏 —— 和识别校正共用同一个服务，所以不用重复填。
           </p>
-          <p class="note">
-            <b>音源不好怎么办（差麦克风 / 说话快）</b>——这三个旋钮是为此准备的，都可以单独试，
-            不满意就改回默认：
+          <p class="note" data-backend="dashscope">
+            文本来自<b>阿里云百炼</b> —— API Key、端点、模型名、提示词、热词都在上面
+            「阿里云百炼」那一栏里填，这里只管<b>怎么切句</b>。
           </p>
-          <div class="grid">
-            <label class="field">
-              <span>自动增益档位</span>
-              <select id="cp-agcProfile"></select>
-              <small class="hint" id="agcHint"></small>
-            </label>
-          </div>
+
+          <!--
+            ⚠️ 「自动增益档位」原本在这个面板里，但它改的是**采集进来的音频本身** ——
+            `player.js` 的 `startAudioEngine()` 不分识别服务都会跑，所以它对**所有**识别服务生效。
+            按本项目的约定（共用字段放在所有 data-panel 之外，见 smoke-test 里那条断言），
+            已经挪到下面「识别校正」那一带。这里留一句指路，免得照设置名找过来的人以为它没了。
+          -->
           <p class="note">
-            <b>差麦克风 / 说话快怎么办</b>——先试这里的「自动增益档位」调到<b>温和</b>，
+            音源本身不好（差麦克风 / 说话快）怎么办 —— 见下面<b>「自动增益档位」</b>那一栏；
+            它对所有识别服务都生效，所以不放在这个面板里。
+          </p>
+
+          <p class="note" data-backend="whisper">
+            <b>差麦克风 / 说话快怎么办</b>——先试下面的「自动增益档位」调到<b>温和</b>，
             再到下面「本地 Whisper 服务」那一栏填<b>提示词</b>引导识别。
             <b>两项都可以单独试，不满意就改回默认</b>（默认 = 一直以来的行为）。
           </p>
-          <p class="note">
+          <p class="note" data-backend="dashscope">
+            <b>差麦克风 / 说话快怎么办</b>——先试下面的「自动增益档位」调到<b>温和</b>，
+            再到上面「阿里云百炼」那一栏填<b>提示词</b>或<b>热词</b>引导识别。
+            <b>都可以单独试，不满意就改回默认</b>（默认 = 一直以来的行为）。
+          </p>
+
+          <p class="note" data-backend="whisper">
             这个模式<b>不需要分片</b>：VAD 当场判断"这句说完了"，把完整的一句交给本地 Whisper。
             所以没有分片时长要调，也没有跨片等待 —— 延迟比 Whisper 分片低得多（约 0.3 秒 + 一次推理）。
           </p>
+          <p class="note" data-backend="dashscope">
+            这个模式<b>不需要分片</b>：VAD 当场判断"这句说完了"，把完整的一句发给阿里云。
+            所以没有分片时长要调，也没有跨片等待。
+            <br />
+            ⚠️ 但阿里是<b>非流式</b>的：要等一句说完才发请求，所以要等一次网络往返。
+            延迟画面模式能盖住这个差距。
+          </p>
+
+          <!-- 公共部分：两个 backend 都成立 -->
           <p class="note">
             <b>用了它就可以把「识别校正」关掉</b>：这里的音频已经是完整的一句，
             校正再听一遍是重复劳动，白白多花一次 GPU。
@@ -404,6 +432,30 @@
           它跟具体哪家流式识别是正交的（尤其「Deepgram 定时间轴 + 本地定文本」才是主力用法），
           一开始误放进 whisper-chunked 那个 panel 里，结果只有选本地分片才看得见 —— 正好反了。
         -->
+        <!--
+          ⚠️ 自动增益放在**所有 data-panel 之外** —— 它改的是**采集进来的音频本身**：
+          `player.js` 的 `startAudioEngine()` 不分识别服务都会跑
+          （`setAgcProfile(settings.capture?.agcProfile)`，见 player.js 里那一行），
+          所以它对**每一家**识别服务都生效。
+
+          它原来在「本地 VAD」那个面板里 —— 于是选 Deepgram / Whisper 分片 / OpenAI Realtime 时
+          整块看不见，**而它照样在改音频**。这和「语速档位看不到」是同一类错配：
+          参数生效却调不到。按本项目的约定（共用字段必须放在所有 data-panel 之外，
+          见 smoke-test 里那条断言），它属于这里。
+        -->
+        <h4>音源质量（对所有识别服务生效）</h4>
+        <div class="grid">
+          <label class="field">
+            <span>自动增益档位</span>
+            <select id="cp-agcProfile"></select>
+            <small class="hint" id="agcHint"></small>
+          </label>
+        </div>
+        <p class="hint">
+          差麦克风 / 说话快就先试这一栏调到<b>温和</b>。它作用在<b>采集进来的音频</b>上，
+          所以换哪家识别服务都有效 —— 这正是它放在服务商面板外面的原因。
+        </p>
+
         <h4>识别校正（流式定时间轴 + 本地模型定文本）</h4>
         <div class="grid">
           <label class="field">

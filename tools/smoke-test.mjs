@@ -3257,11 +3257,220 @@ check('本地 VAD：必须注册成识别服务，并带上自己的参数', () 
 
   // 界面接线
   const html = fs.readFileSync(path.join(process.cwd(), 'options', 'options.html'), 'utf8');
-  if (!/data-panel="vad"/.test(html)) throw new Error('设置页没有 vad 面板');
+  // ⚠️ 面板的 data-panel 是**空格分隔的列表**（vad 和 dashscope 共用同一个面板，
+  //    因为阿里云百炼也复用这个 VAD 引擎 —— 见下面那条断言）。
+  //    所以这里不能写死 `data-panel="vad"`，要按"列表里含 vad"判断。
+  if (!/data-panel="[^"]*\bvad\b[^"]*"/.test(html)) throw new Error('设置页没有 vad 面板');
   const js = fs.readFileSync(path.join(process.cwd(), 'options', 'options.js'), 'utf8');
   for (const id of ['vd-threshold', 'vd-minSilenceMs', 'vd-maxSpeechSec', 'vd-padMs']) {
     if (!new RegExp(`'${id}'`).test(js)) throw new Error(`options.js 没有接线 ${id}`);
   }
+});
+
+/**
+ * 凡是复用 VAD 引擎的识别服务，设置页都必须让它看到 VAD 的那组旋钮。
+ *
+ * 踩过的坑（用户实测发现）：阿里云百炼复用 `vad.js` 的 `createSession`，
+ * 断句仍然由浏览器内的 Silero VAD 做，只是把"文本从哪来"换成了阿里云的 HTTP 接口。
+ * 但 `syncPanels()` 当时是 `panel.dataset.panel === asrId`（精确相等），
+ * 于是选中阿里时，装着「语速档位 / 静音确认 / 收句静音 / 最短话段 / 单句上限 /
+ * 前后留白 / 判定阈值 / 自动增益档位」的面板**整块消失** —— 而那些旋钮对它照样生效。
+ * 用户原话：「我就是想问这个 我看不到了」。
+ *
+ * ⚠️ 名单**从代码推**，不手写 —— 手写名单会和现实脱节（这个项目为"两份清单不一致"栽过）。
+ * 判据：adapter 只要 import 了 `./vad.js` 且调用了它的 `createSession`，就由 Silero VAD 切句。
+ */
+check('凡是复用 VAD 引擎的识别服务，设置页都必须让它看到 VAD 的那组旋钮', () => {
+  const asrDir = path.join(process.cwd(), 'lib', 'asr');
+
+  // ① 从代码推出：谁会走到 VAD 引擎，以及它的 backend 叫什么
+  //    ⚠️ provider id 和 backend 名**不是一回事**：provider「vad」的 backend 叫「whisper」，
+  //    所以 backend 名也必须从代码推，不能拿 provider id 顶替（这条断言第一版就是这么错的）。
+  const vadSrc = fs.readFileSync(path.join(asrDir, 'vad.js'), 'utf8');
+  const defaultBackend = (vadSrc.match(/config\.backend\s*\|\|\s*'([^']+)'/) || [])[1];
+  if (!defaultBackend) {
+    throw new Error('没能从 vad.js 推出默认 backend —— 判据失效了，得重新审视这条断言');
+  }
+
+  const vadBacked = new Map([['vad', defaultBackend]]); // provider id → backend 名
+  for (const f of fs.readdirSync(asrDir)) {
+    if (!f.endsWith('.js') || f === 'vad.js' || f === 'index.js') continue;
+    const src = fs.readFileSync(path.join(asrDir, f), 'utf8');
+    const importsVad = /from\s+['"]\.\/vad\.js['"]/.test(src);
+    const callsVad = /vadEngine\.createSession\s*\(/.test(src);
+    if (!importsVad || !callsVad) continue;
+    const id = f.replace(/\.js$/, '');
+    const be = (src.match(/backend:\s*'([^']+)'/) || [])[1];
+    if (!be) throw new Error(`${id} 复用了 VAD 引擎却没显式设 backend —— 设置页没法按 backend 区分文案`);
+    vadBacked.set(id, be);
+  }
+  // 判据自身要有效：现在至少是 vad + dashscope 两个。
+  // 如果哪天只剩一个，说明推导规则失效了（比如有人换了调用方式），必须重新审视这条断言。
+  if (vadBacked.size < 2) {
+    throw new Error(`只推出 ${vadBacked.size} 个复用 VAD 引擎的服务（${[...vadBacked.keys()]}）—— 推导规则可能失效了`);
+  }
+
+  // ② 装着那组旋钮的面板，data-panel 列表里必须有每一个
+  const html = fs.readFileSync(path.join(process.cwd(), 'options', 'options.html'), 'utf8');
+  const panelAttrOf = (id) => {
+    const stack = [];
+    const re = new RegExp(`<div\\b([^>]*)>|</div>|id="${id}"`, 'g');
+    let m;
+    while ((m = re.exec(html))) {
+      if (m[0] === '</div>') {
+        stack.pop();
+        continue;
+      }
+      if (m[0] === `id="${id}"`) {
+        const found = stack.find((a) => a && a.includes('data-panel='));
+        return found ? (found.match(/data-panel="([^"]*)"/) || [])[1] : null;
+      }
+      stack.push(m[1] || '');
+    }
+    return 'NOT-FOUND';
+  };
+  const attr = panelAttrOf('vd-rate');
+  if (attr === 'NOT-FOUND') throw new Error('找不到 vd-rate');
+  if (!attr) throw new Error('vd-rate 跑出了 panel —— 那它会对所有识别服务都显示');
+  const shownFor = attr.split(/\s+/).filter(Boolean);
+
+  for (const p of vadBacked.keys()) {
+    if (!shownFor.includes(p)) {
+      throw new Error(
+        `「${p}」复用 VAD 引擎切句，但设置页选它时看不到 VAD 的那组旋钮` +
+          `（面板 data-panel="${attr}"）—— 那些旋钮对它是生效的`
+      );
+    }
+  }
+
+  // ③ 反向也要成立：不用 VAD 引擎的服务**不该**看到这组旋钮，否则文案会误导
+  const allIds = loaded['lib/settings.js'].ASR_PROVIDERS.map((p) => p.id);
+  for (const p of allIds) {
+    if (vadBacked.has(p)) continue;
+    if (shownFor.includes(p)) {
+      throw new Error(`「${p}」不用 VAD 引擎切句（它有自己的断句方式），却能看到那些旋钮 —— 文案会误导`);
+    }
+  }
+
+  // ④ syncPanels 必须真的按"列表包含"判断。
+  //    ⚠️ 只查字符串存在是不够的（这个项目栽过八次）—— 这里显式拒绝"精确相等"的写法。
+  //    ⚠️⚠️ 而且**必须先剥注释**：上面 panelShown 的文档注释里就写着旧的写法
+  //    `panel.dataset.panel === asrId` 用来记录踩过的坑 —— 不剥注释的话，
+  //    这条断言会被自己的注释文本触发（写这条断言时真踩了，是它自己报出来的）。
+  //    stripComments 的注释里也记着这个坑已经产生过三次假阳性，这是第四次。
+  const js = stripComments(fs.readFileSync(path.join(process.cwd(), 'options', 'options.js'), 'utf8'));
+  if (/dataset\.panel\s*===\s*asrId/.test(js)) {
+    throw new Error('syncPanels 还在用 `dataset.panel === asrId` 精确相等 —— 多值 data-panel 会失效');
+  }
+  if (!/\.split\(\/\\s\+\/\)/.test(js)) {
+    throw new Error('syncPanels 没有把 data-panel 按空格拆开 —— 多值列表面板不会显示');
+  }
+  if (!/panelShown\s*\(/.test(js)) {
+    throw new Error('没有 panelShown 这个判定函数');
+  }
+
+  // ⑤ 面板里"只对一个 backend 成立"的文案必须按 backend 显隐 ——
+  //    否则选阿里时会看到"把完整的一句交给本地 Whisper"这种错话。
+  //    注意这里是 **backend 名**（whisper / dashscope），不是 provider id（vad / dashscope）。
+  const beBlocks = [...html.matchAll(/data-backend="([^"]+)"/g)].map((m) => m[1]);
+  for (const be of new Set(vadBacked.values())) {
+    if (!beBlocks.includes(be)) {
+      throw new Error(`面板里没有 data-backend="${be}" 的块 —— 那个 backend 下的文案会和另一个混在一起`);
+    }
+  }
+
+  // ⑥ options.js 的 backend 判定必须和上面推出来的默认值一致 ——
+  //    否则界面按一个名字显隐、代码按另一个名字判断，两边会脱节。
+  if (!new RegExp(`['"]${defaultBackend}['"]`).test(js)) {
+    throw new Error(`options.js 里没有提到默认 backend「${defaultBackend}」—— 两边的判定可能脱节`);
+  }
+
+  // ⑦ `el.hidden` 必须有一条显式 CSS 规则兜底。
+  //    浏览器默认的 `[hidden] { display: none }` 是 **UA 样式**，任何作者样式都能盖过它 ——
+  //    哪天有人给 `.note` 或 `p` 加一句 `display: block`，显隐就会**静默失效**
+  //    （选阿里时又会看到"把完整的一句交给本地 Whisper"）。
+  const css = fs.readFileSync(path.join(process.cwd(), 'options', 'options.css'), 'utf8');
+  const hiddenRule = /\[data-backend\]\[hidden\]\s*\{[^}]*display\s*:\s*none/.test(css);
+  if (!hiddenRule) {
+    throw new Error('options.css 里没有 `[data-backend][hidden] { display: none }` —— 显隐会被作者样式盖掉');
+  }
+  // 而且不能只靠浏览器默认：这条规则得带 !important 才钉得住
+  if (!/\[data-backend\]\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important/.test(css)) {
+    throw new Error('那条 [data-backend][hidden] 规则没有 !important —— 作者样式仍可能盖过它');
+  }
+});
+
+/**
+ * 通用规则：**面板里的设置项，它的键必须属于那个面板的 provider。**
+ *
+ * 这条规则能一次性覆盖整类「参数生效却调不到」的错配 —— 用户实测报的就是这一类：
+ * 选了阿里云百炼后，「语速档位」等旋钮整块消失，而它们照样生效。
+ *
+ * 同一个坑还有第二处：`capture.agcProfile`（自动增益）原来也在「本地 VAD」面板里，
+ * 但它改的是**采集进来的音频本身**（`player.js` 的 `startAudioEngine()` 不分服务都会跑），
+ * 所以选 Deepgram / Whisper 分片 / OpenAI Realtime 时同样看不见、却照样生效。
+ *
+ * ⚠️ provider 名单、面板归属、键名**全部从代码推**，不手写 ——
+ * 手写名单会和现实脱节（这个项目为"两份清单不一致"栽过）。
+ */
+check('面板里的设置项，键必须属于那个面板的 provider（否则就是"生效却调不到"）', () => {
+  const html = fs.readFileSync(path.join(process.cwd(), 'options', 'options.html'), 'utf8').replace(/<!--[\s\S]*?-->/g, '');
+  const js = fs.readFileSync(path.join(process.cwd(), 'options', 'options.js'), 'utf8');
+
+  // ① FIELDS 表：元素 id → 设置键
+  const start = js.indexOf('const FIELDS = [');
+  if (start < 0) throw new Error('找不到 FIELDS 表');
+  const block = js.slice(start, js.indexOf('];', start));
+  const idToKey = new Map();
+  for (const m of block.matchAll(/\['([\w-]+)',\s*'[^']*',\s*'([^']+)'\]/g)) idToKey.set(m[1], m[2]);
+  if (idToKey.size < 30) throw new Error(`只解析出 ${idToKey.size} 个设置项 —— FIELDS 的格式可能变了`);
+
+  // ② HTML：元素 id → 所在面板的 data-panel 值
+  const idPanel = new Map();
+  {
+    const stack = [];
+    const re = /<div\b([^>]*)>|<\/div>|id="([\w-]+)"/g;
+    let m;
+    while ((m = re.exec(html))) {
+      if (m[0] === '</div>') { stack.pop(); continue; }
+      if (m[2]) {
+        const p = stack.find((a) => a && a.includes('data-panel='));
+        idPanel.set(m[2], p ? (p.match(/data-panel="([^"]*)"/) || [])[1] : null);
+        continue;
+      }
+      stack.push(m[1] || '');
+    }
+  }
+
+  // camelCase → kebab-case，好和面板 id 对齐（asr.openaiRealtime ↔ 面板 openai-realtime）
+  const kebab = (s) => s.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
+
+  let examined = 0;
+  const bad = [];
+  for (const [id, panel] of idPanel) {
+    if (!panel) continue;
+    const key = idToKey.get(id);
+    if (!key) continue; // 不在 FIELDS 里的（纯展示、或走别的绑定方式）跳过
+    examined++;
+    const segs = key.split('.');
+    // 只管 <域>.<provider>.<...> 这种形状的键（asr.* / translate.*）
+    if (segs.length < 3 || !['asr', 'translate'].includes(segs[0])) {
+      bad.push(`${id} 的键 ${key} 不属于 asr/translate 域，却被关在面板 [${panel}] 里`);
+      continue;
+    }
+    const wanted = kebab(segs[1]);
+    const ids = panel.split(/\s+/).filter(Boolean).map(kebab);
+    // 允许前缀关系：面板 google-free ↔ 键 translate.google.*
+    const owned = ids.some((p) => p === wanted || p.startsWith(wanted) || wanted.startsWith(p));
+    if (!owned) {
+      bad.push(`${id} 的键是 ${key}（属于「${segs[1]}」），却关在面板 [${panel}] 里 —— 选别的服务就看不见它，而它照样生效`);
+    }
+  }
+
+  // ⚠️ 检查自身要有效：不能一个都没查到就"通过"（空集恒真）
+  if (examined < 30) throw new Error(`只检查了 ${examined} 个设置项 —— 判据可能失效了`);
+
+  if (bad.length) throw new Error(bad.join('\n        '));
 });
 
 check('本地 VAD：vendor 依赖必须在位，CSP 必须允许 WASM', () => {

@@ -86,6 +86,17 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; back
 }
 .panel.active { display: block; }
 
+/*
+ * 面板里"只对某个 backend 成立"的文案（`data-backend`）靠 `el.hidden` 显隐。
+ *
+ * ⚠️ 这条规则**必须显式写出来**，不能只依赖浏览器默认的 `[hidden] { display: none }`：
+ * 浏览器默认属于 UA 样式，**任何作者样式都会盖过它**。也就是说，
+ * 哪天有人给 `.note` 或 `p` 加上一句 `display: block`，
+ * backend 的显隐就会**静默失效** —— 选阿里时又会看到"把完整的一句交给本地 Whisper"。
+ * 所以这里用显式规则 + !important 把它钉住。
+ */
+[data-backend][hidden] { display: none !important; }
+
 .glossary-block {
   margin-top: 16px;
   padding-top: 14px;
