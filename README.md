@@ -1,6 +1,6 @@
 # livedtranslate · 浏览器同声传译
 
-![version](https://img.shields.io/badge/version-2.66.13-blue)
+![version](https://img.shields.io/badge/version-2.66.14-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![manifest](https://img.shields.io/badge/Manifest-V3-orange)
 
@@ -1225,7 +1225,7 @@ Deepgram 官方文档（[Smart Formatting](https://developers.deepgram.com/docs/
 **默认开着**，不用勾任何东西。只要开始同传，**字幕上方**就会出现一个面板，第一行是版本号：
 
 ```
-livedtranslate v2.66.13 · 字幕层就绪
+livedtranslate v2.66.14 · 字幕层就绪
 识别 0.4s · 翻译 0.25s
 翻译完成 · 312ms · google-free
 ```
@@ -1487,7 +1487,7 @@ A：说明模型没被正确喂进去。诊断面板会把几种窗长各自的�
 **全是 0.00x 才是真失败**；只要有一个是 0.9x，说明自检会自己挑对，看下一行它就绪了没。
 
 **Q：选了本地 VAD，但识别服务连不上 / 一直没结果**
-A：① 确认本机那个 Whisper 服务真的在跑（浏览器打开 `http://127.0.0.1:8080/v1/models` 试试）；
+A：① 确认本机那个 Whisper 服务真的在跑（**启动它的那个命令行窗口**还开着、没报错）；
 ② 地址**填到哪为止要看你的服务** —— 扩展会在它后面接 `/audio/transcriptions`，
 所以服务挂在 `/v1/audio/transcriptions` 就填到 `/v1`，直接挂在 `/audio/transcriptions` 就不带 `/v1`；
 **两种都试一下，报「未找到文件」通常是前缀多一段或少一段**；③ 看诊断面板的 `识别就绪 · …Whisper @ …` 那一行，
