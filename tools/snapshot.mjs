@@ -251,20 +251,28 @@ function main() {
       console.log('还没有任何快照。');
       return;
     }
-    const want = listFiles(ROOT);
+    /**
+     * ⚠️ 历史体检**不能**拿"当前源目录"当基准 —— 先写成那样，结果 104 份里报了 93 份
+     * "不完整"：项目在长大，老快照本来就文件更少（44~60 个）。
+     * 那条严格判据（拿源目录逐个对齐）只适用于 createSnapshot 里"刚存完"那一处；
+     * 对历史快照只能查"有没有明显残缺"。
+     * 两次真实事故分别是 2 个和 6 个文件、且都没有 manifest.json —— 下面这条能全抓到。
+     */
+    const FLOOR = 30;
     let bad = 0;
     for (const it of items) {
-      const v = verifySnapshot(path.join(STORE, it.dir), want);
-      if (!v.ok) {
+      const rel = listFiles(path.join(STORE, it.dir));
+      const hasManifest = rel.includes('manifest.json');
+      if (!hasManifest || rel.length < FLOOR) {
         bad += 1;
         console.log(
-          `  ✗ ${it.dir}  —— 应有 ${v.expected} 个文件，实际 ${v.files} 个，缺 ${v.missing.length} 个`
+          `  ✗ ${it.dir}  —— ${rel.length} 个文件${hasManifest ? '' : '，**没有 manifest.json**'}`
         );
       }
     }
     console.log(
-      `\n共 ${items.length} 份快照，不完整 ${bad} 份。` +
-        (bad ? '\n⚠️ 不完整的快照**不能用来回退**，建议删掉重存。' : '')
+      `\n共 ${items.length} 份快照，明显残缺 ${bad} 份。` +
+        (bad ? '\n⚠️ 残缺的快照**不能用来回退**，建议删掉重存。' : '')
     );
     process.exitCode = bad ? 1 : 0;
     return;
