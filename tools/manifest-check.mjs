@@ -6,6 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VERSION_DOC_FILES, scanVersionRefs } from './version-refs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let failures = 0;
@@ -158,18 +159,16 @@ console.log('\n[6] 版本一致性');
     }
   }
 
-  // 文档里出现过版本号的地方最容易忘，顺手对一遍
+  // 文档里出现过版本号的地方最容易忘，顺手对一遍。
+  // ⚠️ 判定逻辑在 `version-refs.mjs`，和 `bump-version.mjs` **共用一份** ——
+  //    以前两边各写一份，而且 bump-version 用的是裸子串，会把文档里的历史例子也命中。
   const stale = [];
-  for (const rel of ['README.md', 'tools/README.md']) {
+  for (const rel of VERSION_DOC_FILES) {
     const file = path.join(ROOT, rel);
     if (!fs.existsSync(file)) continue;
-    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
-      const m = line.match(/livedtranslate v(\d+\.\d+\.\d+)/);
-      if (m && m[1] !== manifest.version) stale.push(`${rel}: livedtranslate v${m[1]}`);
-      // ⚠️ README 顶部那枚版本徽章是**另一个**写法（`badge/version-2.58.1-blue`），
-      // 上面那个正则抓不到它 —— 于是它会在下次升版本时静默落后。
-      const b = line.match(/badge\/version-(\d+\.\d+\.\d+)-/);
-      if (b && b[1] !== manifest.version) stale.push(`${rel}: 徽章 version-${b[1]}`);
+    for (const r of scanVersionRefs(fs.readFileSync(file, 'utf8'), rel)) {
+      if (r.version === manifest.version) continue;
+      stale.push(`${rel}: ${r.kind === 'badge' ? '徽章 ' : ''}v${r.version}`);
     }
   }
   if (stale.length) {
@@ -336,6 +335,58 @@ console.log('\n[9] 文档里的断言数');
       for (const p of problems) console.log(`      ${p}`);
     } else {
       console.log(`  ✓ 四处一致（${canon.join(' + ')} = ${canonTotal}）：README.md 目录树 / README.md 合计 / tools/README.md 目录树 / tools/README.md 合计`);
+    }
+  }
+}
+
+console.log('\n[10] 单测数量与实际相符');
+{
+  /**
+   * 真踩过的坑：README 里写着「判定逻辑在 `lib/utterance.js`，独立模块、有 **12** 项单测」，
+   * 而实际是 11 项。这个数字**只出现一次**，所以 [9] 那套"四处互相核对"覆盖不到它；
+   * 它也不会因为别处改动而漂 —— 只会随着测试增删**静静地变成假话**。
+   *
+   * 判据：数 `smoke-test.mjs` 的 [9] 段里、标题以「整句累积」开头的 `check(...)` 条数。
+   *   · 用「段范围 + 标题前缀」定位，**不做括号配平** —— 配平遇到模板字符串里的括号就会错，
+   *     而这个项目已经为"看起来对的判据其实不对"栽过多次
+   *   · 只匹配行首的 `check('整句累积`，不解析函数体
+   *
+   * ⚠️ 覆盖面有限，如实说明：它只保证"README 里的数字 == 带那个前缀的 check 条数"。
+   *    [9] 段里还有 5 条测字幕排期、翻译窗口的 check，它们**不属于** `lib/utterance.js`，
+   *    所以没算进来。哪天给这个模块的测试换了标题前缀，这条会红 ——
+   *    那时改前缀的同时也要改这里，别把断言删掉了事。
+   */
+  const smokePath = path.join(ROOT, 'tools', 'smoke-test.mjs');
+  const readmePath = path.join(ROOT, 'README.md');
+  const smoke = fs.existsSync(smokePath) ? fs.readFileSync(smokePath, 'utf8').split('\n') : null;
+  const readme = fs.existsSync(readmePath) ? fs.readFileSync(readmePath, 'utf8') : null;
+
+  if (!smoke || !readme) {
+    failures++;
+    console.log('  ✗ 读不到 tools/smoke-test.mjs 或 README.md，无法核对');
+  } else {
+    const claim = readme.match(/`lib\/utterance\.js`[^\n]*?有\s*(\d+)\s*项单测/);
+    const start9 = smoke.findIndex((l) => /console\.log\('\\n\[9\]/.test(l));
+    const after9 = smoke.findIndex((l, i) => i > start9 && /console\.log\('\\n\[\d+\]/.test(l));
+    const end9 = after9 === -1 ? smoke.length : after9;
+
+    let actual = 0;
+    for (let i = start9; i < end9; i++) {
+      if (/^\s*check\(\s*'整句累积/.test(smoke[i])) actual++;
+    }
+
+    if (!claim) {
+      failures++;
+      console.log('  ✗ README.md 里找不到「lib/utterance.js … 有 N 项单测」这句，无法核对');
+    } else if (start9 === -1) {
+      failures++;
+      console.log('  ✗ smoke-test.mjs 里找不到 [9] 段，无法核对单测数量');
+    } else if (Number(claim[1]) !== actual) {
+      failures++;
+      console.log(`  ✗ README 说 lib/utterance.js 有 ${claim[1]} 项单测，实际是 ${actual} 项`);
+      console.log(`      （smoke-test.mjs [9] 段 L${start9 + 1}~L${end9} 里「整句累积」开头的 check）`);
+    } else {
+      console.log(`  ✓ lib/utterance.js 的单测数相符：${actual} 项`);
     }
   }
 }

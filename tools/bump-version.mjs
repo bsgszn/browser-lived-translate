@@ -12,6 +12,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createSnapshot } from './snapshot.mjs';
 import { commitAll, findGit, isDirty, isRepo } from './git.mjs';
+import { VERSION_DOC_FILES, scanVersionRefs } from './version-refs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const manifestPath = path.join(ROOT, 'manifest.json');
@@ -55,17 +56,21 @@ fs.writeFileSync(packagePath, JSON.stringify(pkg, null, 2) + '\n');
 
 console.log(`${current} → ${next}`);
 
-// 这些地方在文档里出现过版本号，容易忘记同步
+// 这些地方在文档里出现过版本号，容易忘记同步。
+//
+// ⚠️ 判定逻辑在 `version-refs.mjs`，和 `manifest-check.mjs` 的 [6] **共用一份**。
+// 以前这里写的是 `line.includes('v' + current)` —— 裸子串，会把文档里的**历史对照例子**
+// 也命中（比如记「先提交修复再改版本号」那条约定时写的 `3b1ce5e v2.66.8`），
+// 于是每次升版本都报几条不存在的"版本号滞留"。噪音会让人不再看这个提示，所以收紧了。
 const stale = [];
-for (const rel of ['README.md', 'tools/README.md', 'docs/delayed-playback.md']) {
+for (const rel of VERSION_DOC_FILES) {
   const file = path.join(ROOT, rel);
   if (!fs.existsSync(file)) continue;
   const text = fs.readFileSync(file, 'utf8');
-  for (const line of text.split('\n')) {
-    if (line.includes(`v${current}`)) stale.push(`${rel}: ${line.trim()}`);
-    // README 顶部的版本徽章用的是另一种写法（`badge/version-2.58.1-blue`），
-    // 不含 `v` 前缀，上面那行抓不到 —— 单独提一句，免得升版本时漏掉它。
-    if (line.includes(`version-${current}-`)) stale.push(`${rel}: 徽章 ${line.trim()}`);
+  for (const r of scanVersionRefs(text, rel)) {
+    // 这里找的是**旧版本号**：升完之后还写着旧值的地方就是待同步的。
+    if (r.version !== current) continue;
+    stale.push(`${rel}:${r.line} ${r.kind === 'badge' ? '徽章 ' : ''}${r.text}`);
   }
 }
 if (stale.length) {

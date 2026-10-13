@@ -233,16 +233,37 @@ Deepgram 在国内要代理才能注册和使用，直接卡死了大部分用�
 
 ### 方案 B：完全本地（推荐给折腾党，音频不出本机）
 
-**先起一个本地 Whisper 服务**（两种都行，接口是 OpenAI 兼容的）：
+**先起一个本地 Whisper 服务**（两种都行，接口是 OpenAI 兼容的）。
+
+**⚠️ 但两个服务都不会把模型替你准备好 —— 先把模型下下来，否则第一步就卡住：**
+
+| | 模型从哪来 | 大小 |
+|---|---|---|
+| **faster-whisper** | 起服务时**自动**从 HuggingFace 拉（`Systran/faster-whisper-large-v3`） | large-v3 约 2.9 GB |
+| **whisper.cpp** | **完全不自动下载** —— 得你自己拿 ggml 模型，把**实际路径**填进 `-m` | 同上 |
+
+- **ggml 模型**在 HuggingFace 的 [`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp) 仓库，
+  文件名形如 `ggml-large-v3.bin`（还有 `ggml-large-v3-turbo.bin`、`ggml-medium.bin` 等）。
+- **机器一般、或者只想先跑通**，可以先用小的：`medium` 约 **1.5 GB**、`small` 约 **466 MB**、
+  **`large-v3-turbo` 约 1.5 GB**（速度和质量的折中，值得先试它）。质量会差一些，但能立刻验证整条链路。
+- **⚠️ 国内访问 HuggingFace 常常很慢或者不通。** 最省事的做法是把下载端点指到镜像
+  （`HF_ENDPOINT=https://hf-mirror.com`）——**hf-mirror 自己的文档就是这么写的**，PowerShell 里是
+  `$env:HF_ENDPOINT = "https://hf-mirror.com"`；也可以直接在镜像站网页上手动下那个文件。
+  **这条路我们没实测过，是照镜像站的文档写的。**
 
 ```bash
-# 用 faster-whisper
+# 用 faster-whisper（模型自动下载；国内可以先设 HF_ENDPOINT 指镜像）
 pip install faster-whisper-server
 faster-whisper-server --model large-v3 --port 8000
 
 # 或者用 whisper.cpp（作者用的就是这个）
+# ⚠️ -m 后面必须是你实际放模型的那个路径，不是文件名：
+#    whisper-server.exe -m D:\models\ggml-large-v3.bin -l ja …
 whisper-server.exe -m ggml-large-v3.bin -l ja --inference-path /v1/audio/transcriptions --host 127.0.0.1 --port 8080
 ```
+
+**起完确认一下：浏览器打开 `http://127.0.0.1:8080/v1/models`，能看到模型名就说明服务好了**
+（看不到就回去看服务端的输出，多半是模型路径填错了）。
 
 **然后设置页 → 识别服务选 `本地 VAD 断句 + 本地 Whisper`**（列表里第一项），服务地址填你上面起的那个。
 
@@ -658,7 +679,7 @@ Deepgram 在一次说话**中间**也会不断吐 `is_final` 分片。如果每�
 | ASR 没发收句信号 | 最后一个分片之后静默 3 秒就上屏 |
 | 停止采集 | 把没说完的一句吐出来 |
 
-> 判定逻辑在 `lib/utterance.js`，独立模块、有 12 项单测 —— 因为这里很微妙
+> 判定逻辑在 `lib/utterance.js`，独立模块、有 11 项单测 —— 因为这里很微妙
 > （比如「没有时间戳时必须传 `undefined` 而不是 `null`」，否则会被当成时间 0、字幕排在过去立刻弹出）。
 >
 > **叠加模式不受影响**：它另有「中间结果翻译」保证出字速度，`endpointing` 抬高只让定稿晚 380ms。
@@ -861,7 +882,7 @@ browser-lived-translate/
 │   └── delayed-playback.md        设计笔记：延迟播放（已实现）与前读路线（未实现）
 ├── tools/                         开发期自检脚本（不参与扩展运行）
 │   ├── README.md                  测试说明
-│   ├── manifest-check.mjs         88 项：manifest / 路径 / DOM id / 硬约束 静态完整性
+│   ├── manifest-check.mjs         91 项：manifest / 路径 / DOM id / 硬约束 静态完整性
 │   ├── smoke-test.mjs             335 项：模块加载 / 滤波器与 AGC / 断句状态机 / 预设 / 术语表 / 签名 / 防复发
 │   ├── pipeline-test.mjs          126 项：音频引擎全链路（桩对象驱动）
 │   ├── worker-test.mjs            60 项：service worker 状态机与消息路由（含竞态回归）
@@ -1426,7 +1447,7 @@ A：字幕样式改 `content/content.js` 里的 `CSS` 常量；新增识别服�
   node tools/pipeline-test.mjs   # 音频引擎全链路，桩对象驱动
   node tools/worker-test.mjs     # service worker 状态机与消息路由
   ```
-  四套一共 **609 项断言**（88 + 335 + 126 + 60）。
+  四套一共 **612 项断言**（91 + 335 + 126 + 60）。
   `pipeline-test` 会桩掉 `AudioContext` / `AudioWorkletNode` / `WebSocket` / `fetch` / `performance.now`，
   真实走完「启动 → 分析支路 → PCM → 重采样 → ASR 事件 → 翻译（含上下文）→ 下发字幕 → 停止 → 重启」，
   覆盖字幕行复用、译文与原文错配、AGC 收敛与回落、识别滞后夹取、**翻译请求背压与定稿抢占**、缓存命中、去重、资源回收等不变量。

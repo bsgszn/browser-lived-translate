@@ -7,7 +7,7 @@
 在扩展根目录（有 `package.json` 的那一层）：
 
 ```bash
-node tools/manifest-check.mjs   # 88 项：manifest / 路径 / DOM id / 硬约束 静态完整性
+node tools/manifest-check.mjs   # 91 项：manifest / 路径 / DOM id / 硬约束 静态完整性
 node tools/smoke-test.mjs       # 335 项：模块加载 / 音频前端数值 / 断句状态机 / 预设 / 术语表 / 签名
 node tools/pipeline-test.mjs    # 126 项：音频引擎全链路（桩对象驱动）
 node tools/worker-test.mjs      # 60 项：service worker 状态机与消息路由
@@ -19,7 +19,7 @@ node tools/worker-test.mjs      # 60 项：service worker 状态机与消息路�
 npm test
 ```
 
-不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **609 项断言**。
+不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **612 项断言**。
 
 ### `manifest-check.mjs`
 
@@ -202,7 +202,61 @@ robocopy ..\_versions\<目录名> . /MIR /XD node_modules .git
    `spawnSync(exe, args, { stdio: ['ignore', ofd, efd] })`。
 
 2. **静态检查要先剥注释。** 注释里出现 `execFileSync` / `new AudioWorkletNode` 这类词
-   会让正则检查误报。这个项目因为不剥注释产生过三次假阳性。
+   会让正则检查误报。这个项目因为不剥注释产生过**四次**假阳性
+   （最近一次：有人在 `panelShown` 的文档注释里写了旧写法 `panel.dataset.panel === asrId`
+   用来记录踩过的坑 —— 断言于是命中了**自己的注释**）。
+
+## ⚠️ 不要用 `git checkout -- <file>` 去还原
+
+**这条不是"注意事项"，是"这么干会丢工作"。上一轮连同上级在内，踩了五次。**
+
+```bash
+git checkout -- tools/README.md     # ✗ 别这么干
+```
+
+**为什么危险：它恢复的是 **HEAD 里的版本**，而不是"你五分钟前的样子"。**
+**那个文件里所有**未提交的真实改动会一起消失** —— 包括你刚写对、还没来得及提交的部分。**
+
+**为什么明知危险还会踩：因为人在着急的时候会本能地敲它。** 光写"不要这样做"没用，
+得有一条**能照做的路子**：
+
+### ✓ 要还原文件时这样做
+
+```js
+// 1. 先把文件复制到**仓库外**的备份副本
+const fs = require('fs'), path = require('path'), os = require('os');
+const BAK = path.join(os.tmpdir(), 'dsh-bak');          // ← 仓库外，不会进 git；别写死绝对路径
+fs.mkdirSync(BAK, { recursive: true });
+
+// ⚠️ 备份名**必须保留目录层级**
+const backName = (rel) => rel.split('/').join('__');    // 'tools/README.md' → 'tools__README.md'
+
+const src = path.join(ROOT, rel);
+const dst = path.join(BAK, backName(rel));
+fs.copyFileSync(src, dst);                              // ← 先备份，再动手
+
+// 2. 改文件、做实验、跑变异测试……
+
+// 3. 还原时从**备份副本**复制回去（不是从 git）
+fs.copyFileSync(dst, src);
+
+// 4. 逐字节确认还原正确
+Buffer.compare(fs.readFileSync(dst), fs.readFileSync(src)) === 0;   // 必须为 true
+```
+
+**⚠️ 别用 `path.basename()` 命名备份 —— 它会撞车：**
+
+| 表达式 | 结果 |
+|---|---|
+| `path.basename('README.md')` | `README.md` |
+| `path.basename('tools/README.md')` | **`README.md`** ← 同名，第二个覆盖第一个 |
+
+**真实事故：** 有人用 `basename` 命名备份，还原时把 `tools/README.md` 的内容写进了 `README.md`，
+**1463 行的 README 变成了 301 行。** 从 git 恢复后重新应用了三处改动才救回来
+（好在当时那三处改动都还记得是什么 —— 换成复杂的改动就未必了）。
+
+**只有在你确定那处改动本来就不想要时，才可以用 `git checkout`。**
+"做变异测试、试完想还原"**不属于**这种情况 —— 那正是最容易连带丢掉真实改动的场景。
 
 ## ⚠️ 不要用 PowerShell 往返文本
 
