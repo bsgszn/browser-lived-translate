@@ -238,50 +238,95 @@ Deepgram 在国内要代理才能注册和使用，直接卡死了大部分用�
 
 ### 方案 B：完全本地（推荐给折腾党，音频不出本机）
 
-**照着三步做就行。** 下面走的是最省事的一条路；另一条（whisper.cpp）在这节末尾的折叠块里。
+**照着做就行。** 这条路**不需要装 Python、也不需要装任何东西** ——
+要下的两个文件都在浏览器里下（看得见进度），命令行只用来**启动**服务。
 
-**第 1 步 · 装服务**（需要先有 Python）
+**第 1 步 · 下 whisper.cpp 的 Windows 包**
 
-```bash
-pip install faster-whisper-server
-```
+去 [whisper.cpp 的 releases 页](https://github.com/ggml-org/whisper.cpp/releases) 找 **Windows 预编译包**
+（文件名形如 `whisper-bin-x64.zip`）。
 
-**第 2 步 · 起服务**（模型它会自己下，第一次要等一会儿）
+> **⚠️ 别只看最上面那个"Latest"版本** —— 那个页面上的**正式版本往往不带附件**，
+> 二进制挂在标着 **nightly** 的那些构建里（比如 `b5454` 这种纯数字 tag）。
+> 往列表下面翻，找带 `.zip` 附件的那一条。
+> 下下来**解压到一个好找的地方**，比如 `D:\whisper\`，里面应该有 `whisper-server.exe`。
 
-```bash
-faster-whisper-server --model large-v3 --port 8000
-```
+> ⚠️ **这一段是照官方仓库整理的，我们自己没在 Windows 上解压运行过。**
+> 如果你下下来的包里没有 `whisper-server.exe`（只有 `whisper-cli.exe` 之类），
+> 说明那个包不含服务端 —— 换一个附件，或者退到下面的 faster-whisper 那条路。
 
-> - 第一次启动会从 HuggingFace 下模型，**`large-v3` 约 2.9 GB** —— 等它下完再往下走。
+**第 2 步 · 下模型，放进同一个目录**
+
+到 HuggingFace 的 [`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp) 仓库下
+**`ggml-large-v3.bin`**（约 2.9 GB）—— **只需要这一个文件**。
+
 > - **⚠️ 国内下 HuggingFace 常常很慢或者连不上** —— 慢的话看下面折叠块里的「国内下载」。
-> - 不想等大模型：把 `large-v3` 换成 `small`（约 466 MB）或 `medium`（约 1.5 GB）。
->   质量差一些，但几分钟就能验证整条链路通不通。
+> - 不想等大模型：下 `ggml-small.bin`（约 466 MB）就行，质量差一些，但几分钟就能验证整条链路通不通。
+> - **放进第 1 步解压出来的那个目录**（和 `whisper-server.exe` 放一起）——
+>   这样下一步那条命令不用写一长串路径。
 
-**怎么知道服务起来了**：浏览器打开 `http://127.0.0.1:8000/v1/models`，能看到模型名就成了。
+**第 3 步 · 起服务**
 
-**第 3 步 · 在扩展里填地址**
+在解压出来的那个目录里打开命令行（在文件夹空白处**右键 → 「在终端中打开」**，或按住 Shift 右键 → 「在此处打开 PowerShell 窗口」），然后跑：
+
+```bash
+whisper-server.exe -m ggml-large-v3.bin -l ja --inference-path /v1/audio/transcriptions --host 127.0.0.1 --port 8080
+```
+
+> - **这个窗口别关** —— 关掉服务就停了。（`-l ja` 是日语；识别中文就换 `-l zh`。）
+> - 模型不在同一个目录时，`-m` 后面要写**你实际放它的完整路径**，不是文件名。
+> - `--inference-path /v1/audio/transcriptions` 是**故意**加的：这个服务默认挂在 `/inference` 上，
+>   而扩展要的是 OpenAI 兼容路径。加了它，下一步的地址才填 `/v1` 结尾。
+
+**怎么知道服务起来了**：启动后那个命令行窗口会打印加载模型的日志，**窗口不报错、停在那儿不动**
+就是起好了。真正确认用下一步的「测试识别连接」—— **那个按钮会真的发一次请求**，
+比这里的任何说法都可靠。
+
+**第 4 步 · 在扩展里填地址**
 
 1. 设置页 → **语音识别** → 识别服务选 `本地 VAD 断句 + 本地 Whisper`（列表里第一项）
-2. **服务地址**填 `http://127.0.0.1:8000/v1`
+2. **服务地址**填 `http://127.0.0.1:8080/v1`
 3. 点「测试识别连接」看到成功提示 → 保存
 
 > **⚠️ 如果报「未找到文件」或者 404**：那是地址前缀多了一段、或者少了一段 ——
-> 把 `/v1` 去掉再试一次（填 `http://127.0.0.1:8000`），两个都试一下就知道哪个对。
+> 把 `/v1` 去掉再试一次（填 `http://127.0.0.1:8080`），两个都试一下就知道哪个对。
 > **这时候服务本身是好的**，不用去重装。
 
 <details>
-<summary><b>国内下载慢 · 想用 whisper.cpp · 想搞清楚地址为什么有时要带 /v1 —— 点开</b></summary>
+<summary><b>国内下载慢 · 想改用 faster-whisper · 想搞清楚地址为什么有时要带 /v1 —— 点开</b></summary>
 
 #### 国内下载模型
 
-HuggingFace 在国内常常很慢或者不通。最省事的做法是把下载端点指到镜像 ——
-**hf-mirror 自己的文档就是这么写的**（这条路我们没实测过，是照它的文档写的）：
+HuggingFace 在国内常常很慢或者不通。两条路分开说：
+
+- **主线（whisper.cpp）用浏览器下** —— 直接在镜像站网页上点着下就行，
+  或者用任何下载工具。**这一步不依赖命令行联网**，所以不受下面那条限制。
+- **只有走 faster-whisper（它自己从 HuggingFace 拉模型）时**，才需要用镜像端点 ——
+  设一个环境变量再启动服务（**hf-mirror 自己的文档就是这么写的，
+  这条路我们没实测过，是照它的文档写的**）：
 
 ```powershell
 $env:HF_ENDPOINT = "https://hf-mirror.com"
 ```
 
-设完再跑第 2 步那条起服务的命令。也可以直接在镜像站网页上手动下模型文件。
+#### 改用 faster-whisper（会自己下模型，但要先有 Python）
+
+**命令更少，但前提更多** —— 选它之前先确认这三件事：
+
+1. **装 Python**：到 [python.org](https://www.python.org/downloads/) 下载安装。
+   **⚠️ 安装第一屏一定要勾上「Add Python to PATH」** —— 不勾的话下一步会报
+   「'pip' 不是内部或外部命令」，而且装完了还是同一个错，很容易以为是扩展的问题。
+2. `pip install faster-whisper-server`（国内 pip 可能慢，可以换源）
+3. 起服务，**模型它会自己从 HuggingFace 下**：
+
+```bash
+faster-whisper-server --model large-v3 --port 8000
+```
+
+> 第一次启动要等它下完（`large-v3` 约 2.9 GB）才对外服务。
+> 国内连 HuggingFace 常失败 → 见上面的「国内下载模型」。
+> 地址那一栏填 `http://127.0.0.1:8000/v1`（端口是 **8000**，和 whisper.cpp 那条的 8080 不一样）。
+> 起没起来用扩展的「测试识别连接」确认 —— 它真的发一次请求。
 
 #### 改用 whisper.cpp（作者用的就是这个）
 
