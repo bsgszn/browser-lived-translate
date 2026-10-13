@@ -5270,8 +5270,16 @@ check('播放压根没开始过时，遮罩不许被收掉（否则黑屏 + 零�
   const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   const at = pj.indexOf('}, 15000)');
   if (at < 0) throw new Error('找不到 15000 那个兜底');
-  // 往前取足够长的一段（那个 setTimeout 的回调体）
-  const body = pj.slice(Math.max(0, at - 1600), at);
+  /**
+   * ⚠️ 切片必须**精确到那个 setTimeout 自己**，不能用 `at - 1600` 这种固定长度。
+   * 因为紧挨着它上面就是 `waitPlaying` 那个 `setInterval(..., 300)`，
+   * 而那个区间里**本来就有** `clearInterval(waitPlaying)`（它是正常的自我停止）。
+   * 用固定长度切片会把它切进来，于是"兜底里有没有 clearInterval"这条断言就永远为真、
+   * 完全失去意义 —— 那是本项目最典型的「断言看着在跑、其实没验到东西」。
+   */
+  const setAt = pj.lastIndexOf('setTimeout(', at);
+  if (setAt < 0) throw new Error('找不到 15000 那个 setTimeout 的开头');
+  const body = pj.slice(setAt, at);
   /**
    * ⚠️ 真实事故（用户的实测日志）：源画面静止 → tabCapture 一帧都不给 →
    * bufferedEnd() 一直是 null → _tick() 早早 return → locked 从没置真 →
@@ -5292,8 +5300,96 @@ check('播放压根没开始过时，遮罩不许被收掉（否则黑屏 + 零�
   if (!/showOverlay\(/.test(body)) {
     throw new Error('留着遮罩时没有写原因/读数 —— 用户还是只能看到一个黑屏');
   }
-  for (const kw of ['bufferAheadSec', 'totalFrames', 'droppedFrames', 'stallCount']) {
-    if (!body.includes(kw)) throw new Error(`遮罩里没显示 ${kw} —— 少了能自诊断的数字`);
+  /**
+   * 读数在 `overlayNoDataBody()` 那个辅助函数里（它同时被 15 秒兜底和 300ms 轮询调用，
+   * 所以不该把它内联进某一处 —— 那会变成两份实现，这个项目为此栽过）。
+   * 所以这里验那个函数**本身**，再验**两个调用点都用了它**。
+   */
+  const helperAt = pj.indexOf('const overlayNoDataBody');
+  if (helperAt < 0) throw new Error('找不到 overlayNoDataBody —— 「没数据」文案应当只有一处实现');
+  const helper = pj.slice(helperAt, helperAt + 700);
+  /**
+   * ⚠️ 这里**不能**只 `includes('bufferAheadSec')` —— 那是个摆设：
+   * 把属性名拼成 `bufferAheadSecXX`（`playback` 上不存在，遮罩会打出 "—"）时，
+   * `'bufferAheadSecXX'.includes('bufferAheadSec')` 仍然是 true，断言照样绿。
+   * （实测过：这个弱版本放过了那个变异。）
+   *
+   * 所以改成**跨文件核对**：从 helper 里抽出所有 `playback?.X` / `playback.X`，
+   * 再确认每一个都真的在 `lib/delayed-player.js` 里定义/赋值过。
+   * 这样连"在 delayed-player 里改了属性名、忘了改这里"也能抓到。
+   */
+  const used = [...helper.matchAll(/playback\??\.([A-Za-z][A-Za-z0-9_]*)/g)].map((m) => m[1]);
+  const uniq = [...new Set(used)];
+  if (uniq.length < 4) {
+    throw new Error(`overlayNoDataBody 只读了 ${uniq.length} 个 playback 属性（${uniq.join(',')}）—— 读数太少，用户看不出问题在哪`);
+  }
+  const dpSrc = fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8');
+  for (const name of uniq) {
+    if (!new RegExp(`(this\\.${name}\\b|get\\s+${name}\\b)`).test(dpSrc)) {
+      throw new Error(
+        `遮罩读了 playback.${name}，但 lib/delayed-player.js 里没有这个属性 —— ` +
+          '提示里的数字会是 undefined/"—"，用户反而更困惑',
+      );
+    }
+  }
+  // 定义那处不带括号（`const overlayNoDataBody = () => {`），所以带括号的就是纯调用点
+  const calls = (pj.match(/overlayNoDataBody\(\)/g) || []).length;
+  if (calls < 2) {
+    throw new Error(
+      `overlayNoDataBody() 只被调用了 ${calls} 处 —— 15 秒兜底和 300ms 轮询都该用它，` +
+        '否则同一段文案会分裂成两份（这个项目为「两份实现只改一份」栽过）',
+    );
+  }
+});
+
+check('「没数据」遮罩必须能在数据到来时自动让位（否则它把画面永久挡住）', () => {
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+
+  /**
+   * ⚠️ 这是上一次修复**自己引入的回归**，比它要修的那个 bug 更糟：
+   *
+   * 那一版在 15 秒兜底里 `clearInterval(waitPlaying)` —— 把「画面动起来就收遮罩」
+   * 那个唯一的循环停掉了。于是源画面静止时显示了「还没收到画面数据…」，
+   * 而用户一旦让它动起来、数据开始流动、画面真的出来了，**那个遮罩永远没人收**：
+   * 它把画面永久挡住，而且它没有按钮（按钮只在 play-blocked 时才有），
+   * 用户唯一的出路是关掉播放页。
+   *
+   * 换来的教训：**「没数据」这个提示只是临时说明，必须能自动让位。**
+   */
+  const at = pj.indexOf('}, 15000)');
+  if (at < 0) throw new Error('找不到 15000 那个兜底');
+  const setAt = pj.lastIndexOf('setTimeout(', at);
+  const body = pj.slice(setAt, at);
+  if (/clearInterval\(waitPlaying\)/.test(body)) {
+    throw new Error(
+      '15 秒兜底里又出现了 clearInterval(waitPlaying) —— 那会停掉唯一的收遮罩路径，' +
+        '「没数据」遮罩显示后数据来了也永远不走，画面被永久挡住',
+    );
+  }
+
+  /**
+   * 而且那个循环必须**真的会收遮罩**。
+   * 只断言"兜底里没有 clearInterval"是不够的 —— 如果循环本身不 hideOverlay，
+   * 遮罩照样出不去。所以这里验的是**区间那条路**。
+   */
+  const ivAt = pj.indexOf('}, 300)');
+  if (ivAt < 0) throw new Error('找不到 waitPlaying 那个 300ms 轮询');
+  const ivStart = pj.lastIndexOf('setInterval(', ivAt);
+  const iv = pj.slice(ivStart, ivAt);
+  if (!/hideOverlay\(\)/.test(iv)) {
+    throw new Error('waitPlaying 轮询里没有再收遮罩 —— 「没数据」遮罩显示后就出不去了');
+  }
+  // 收遮罩的判据必须是「画面真的在动」，不能只看 actualDelaySec（那和有没有在播无关）
+  if (!/!v\.paused/.test(iv)) {
+    throw new Error('收遮罩的判据里没有 !v.paused —— 缓冲在涨但画面没动时会把遮罩误收');
+  }
+  // 被自动播放拒绝时不许把那个带按钮的遮罩刷成"没数据"，两者语义不同
+  if (!/playBlocked/.test(iv)) {
+    throw new Error('轮询里没处理 playBlocked —— 会把「需要点一下才能开始播放」那个按钮刷掉');
+  }
+  // 「没数据」文案必须走 showOverlay（走 hideOverlay 就又回到黑屏零提示了）
+  if (!/showOverlay\(\s*'还没收到画面数据/.test(pj)) {
+    throw new Error('「没数据」提示没走 showOverlay —— 它必须显示出来，否则用户看到的是黑屏');
   }
 });
 

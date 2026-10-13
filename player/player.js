@@ -370,58 +370,79 @@ async function startCapture() {
   pumpSubtitles();
   pumpTranslation();
 
+  const startedAt = Date.now();
+  /** 「还没收到画面数据」那段文字 —— 带上实时读数，好让下一个遇到的人看出数字到底动没动 */
+  const overlayNoDataBody = () => {
+    const ahead = Number.isFinite(playback?.bufferAheadSec) ? `${playback.bufferAheadSec.toFixed(1)}s` : '—';
+    const total = playback?.totalFrames || 0;
+    const dropped = playback?.droppedFrames || 0;
+    const stalls = playback?.stallCount || 0;
+    const waited = Math.round((Date.now() - startedAt) / 1000);
+    return (
+      `已等 ${waited} 秒 · 缓冲 ${ahead} · 收到 ${total} 帧（掉 ${dropped}） · 见底 ${stalls} 次。` +
+      '通常是来源画面静止、或那个标签页没有画面输出 —— 让它动起来试试。'
+    );
+  };
+  let noDataShownAt = 0;
+
   /**
-   * 等第一帧画面**真正动起来**再收掉遮罩。
+   * ⚠️ 这个轮询是**收遮罩的唯一出口**，它必须一直活到画面真的动起来为止。
    *
-   * ⚠️ 判据必须同时要求「video 没在暂停」，只凭 actualDelaySec 是不够的 ——
-   * 播放页是扩展打开的标签页，没有用户手势，带声音的 play() 会被自动播放策略拒绝
+   * 收遮罩的条件只有「画面真的在动」（`!video.paused`），只凭 `actualDelaySec` 是不够的 ——
+   * 播放页是扩展打开的标签页，没有用户手势，带声音的 `play()` 会被自动播放策略拒绝
    * （`_notePlayBlocked` 会发 `play-blocked`，上面那段显示"需要点一下才能开始播放"）。
    * **而那时缓冲照样在涨、`actualLagSec` 照样算得出来、`actualDelaySec` 照样非 null**，
    * 于是这个 interval 会在 300ms 内把那个遮罩收掉 ——
    * 用户看到的就是**黑屏 + 字幕正常 + 零提示**，根本不知道该点一下。
-   * （`actualDelaySec` 在 `_tick` 里是 `bufferedEnd − currentTime`，和"有没有在播"无关。）
    *
-   * 实测:被拒时 `actualDelaySec` 仍然是 6.6（因为它只是 `bufferedEnd − currentTime`，
-   * 和"有没有在播"无关），而 `video.paused` 是 true —— 拿这两个量对比就能复现。
+   * 唯一的例外是「被自动播放策略拒绝」：那时只有用户点按钮能恢复，
+   * 所以停止轮询、把遮罩留给那个按钮，别把它刷掉。
+   *
+   * 另外：如果当前显示的是「还没收到画面数据…」，每 2 秒刷新一次读数 ——
+   * 让用户看到「缓冲 / 帧数」到底在不在动，而不是盯着一组冻结的数字。
    */
   const waitPlaying = setInterval(() => {
     const v = $('video');
     if (!v.paused && playback?.actualDelaySec !== null && playback?.actualDelaySec !== undefined) {
       clearInterval(waitPlaying);
       hideOverlay();
+      return;
+    }
+    if (playback?.playBlocked) {
+      clearInterval(waitPlaying);
+      return;
+    }
+    if (noDataShownAt && Date.now() - noDataShownAt > 2000) {
+      noDataShownAt = Date.now();
+      showOverlay('还没收到画面数据…', overlayNoDataBody(), '');
     }
   }, 300);
+
   setTimeout(() => {
-    clearInterval(waitPlaying);
     /**
-     * ⚠️ 只有「真的开始播了」或「被自动播放策略拒了」才允许收遮罩。
+     * ⚠️⚠️ 这里**绝对不能** `clearInterval(waitPlaying)`。
      *
-     * 原来这里写的是 `if (!playback?.playBlocked) hideOverlay()` ——
-     * **而 `playBlocked` 只表示"play() 被拒了"。「压根没走到播放」时它同样是 false**，
-     * 于是遮罩照样被收掉，用户面对的是**黑屏 + 零提示**。
+     * 踩过的坑：原来这里写的是「15 秒到了就停掉那个轮询，并且只有 locked/playBlocked 才收遮罩」。
+     * 于是源画面静止时会显示「还没收到画面数据…」，**而用户一旦让它动起来、
+     * 数据开始流动、画面真的出来了，那个遮罩就永远没人收** ——
+     * 它把画面永久挡住，而且它**没有按钮**（按钮只在 play-blocked 时才有），
+     * 用户唯一的出路是关掉播放页。**比原来的黑屏更糟。**
      *
-     * 实测踩到的场景（用户的真实日志）：**源画面静止 → tabCapture 一帧都不给**
-     *   `缓冲 · 前方 0.0s · 见底 0 次 · 掉帧 0/0`、`输入电平 0.0000`，33 秒一次没涨。
-     * 于是 `bufferedEnd()` 一直是 null → `_tick()` 早早 return → `locked` 从没置真 →
-     * `play()` 压根没被调用 → `playBlocked` 保持 false → **遮罩被这一行收掉**。
-     * 用户只看到黑屏，完全不知道是"采集没数据"还是"播放被拒"。
+     * 正确语义：「没数据」这个提示只是一个**临时说明**，必须能在数据到来时自动让位。
+     * 所以轮询留着，收遮罩的判据统一交给上面 `waitPlaying` 里那一处。
      *
-     * 现在：留着遮罩，**并把实际读数写出来** —— 下一个遇到的人一眼就能分辨。
+     * 为什么不是 `if (!playback?.playBlocked)`：`playBlocked` 只表示"play() 被拒了"，
+     * 而「压根没走到播放」（缓冲从没填够）时它同样是 false —— 那种情况必须给提示。
+     * 实测：源画面静止 → tabCapture 一帧都不给（`缓冲 前方 0.0s · 掉帧 0/0 · 输入电平 0.0000`）
+     * → `bufferedEnd()` 一直是 null → `_tick()` 早早 return → `locked` 从没置真 →
+     * `play()` 压根没被调用 → 遮罩被无条件收掉，用户只看到黑屏。
      */
     if (playback?.locked || playback?.playBlocked) {
       hideOverlay();
       return;
     }
-    const ahead = Number.isFinite(playback?.bufferAheadSec) ? `${playback.bufferAheadSec.toFixed(1)}s` : '—';
-    const total = playback?.totalFrames || 0;
-    const dropped = playback?.droppedFrames || 0;
-    const stalls = playback?.stallCount || 0;
-    showOverlay(
-      '还没收到画面数据…',
-      `已等 15 秒 · 缓冲 ${ahead} · 收到 ${total} 帧（掉 ${dropped}） · 见底 ${stalls} 次。` +
-        '通常是来源画面静止、或那个标签页没有画面输出 —— 让它动起来试试。',
-      '',
-    );
+    noDataShownAt = Date.now();
+    showOverlay('还没收到画面数据…', overlayNoDataBody(), '');
   }, 15000);
 
   void chrome.runtime
