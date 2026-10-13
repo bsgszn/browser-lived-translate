@@ -6,6 +6,17 @@
   </head>
   <body>
     <!-- 该文档不可见，仅用于承载 tabCapture 音频流、AudioWorklet 与 ASR WebSocket。 -->
+    <!--
+      onnxruntime-web（本地 VAD 用）。
+
+      ⚠️ 这个页面也会 `createAsrSession()`（叠加模式的 ASR 跑在这里），
+      所以它和播放页一样需要这个依赖 —— **漏了它的后果是叠加模式 + 本地 VAD
+      直接报「onnxruntime 没加载」，而且不报错在真正的原因上**（这个坑踩过一次）。
+
+      ⚠️ 必须**本地文件**，不能从 CDN 加载 —— MV3 的 CSP 只允许 'self'。
+      它是个 UMD 脚本，加载后在 window.ort 上；WASM 与模型都从 vendor/ 读。
+    -->
+    <script src="../vendor/ort.min.js"></script>
     <script type="module" src="offscreen.js"></script>
   </body>
 </html>

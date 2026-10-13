@@ -5187,5 +5187,84 @@ check('默认模型必须能自己选对端点（qwen-audio-3.1 → 原生），
   }
 });
 
+check('能创建 ASR 会话的页面必须引入 onnxruntime（否则本地 VAD 直接报「onnxruntime 没加载」）', () => {
+  /**
+   * 实测事故：叠加模式的 ASR 会话建在 **offscreen document** 里
+   * （offscreen.js 调 createAsrSession），而 offscreen.html 从来没引入 vendor/ort.min.js
+   * → 叠加模式 + 本地 VAD 必然失败。
+   *
+   * 延迟模式没事，因为 player.html 引了 —— 所以这个洞藏了很久，
+   * 直到有人同时用了「叠加模式」和「本地 VAD」（两个条件各有一半人满足，交集一直没人踩到）。
+   *
+   * ⚠️ 判据**反着写**：先从代码里找出谁真的调了 createAsrSession（看调用点），
+   * 再检查那个页面的 HTML。**名单是推导出来的，不是手写的** ——
+   * 手写名单会和现实脱节，而这个项目在「断言只是摆设」上栽过六次。
+   */
+  const root = process.cwd();
+  const skipDir = /^(node_modules|\.|vendor|tools|docs)$/;
+  const jsFiles = [];
+  (function walk(d) {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (skipDir.test(e.name)) continue;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith(".js")) jsFiles.push(p);
+    }
+  })(root);
+
+  // ① 谁真的在建 ASR 会话？
+  const callers = [];
+  for (const f of jsFiles) {
+    const src = stripComments(fs.readFileSync(f, "utf8"));
+    if (!/createAsrSession\s*\(/.test(src)) continue;
+    const html = f.replace(/\.js$/, ".html");
+    if (!fs.existsSync(html)) continue; // 纯库文件（如 lib/asr/index.js 只导出，不是页面）
+    // ⚠️ 统一成正斜杠：Windows 的 path.relative 返回反斜杠，而下面豁免名单用的是正斜杠，
+    //    不归一化会让豁免永远匹配不上（写这条断言时就是这么栽的）。
+    const norm = (p) => p.split(path.sep).join('/');
+    callers.push({ js: norm(path.relative(root, f)), html: norm(path.relative(root, html)) });
+  }
+  if (callers.length < 2) {
+    throw new Error(`只找到 ${callers.length} 个建 ASR 会话的页面 —— 判据大概失效了（至少该有播放页和 offscreen）`);
+  }
+
+  // ② 明确不需要 onnxruntime 的页面 —— 每一条都必须写明理由
+  const EXEMPT = {
+    "options/options.html":
+      "设置页的「测试识别连接」不支持需要本地 VAD 的服务（vad.js 的报错文案里写明了，让用户去播放页实测）",
+  };
+
+  // ③ 不带 onnxruntime 就建不了本地 VAD 会话的页面，必须引入
+  const bad = [];
+  for (const c of callers) {
+    if (EXEMPT[c.html]) continue;
+    const html = fs.readFileSync(path.join(root, c.html), "utf8");
+    if (!/vendor\/ort\.min\.js/.test(html)) bad.push(c.html + "（由 " + c.js + " 建会话）");
+  }
+  if (bad.length) {
+    throw new Error(
+      "这些页面会 createAsrSession，却没引入 vendor/ort.min.js —— " +
+        "本地 VAD 会在那里报「onnxruntime 没加载」：" + bad.join("、"),
+    );
+  }
+
+  // ④ 豁免名单不许腐坏：被豁免的页面必须真的还在建会话
+  for (const html of Object.keys(EXEMPT)) {
+    if (!callers.some((c) => c.html === html)) {
+      throw new Error(`${html} 被豁免了，但它已经不再建 ASR 会话 —— 请删掉这条豁免（陈旧名单会掩盖真问题）`);
+    }
+  }
+
+  // ⑤ 豁免的理由必须真的写在报错文案里（验「它起作用」，不是验「符号存在」）
+  const vadSrc = fs.readFileSync(path.join(root, "lib", "asr", "vad.js"), "utf8");
+  const msg = (vadSrc.match(/onnxruntime 没加载[\s\S]{0,400}/) || [""])[0];
+  if (!/设置页/.test(msg)) {
+    throw new Error("vad.js 那条 onnxruntime 报错没提设置页 —— 用户看不懂该去哪儿测（豁免名单的理由就不成立了）");
+  }
+  if (/播放页需要/.test(msg)) {
+    throw new Error("那条报错又写成「播放页需要…」了 —— 它会从设置页和 offscreen 触发，不能假定页面");
+  }
+});
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
