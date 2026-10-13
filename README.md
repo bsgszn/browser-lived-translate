@@ -1,6 +1,6 @@
 # livedtranslate · 浏览器同声传译
 
-![version](https://img.shields.io/badge/version-2.66.4-blue)
+![version](https://img.shields.io/badge/version-2.66.5-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![manifest](https://img.shields.io/badge/Manifest-V3-orange)
 
@@ -1112,7 +1112,7 @@ Deepgram 官方文档（[Smart Formatting](https://developers.deepgram.com/docs/
 **默认开着**，不用勾任何东西。只要开始同传，**字幕上方**就会出现一个面板，第一行是版本号：
 
 ```
-livedtranslate v2.66.4 · 字幕层就绪
+livedtranslate v2.66.5 · 字幕层就绪
 识别 0.4s · 翻译 0.25s
 翻译完成 · 312ms · google-free
 ```
