@@ -370,16 +370,32 @@ async function startCapture() {
   pumpSubtitles();
   pumpTranslation();
 
-  // 等第一帧画面真正动起来再收掉遮罩
+  /**
+   * 等第一帧画面**真正动起来**再收掉遮罩。
+   *
+   * ⚠️ 判据必须同时要求「video 没在暂停」，只凭 actualDelaySec 是不够的 ——
+   * 播放页是扩展打开的标签页，没有用户手势，带声音的 play() 会被自动播放策略拒绝
+   * （`_notePlayBlocked` 会发 `play-blocked`，上面那段显示"需要点一下才能开始播放"）。
+   * **而那时缓冲照样在涨、`actualLagSec` 照样算得出来、`actualDelaySec` 照样非 null**，
+   * 于是这个 interval 会在 300ms 内把那个遮罩收掉 ——
+   * 用户看到的就是**黑屏 + 字幕正常 + 零提示**，根本不知道该点一下。
+   * （`actualDelaySec` 在 `_tick` 里是 `bufferedEnd − currentTime`，和"有没有在播"无关。）
+   *
+   * 实测:被拒时 `actualDelaySec` 仍然是 6.6（因为它只是 `bufferedEnd − currentTime`，
+   * 和"有没有在播"无关），而 `video.paused` 是 true —— 拿这两个量对比就能复现。
+   */
   const waitPlaying = setInterval(() => {
-    if (playback?.actualDelaySec !== null && playback?.actualDelaySec !== undefined) {
+    const v = $('video');
+    if (!v.paused && playback?.actualDelaySec !== null && playback?.actualDelaySec !== undefined) {
       clearInterval(waitPlaying);
       hideOverlay();
     }
   }, 300);
   setTimeout(() => {
     clearInterval(waitPlaying);
-    hideOverlay();
+    // ⚠️ 被自动播放策略拒绝时，那个「开始播放」按钮是**唯一的恢复途径**，绝不能收掉。
+    // 否则用户面对的就是一个看不出任何原因的静止画面。
+    if (!playback?.playBlocked) hideOverlay();
   }, 15000);
 
   void chrome.runtime
