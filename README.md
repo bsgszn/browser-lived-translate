@@ -1,6 +1,6 @@
 # livedtranslate · 浏览器同声传译
 
-![version](https://img.shields.io/badge/version-2.66.3-blue)
+![version](https://img.shields.io/badge/version-2.66.4-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![manifest](https://img.shields.io/badge/Manifest-V3-orange)
 
@@ -857,7 +857,7 @@ browser-lived-translate/
 ├── tools/                         开发期自检脚本（不参与扩展运行）
 │   ├── README.md                  测试说明
 │   ├── manifest-check.mjs         80 项：manifest / 路径 / DOM id / 硬约束 静态完整性
-│   ├── smoke-test.mjs             325 项：模块加载 / 滤波器与 AGC / 断句状态机 / 预设 / 术语表 / 签名 / 防复发
+│   ├── smoke-test.mjs             328 项：模块加载 / 滤波器与 AGC / 断句状态机 / 预设 / 术语表 / 签名 / 防复发
 │   ├── pipeline-test.mjs          126 项：音频引擎全链路（桩对象驱动）
 │   ├── worker-test.mjs            60 项：service worker 状态机与消息路由（含竞态回归）
 │   ├── bump-version.mjs           改版本号、同步文档、**自动存历史快照**
@@ -1112,7 +1112,7 @@ Deepgram 官方文档（[Smart Formatting](https://developers.deepgram.com/docs/
 **默认开着**，不用勾任何东西。只要开始同传，**字幕上方**就会出现一个面板，第一行是版本号：
 
 ```
-livedtranslate v2.66.3 · 字幕层就绪
+livedtranslate v2.66.4 · 字幕层就绪
 识别 0.4s · 翻译 0.25s
 翻译完成 · 312ms · google-free
 ```
@@ -1290,6 +1290,21 @@ Deepgram 新的 `/v2/listen`（Flux）每 **0.25 秒**推一条 `Update`，比 N
 
 ## 九、常见问题
 
+### 播放页显示「还没收到画面数据…」
+
+**那不是扩展坏了，是它在等你给它画面。** 那行字里会带实时读数：
+
+```
+已等 15 秒 · 缓冲 0.0s · 收到 0 帧（掉 0） · 见底 0 次。
+通常是来源画面静止、或那个标签页没有画面输出 —— 让它动起来试试。
+```
+
+- **`收到 0 帧`、`缓冲 0.0s` 一直不动** → 那个标签页确实没有画面输出。
+  常见于**视频处于暂停**、或者页面本身是静止的（纯音频页、音乐播放页）。
+  **让画面动起来（播放视频）它就会自动消失** —— 数据一到就收掉。
+- **数字在涨但画面还是黑的** → 那是另一个问题，请把这份日志贴出来。
+
+> ⚠️ 这个提示是**自动让位**的：一旦收到画面数据就立刻消失，不需要你点任何东西。
 ### 📋 报问题之前：先复制这份日志
 
 **没有日志我没法查。** 好消息是它很容易拿。
@@ -1390,7 +1405,7 @@ A：字幕样式改 `content/content.js` 里的 `CSS` 常量；新增识别服�
   node tools/pipeline-test.mjs   # 音频引擎全链路，桩对象驱动
   node tools/worker-test.mjs     # service worker 状态机与消息路由
   ```
-  四套一共 **598 项断言**（87 + 325 + 126 + 60）。
+  四套一共 **601 项断言**（87 + 328 + 126 + 60）。
   `pipeline-test` 会桩掉 `AudioContext` / `AudioWorkletNode` / `WebSocket` / `fetch` / `performance.now`，
   真实走完「启动 → 分析支路 → PCM → 重采样 → ASR 事件 → 翻译（含上下文）→ 下发字幕 → 停止 → 重启」，
   覆盖字幕行复用、译文与原文错配、AGC 收敛与回落、识别滞后夹取、**翻译请求背压与定稿抢占**、缓存命中、去重、资源回收等不变量。
