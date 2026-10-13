@@ -753,15 +753,29 @@ async function probeWhisper(cfg) {
       `连不上 ${url}\n` +
         '（浏览器报 Failed to fetch = 请求根本没发出去，不是服务器拒绝了它）\n' +
         '① 服务真的在跑吗？先双击「启动本地字幕服务.bat」\n' +
-        '② 地址里的主机名用 127.0.0.1，**别用 localhost** —— 服务只监听 IPv4，\n' +
+        '② 地址里的主机名用 127.0.0.1，别用 localhost —— 服务只监听 IPv4，\n' +
         '   localhost 可能被解析成 IPv6 的 ::1，那就连不上\n' +
-        '③ 地址要填到 /v1 为止，例如 http://127.0.0.1:8080/v1\n' +
+        '③ 地址填到「你的服务挂 /audio/transcriptions 的那一段」为止 ——\n' +
+        '   挂在 /v1/audio/transcriptions 就填 http://127.0.0.1:8080/v1，\n' +
+        '   直接挂在 /audio/transcriptions 就不带 /v1。两种都试一下\n' +
         `④ 服务没启动完就点测试也会这样，等它打印出 listening 再试`,
     );
   }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`HTTP ${res.status}${body ? '：' + body.slice(0, 200) : ''}`);
+    // ⚠️ 「未找到文件」最常见的**不是**服务坏了，而是地址前缀多一段或少一段 ——
+    // 因为扩展会在你填的地址后面自己接 /audio/transcriptions。
+    // 这条提示必须放在这里（服务有响应），而不是上面那个 Failed to fetch 分支：
+    // 前缀错了服务器是**会回包**的，只是回 404。
+    const prefixHint =
+      res.status === 404 || /not\s*found|未找到/i.test(body)
+        ? `\n完整请求地址是 ${url}\n` +
+          '「未找到文件」通常是地址前缀的问题，不是服务坏了：\n' +
+          '  · 服务挂在 /v1/audio/transcriptions → 地址填到 /v1 为止\n' +
+          '  · 服务直接挂在 /audio/transcriptions → 地址就不带 /v1\n' +
+          '把 /v1 加上或去掉，再点一次测试。'
+        : '';
+    throw new Error(`HTTP ${res.status}${body ? '：' + body.slice(0, 200) : ''}${prefixHint}`);
   }
   return res.status;
 }

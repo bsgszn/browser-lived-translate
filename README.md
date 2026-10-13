@@ -267,7 +267,18 @@ whisper-server.exe -m ggml-large-v3.bin -l ja --inference-path /v1/audio/transcr
 
 **然后设置页 → 识别服务选 `本地 VAD 断句 + 本地 Whisper`**（列表里第一项），服务地址填你上面起的那个。
 
-> ⚠️ **地址要带 `/v1`**：`http://127.0.0.1:8080/v1`。填成 `http://127.0.0.1:8080` 会 404。
+> **⚠️ 填到哪为止，取决于你的服务把 `/audio/transcriptions` 挂在哪 —— 不是一律要带 `/v1`。**
+>
+> 扩展会在你填的地址后面**自己接上 `/audio/transcriptions`**（OpenAI 兼容路径）。所以：
+>
+> | 你的服务 | 该填什么 |
+> |---|---|
+> | 用 `--inference-path /v1/audio/transcriptions`（上面那条命令就是） | `http://127.0.0.1:8080/v1` |
+> | 直接挂在 `/audio/transcriptions`（有些服务默认如此） | `http://127.0.0.1:8080` |
+>
+> **怎么判断**：浏览器打开「你打算填的地址 + `/audio/transcriptions`」，或者打开它的 `/models` —— 哪个前缀下能通就填哪个。
+>
+> **⚠️ 报 404 / 未找到文件时，先别怀疑服务坏了 —— 很可能是前缀多了一段或少了一段，两个都试一下。**
 
 #### 两种本地识别路线怎么选
 
@@ -1401,7 +1412,9 @@ A：说明模型没被正确喂进去。诊断面板会把几种窗长各自的�
 
 **Q：选了本地 VAD，但识别服务连不上 / 一直没结果**
 A：① 确认本机那个 Whisper 服务真的在跑（浏览器打开 `http://127.0.0.1:8080/v1/models` 试试）；
-② 地址**要带 `/v1`**，漏了会 404；③ 看诊断面板的 `识别就绪 · …Whisper @ …` 那一行，
+② 地址**填到哪为止要看你的服务** —— 扩展会在它后面接 `/audio/transcriptions`，
+所以服务挂在 `/v1/audio/transcriptions` 就填到 `/v1`，直接挂在 `/audio/transcriptions` 就不带 `/v1`；
+**两种都试一下，报「未找到文件」通常是前缀多一段或少一段**；③ 看诊断面板的 `识别就绪 · …Whisper @ …` 那一行，
 地址对不对一眼就知道。
 
 **Q：用了 DeepSeek / Ollama，报 `model not found`**
