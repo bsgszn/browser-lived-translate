@@ -23,6 +23,7 @@ import { createRefiner } from '../lib/asr/refine.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
 import {
   DelayedPlayback,
+  DELAY_MIN_SEC,
   SubtitleSchedule,
   isSupported,
   buildContextWindow,
@@ -333,7 +334,7 @@ async function startCapture() {
 
   // —— 延迟画面 ——
   playback = new DelayedPlayback($('video'), {
-    delaySec: Number(settings.capture.delaySec) || 2.5,
+    delaySec: Number(settings.capture.delaySec) || DELAY_MIN_SEC,
     // 0 / 未设 = 按实际画面尺寸自动估（4K 自动给到 20~40 Mbps）。
     // ⚠️ 以前写死 4 Mbps，4K 下运动画面会糊 —— 码率不够时编码器只能丢细节。
     bitsPerSecond: Number(settings.capture.delayBitsPerSecond) || 0,
@@ -727,7 +728,7 @@ function scheduleUtterance(u) {
 
   // ⚠️ 这里用**目标延迟**而不是 EMA 实测值，而且不调用 currentDelayMs()。
   // 那个函数有副作用（刷 EMA），在诊断里顺手调它会污染排期用的那个指数平均。
-  const delayForDiagSec = Number(settings.capture.delaySec) || 2.5;
+  const delayForDiagSec = Number(settings.capture.delaySec) || DELAY_MIN_SEC;
   const asrLagSec = delayForDiagSec - (at - Date.now()) / 1000;
   diag(
     `整句上屏 · ${((at - Date.now()) / 1000).toFixed(1)}s 后 · ${text.length} 字 · ${u.reason}` +
@@ -968,7 +969,7 @@ function buildContext(seg) {
 
 /** 排期用的延迟值：优先用实测的（平滑后），拿不到就退回目标值 */
 function currentDelayMs() {
-  const target = (Number(settings.capture.delaySec) || 2.5) * 1000;
+  const target = (Number(settings.capture.delaySec) || DELAY_MIN_SEC) * 1000;
   const actual = playback?.actualDelaySec;
   if (!Number.isFinite(actual) || actual <= 0) return target + recorderLagMs();
   // ⚠️ 必须把「录音/编码滞后」加进来 —— 这是字幕恒偏早的根因。
@@ -1249,8 +1250,8 @@ function renderSubs() {
 // ═══════════════════════════ UI ═══════════════════════════
 
 function applySettingsToUi() {
-  $('delay').value = String(settings.capture.delaySec ?? 2.5);
-  $('delayVal').textContent = `${Number(settings.capture.delaySec ?? 2.5).toFixed(1)}s`;
+  $('delay').value = String(settings.capture.delaySec ?? DELAY_MIN_SEC);
+  $('delayVal').textContent = `${Number(settings.capture.delaySec ?? DELAY_MIN_SEC).toFixed(1)}s`;
   $('sync').value = String(settings.capture.syncOffsetMs ?? 0);
   $('syncVal').textContent = `${settings.capture.syncOffsetMs ?? 0}ms`;
   $('vol').value = String(settings.capture.volume ?? 1);
@@ -1356,7 +1357,7 @@ function tickUi() {
   $('statBuf').textContent = `缓冲 ${buf === null ? '—' : buf.toFixed(1) + 's'}`;
 
   // 把"延迟预算怎么花的"直接写在界面上：延迟 = 等后文的时间 + 翻译的时间
-  const delayMs = Number.isFinite(actual) && actual > 0 ? actual * 1000 : (Number(settings.capture.delaySec) || 2.5) * 1000;
+  const delayMs = Number.isFinite(actual) && actual > 0 ? actual * 1000 : (Number(settings.capture.delaySec) || DELAY_MIN_SEC) * 1000;
   const leadMs = effectiveLeadMs(translateEma);
   const budget = delayMs - leadMs;
   if (buf !== null && buf < 0.6 && actual !== null && actual !== undefined) {

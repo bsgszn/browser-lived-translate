@@ -388,7 +388,11 @@ check('延迟值被夹在合理区间', () => {
   if (dp.clampDelay(0.1) !== dp.DELAY_MIN_SEC) throw new Error('过小没被夹住');
   if (dp.clampDelay(99) !== dp.DELAY_MAX_SEC) throw new Error('过大没被夹住');
   if (dp.clampDelay(3) !== 3) throw new Error('正常值被改了');
-  if (dp.clampDelay(NaN) !== 2.5) throw new Error('非法输入应回落到默认 2.5');
+  // ⚠️ 这里原来是 2.5 —— 那是下限还是 0.5 时的"默认"。下限抬到 3 之后，
+  // 非法输入的兜底也必须是 3（否则 clampDelay(NaN) 会返回一个**低于下限**的值）。
+  if (dp.clampDelay(NaN) !== dp.DELAY_MIN_SEC) {
+    throw new Error(`非法输入应回落到下限 ${dp.DELAY_MIN_SEC}，实际 ${dp.clampDelay(NaN)}`);
+  }
 });
 
 check('纠偏：死区内不动 playbackRate', () => {
@@ -5469,6 +5473,72 @@ check('遮罩要说清「解不出帧」，不能给用户一个零提示的黑�
   if (!/showOverlay\(/.test(seg)) throw new Error('no-decodable-frame 只打日志、没有显示遮罩 —— 用户还是只看到黑屏');
   if (!/采集帧率上限/.test(seg)) throw new Error('遮罩没提到帧率上限这个原因');
   if (!/静止/.test(seg)) throw new Error('遮罩没提到「来源画面静止」这个原因');
+});
+
+
+check('画面延迟下限必须是 3 秒，而且老用户 storage 里的旧值绕不过去', () => {
+  const dp = loaded['lib/delayed-player.js'];
+  /**
+   * ⚠️ 为什么这条要单独守：本项目在「改了默认值，老用户却拿不到」上栽过两次
+   * （delayBitsPerSecond 4000000→0、asr.dashscope.endpoint 内置URL→''）。
+   * 两次结论都是：光改界面 / 光加迁移不够，**代码侧必须能自保**。
+   * 所以下限要落在 clampDelay 这个唯一执行点上，且它必须覆盖"非有限值"。
+   */
+  if (dp.DELAY_MIN_SEC !== 3) throw new Error('DELAY_MIN_SEC 不是 3，实际 ' + dp.DELAY_MIN_SEC);
+  if (dp.DELAY_MAX_SEC < 12) throw new Error('DELAY_MAX_SEC 被改小了：' + dp.DELAY_MAX_SEC);
+
+  // 低于下限 → 抬到 3；非有限值 → 也是 3（不能退回 2.5 那种旧默认）
+  for (const bad of [0.5, 1.5, 2.5, 2.9, 0, -1, NaN, undefined, null, 'abc']) {
+    const got = dp.clampDelay(bad);
+    if (got !== 3) throw new Error('clampDelay(' + String(bad) + ') = ' + got + '，应为 3');
+  }
+  // 区间内 / 超过上限 → 原样或截到上限
+  if (dp.clampDelay(6.6) !== 6.6) throw new Error('clampDelay(6.6) 不该被改');
+  if (dp.clampDelay(12) !== 12) throw new Error('clampDelay(12) 应等于上限');
+  if (dp.clampDelay(99) !== dp.DELAY_MAX_SEC) throw new Error('超过上限应截到 DELAY_MAX_SEC');
+
+  // ★ 关键：模拟"老用户 storage 里存着 1.5" —— 实际用到的必须仍是 3
+  const p = Object.create(dp.DelayedPlayback.prototype);
+  p.video = { paused: true, buffered: { length: 0 }, currentTime: 0 };
+  p.onStatus = () => {};
+  p.quality = 'standard';
+  p.bitsPerSecond = 0;
+  // 直接走构造路径里那句 clampDelay
+  const std = dp.clampDelay(1.5);
+  if (std !== 3) throw new Error('storage 里 1.5 没有被抬到 3 —— 老用户会绕过下限');
+
+  // 默认值不能低于下限（否则全新安装一上来就违规）
+  const d = settings.DEFAULT_SETTINGS.capture.delaySec;
+  if (d < dp.DELAY_MIN_SEC) throw new Error('默认 delaySec ' + d + ' 低于下限 ' + dp.DELAY_MIN_SEC);
+
+  // 预设里也不许有低于下限的
+  for (const preset of settings.LATENCY_PRESETS) {
+    const v = preset.values['capture.delaySec'];
+    if (v !== undefined && v < dp.DELAY_MIN_SEC) {
+      throw new Error('预设 ' + preset.id + ' 的 delaySec ' + v + ' 低于下限');
+    }
+  }
+
+  // 界面两个 range 的 min 必须跟着改（改代码不改界面 = 用户仍能拖到 1.5）
+  for (const f of ['popup/popup.html', 'player/player.html']) {
+    const html = fs.readFileSync(path.join(process.cwd(), f), 'utf8');
+    const m = html.match(/<input type="range" id="(delaySec|delay)"[^>]*min="([\d.]+)"/);
+    if (!m) throw new Error(f + ' 找不到延迟 range');
+    if (Number(m[2]) < dp.DELAY_MIN_SEC) {
+      throw new Error(f + ' 的 range min=' + m[2] + ' 低于下限 ' + dp.DELAY_MIN_SEC);
+    }
+  }
+
+  // 不许再有散落的 2.5 兜底（那是旧默认值，会让下限在某些路径上失效）
+  for (const f of ['player/player.js', 'popup/popup.js']) {
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), f), 'utf8'));
+    const stray = src.match(/\|\|\s*2\.5|\?\?\s*2\.5/g);
+    if (stray) throw new Error(f + ' 里还有 ' + stray.length + ' 处 2.5 兜底：' + stray.join(', '));
+  }
+
+  // 播放页的延迟兜底必须来自那个常量，不是字面量
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  if (!/DELAY_MIN_SEC/.test(pj)) throw new Error('player.js 没有引用 DELAY_MIN_SEC —— 兜底会退回旧值');
 });
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);

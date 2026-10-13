@@ -23,8 +23,8 @@ async function init() {
 
   fillSelect($('targetLang'), TARGET_LANGS.map((l) => ({ value: l.id, label: l.label })), settings.translate.target);
   $('captureMode').classList.add('seg');
-  $('delaySec').value = String(settings.capture?.delaySec ?? 2.5);
-  $('delayVal').textContent = `${Number(settings.capture?.delaySec ?? 2.5).toFixed(1)}s`;
+  $('delaySec').value = String(settings.capture?.delaySec ?? 3);
+  $('delayVal').textContent = `${Number(settings.capture?.delaySec ?? 3).toFixed(1)}s`;
   setMode(currentMode());
   $('position').value = settings.ui.position;
   $('muteOriginal').checked = !!settings.audio.muteOriginal;
