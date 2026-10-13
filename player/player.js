@@ -244,8 +244,33 @@ async function startCapture() {
   showOverlay('正在取得标签页画面…', '浏览器会同时把原标签页静音——这是 tabCapture 的固有行为，声音改由本页播放。', '');
   diag('正在取得标签页流…', true);
 
-  /** 采集帧率上限。0 = 不限制。不显式给的话 Chrome 默认常常只给 30fps。 */
-  const maxFrameRate = Number(settings.capture.maxFrameRate ?? 60) || 0;
+  /**
+   * 采集帧率上限。0 = 不限制。不显式给的话 Chrome 默认常常只给 30fps。
+   *
+   * ⚠️ **必须钳一个下限 —— 压得太低会让画面和声音一起没有。**
+   *
+   * 踩过的坑（用户实测）:填 `5` → 黑屏 + 无声 + 字幕正常。
+   * 机理:录制分片是 250ms 一片，5fps 时一片里只有约 1.25 帧 →
+   * 编码器 GOP 被拉长 → **第一个分片里没有关键帧** → SourceBuffer 有数据、
+   * `buffered` 也在涨，但**解不出任何一帧** → `<video>` 卡住不推进 →
+   * 画面黑、声音也没有（声音来自这个元素的音轨），而字幕走独立管线、照常工作。
+   *
+   * 所以低于下限一律按下限走，**并且不报错**（用户填的是"上限"，钳上去是安全方向）。
+   * 12 这个值的依据:分片 250ms 要拿到关键帧，帧间隔不能长到让一片里连一个 I 帧都没有；
+   * 实测 5 必坏、45 正常，取 12 留了足够余量，同时远低于常见的 24/30/60 源帧率，
+   * 不会影响任何正常来源。
+   */
+  const MIN_MAX_FRAME_RATE = 12;
+  const rawMaxFrameRate = Number(settings.capture.maxFrameRate ?? 60) || 0;
+  // 0 = 用户明确要不限制，尊重它；>0 但太小 → 钳到下限
+  const maxFrameRate = rawMaxFrameRate > 0 ? Math.max(MIN_MAX_FRAME_RATE, rawMaxFrameRate) : 0;
+  if (rawMaxFrameRate > 0 && rawMaxFrameRate < MIN_MAX_FRAME_RATE) {
+    diag(
+      `采集帧率上限 ${rawMaxFrameRate} 太低（会让分片里没有关键帧、画面和声音都出不来），` +
+        `已按 ${MIN_MAX_FRAME_RATE} 走`,
+      true,
+    );
+  }
 
   stream = await navigator.mediaDevices.getUserMedia({
     video: {
@@ -353,6 +378,32 @@ async function startCapture() {
               if (ok) hideOverlay();
             },
           },
+        );
+      }
+      /**
+       * ⚠️ 缓冲在涨、却解不出任何一帧。
+       *
+       * 触发条件（实测）:采集帧率上限压得太低（如 5）→ 分片里没有关键帧；
+       * 或者**源画面长时间静止** → 合成器不产新帧。两者是同一个根因:
+       * `buffered` 在涨，但没有可解码的帧 → `<video>` 卡住不推进 →
+       * **画面黑 + 声音也没有**（声音来自这个元素的音轨），而字幕照常 ——
+       * 也就是那条「只有字幕没画面没声音」。
+       *
+       * 必须说出来，否则用户只能看到一个黑屏、完全不知道该查什么。
+       * ⚠️ 说清"这是采不到可解码的帧"，而不是"扩展坏了"。
+       */
+      if (s.phase === 'no-decodable-frame') {
+        diag(
+          `缓冲已有 ${(s.bufferedSec || 0).toFixed(1)}s，但解不出帧` +
+            `（readyState ${s.readyState}，等了 ${((s.waitedMs || 0) / 1000).toFixed(1)}s）`,
+          true,
+        );
+        showOverlay(
+          '收到了数据，但解不出画面',
+          `已经缓冲 ${(s.bufferedSec || 0).toFixed(1)} 秒，可是解码器一帧都解不出来（readyState ${s.readyState}）。`,
+          '常见原因：① 采集帧率上限设得太低（分片里没有关键帧）；'
+            + '② 来源画面长时间静止（合成器不产新帧）。'
+            + '把「采集帧率上限」改回 30 或 60、或让来源画面动起来再试。',
         );
       }
     },

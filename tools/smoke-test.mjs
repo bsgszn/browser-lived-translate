@@ -4328,7 +4328,7 @@ check('VAD 模式必须把提示词发出去（以前接线漏了，用户填了
 
 check('延迟无限增长必须被夹住（涨上去不拉回来的话会撞配额→空洞→播放头卡死）', () => {
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
-  const tick = src.slice(src.indexOf('_tick()'), src.indexOf('_tick()') + 4200);
+  const tick = src.slice(src.indexOf('_tick()'), src.indexOf('\n  /**', src.indexOf('_tick()')) > 0 ? src.indexOf('\n  /**', src.indexOf('_tick()')) : src.length);
   if (!tick) throw new Error('找不到 _tick()');
   // ⚠️ 真实事故：smoothRate 关掉时速率恒为 1，**没有任何机制把涨上去的延迟拉回来**。
   // 播放头因解码 4K60 偶尔卡顿、走得比实时慢，录制端却是实时的 →
@@ -5403,6 +5403,72 @@ check('那句关于 SharedArrayBuffer 的注释必须是准确的（它误导过
   if (/省掉 SharedArrayBuffer/.test(src)) {
     throw new Error('又出现了「省掉 SharedArrayBuffer 的要求」这种错误说法');
   }
+});
+
+check('起播必须问「解得出帧吗」，不能只量缓冲了多久（低帧率/静止画面会黑屏无声）', () => {
+  // ⚠️ 真实事故（一个缺陷解释了全部现象）：起播判据原来只问「缓冲够久了吗」，
+  // 而缓冲里可能根本没有可解码的帧 —— 帧率上限压到 5 时 250ms 的分片里只有约 1.25 帧、
+  // 没有关键帧；源画面静止时合成器不产新帧。两者都让 buffered 在涨却解不出画面：
+  // <video> 卡住不推进 → 画面黑 + 声音也没有（声音来自这个元素的音轨），
+  // 而字幕走独立支路照常 —— 就是那条「只有字幕没画面没声音」。
+  //
+  // ⚠️ 断言验的是**调用点的实际表达式**，不是「文件里有没有 readyState 这个词」。
+  // 本项目在「验了符号存在、没验它起作用」上栽过六次。
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
+  const a = src.indexOf('_tick()');
+  const b = src.indexOf('\n  /**', a) > 0 ? src.indexOf('\n  /**', a) : src.length;
+  const tick = src.slice(a, b);
+  if (!tick) throw new Error('找不到 _tick()');
+  if (!/this\.video\.readyState\s*<\s*2/.test(tick)) {
+    throw new Error('起播判据没有检查 readyState —— 缓冲够久但解不出帧时会黑屏无声');
+  }
+  const guardAt = tick.search(/this\.video\.readyState\s*<\s*2/);
+  const playAt = tick.indexOf('this._play()');
+  if (guardAt < 0 || playAt < 0) throw new Error('找不到 readyState 判据或 _play()');
+  if (guardAt > playAt) throw new Error('readyState 判据在 _play() 之后 —— 等于没挡');
+  if (!/no-decodable-frame/.test(tick)) throw new Error('解不出帧时没有上报，用户会看到零提示的黑屏');
+  if (!/this\.reportedNoFrame/.test(tick)) throw new Error('没有「只报一次」的闸，会把诊断面板刷爆');
+  if (!/this\.startSeekAt = 0/.test(src)) throw new Error('startSeekAt 没有初始化');
+  if (!/this\.reportedNoFrame = false/.test(src)) throw new Error('reportedNoFrame 没有初始化');
+});
+
+check('采集帧率上限必须钳下限（填 5 会让画面和声音一起没有）', () => {
+  // ⚠️ 用户实测：把「采集帧率上限」填 5 → 黑屏 + 无声 + 字幕正常（可复现）。
+  // 填了不报错、只会黑屏，普通人不可能知道「帧率上限会影响关键帧」。所以要钳。
+  // ⚠️ 但**不能去掉这个约束** —— 注释写明当初为什么加：不设的话 Chrome 对标签页采集
+  // 默认常只给 30fps，60fps 源白丢一半帧。那是真实收益，别为了修这个把它带回来。
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const m = src.match(/const\s+MIN_MAX_FRAME_RATE\s*=\s*(\d+)/);
+  if (!m) throw new Error('没有 MIN_MAX_FRAME_RATE 下限常量');
+  const min = Number(m[1]);
+  if (!(min >= 10 && min <= 30)) throw new Error('下限 ' + min + ' 不合理（应在 10~30 之间）');
+  if (!/Math\.max\(MIN_MAX_FRAME_RATE, rawMaxFrameRate\)/.test(src)) {
+    throw new Error('没有真的钳 —— 用户填 5 仍会传 5 进去');
+  }
+  if (!/rawMaxFrameRate > 0 \?/.test(src)) throw new Error('没有区分 0（不限制）和正数（要钳）');
+  if (!/\.\.\.\(maxFrameRate > 0 \? \{ maxFrameRate \} : \{\}\)/.test(src)) {
+    throw new Error('采集约束里的 maxFrameRate 被去掉了 —— 会让 60fps 源白丢一半帧');
+  }
+  if (!/MIN_MAX_FRAME_RATE\} 走/.test(src)) throw new Error('钳了但不告诉用户');
+});
+
+check('遮罩要说清「解不出帧」，不能给用户一个零提示的黑屏', () => {
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  // ⚠️ 只查字符串是否存在是不够的 —— 我把条件改成 `if (false && s.phase === 'no-decodable-frame')`
+  // 之后，那个字符串**还在**，断言照样通过（变异测试抓到的是断言自己）。
+  // 所以这里要查**它真的是一个可命中的条件**：准确的形态、且不是被短路掉的。
+  if (!/if \(s\.phase === 'no-decodable-frame'\) \{/.test(src)) {
+    throw new Error("no-decodable-frame 的处理不是可命中的条件（被 false && / ! 短路了？）—— 黑屏仍是零提示");
+  }
+  if (/false\s*&&\s*s\.phase === 'no-decodable-frame'/.test(src)) {
+    throw new Error('no-decodable-frame 的处理被 false && 短路 —— 等于没有');
+  }
+  const i = src.indexOf("if (s.phase === 'no-decodable-frame')");
+  const seg = src.slice(i, i + 1400);
+  // 这一段必须真的显示遮罩，而不只是打个日志
+  if (!/showOverlay\(/.test(seg)) throw new Error('no-decodable-frame 只打日志、没有显示遮罩 —— 用户还是只看到黑屏');
+  if (!/采集帧率上限/.test(seg)) throw new Error('遮罩没提到帧率上限这个原因');
+  if (!/静止/.test(seg)) throw new Error('遮罩没提到「来源画面静止」这个原因');
 });
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
