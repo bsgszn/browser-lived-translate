@@ -252,5 +252,93 @@ if (!(manifest.permissions || []).includes('tabCapture')) {
   console.log('  ✓ 已声明 tabCapture 权限');
 }
 
+console.log('\n[9] 文档里的断言数');
+{
+  /**
+   * 真踩过的坑：四套断言数在文档里**写了三遍** ——
+   *   · README.md 目录树（`│ ├── smoke-test.mjs   335 项：…`）
+   *   · README.md 汇总行（`四套一共 **608 项断言**（87 + 335 + 126 + 60）`）
+   *   · tools/README.md 跑测试那节（`node tools/smoke-test.mjs  # 335 项：…` + `合计 **608 项断言**`）
+   * 升版本、加断言时只会改其中一处 —— 实测到 README.md 目录树停在 80/333，
+   * 而 tools/README.md 更旧（80/295、合计 561，落后 48 项）。
+   * 本文件原本只校验版本号和徽章，完全不碰这些数字。
+   *
+   * 基准取 README.md 汇总行里那串 `a + b + c + d`（它是维护时一直被更新的那一份），
+   * 然后要求另外三处都跟它一致。
+   *
+   * ⚠️ **这条断言只保证"四处互相一致"，不保证"和实际跑出来的数一致"** ——
+   *    实际核对要跑另外三套，那需要 spawn 子进程，而受限沙箱会拒管道
+   *    （`couldn't create signal pipe` / EPERM，本项目撞过多次），而且很慢。
+   *    所以基准行自己也错了的话，这条帮不上忙；那时只能靠人跑一遍四套。
+   *    但"只改一处、其它三处漂掉"这一类（真实发生的那一类）它能全抓住。
+   */
+  const ORDER = ['manifest-check.mjs', 'smoke-test.mjs', 'pipeline-test.mjs', 'worker-test.mjs'];
+
+  const readDoc = (rel) => {
+    const p = path.join(ROOT, rel);
+    return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null;
+  };
+
+  // 「xxx-test.mjs」后面不远处的一个「N 项」——两种文档的排版不同，所以留了 40 字符余量
+  const grabTree = (text) => {
+    const out = {};
+    for (const m of text.matchAll(/([\w-]+\.mjs)[^\n]{0,40}?(\d+)\s*项/g)) {
+      if (ORDER.includes(m[1])) out[m[1]] = Number(m[2]);
+    }
+    return out;
+  };
+  // 「… **N 项断言**」
+  const grabTotal = (text) => {
+    const m = text.match(/(\d+)\s*项断言/);
+    return m ? Number(m[1]) : null;
+  };
+
+  const mainDoc = readDoc('README.md');
+  const toolsDoc = readDoc('tools/README.md');
+
+  // 基准：README.md 汇总行括号里那串四项和
+  const base4 = mainDoc && mainDoc.match(/(\d+(?:\s*\+\s*\d+){3})\s*[）)]/);
+  if (!base4) {
+    failures++;
+    console.log('  ✗ README.md 里找不到「（a + b + c + d）」形式的汇总行，无法确定基准');
+  } else {
+    const canon = base4[1].split('+').map((x) => Number(x.trim()));
+    const canonTotal = canon.reduce((a, b) => a + b, 0);
+    const problems = [];
+
+    // ① README.md 自己的目录树
+    const mTree = grabTree(mainDoc);
+    ORDER.forEach((f, i) => {
+      if (typeof mTree[f] !== 'number') problems.push(`README.md 目录树缺 ${f}`);
+      else if (mTree[f] !== canon[i]) problems.push(`README.md 目录树 ${f}: ${mTree[f]} vs 基准 ${canon[i]}`);
+    });
+    // ② README.md 的合计
+    const mTotal = grabTotal(mainDoc);
+    if (mTotal !== canonTotal) problems.push(`README.md 合计: ${mTotal} vs 基准 ${canonTotal}`);
+
+    // ③ tools/README.md 的目录树
+    if (!toolsDoc) {
+      problems.push('读不到 tools/README.md');
+    } else {
+      const tTree = grabTree(toolsDoc);
+      ORDER.forEach((f, i) => {
+        if (typeof tTree[f] !== 'number') problems.push(`tools/README.md 缺 ${f} 的项数`);
+        else if (tTree[f] !== canon[i]) problems.push(`tools/README.md ${f}: ${tTree[f]} vs 基准 ${canon[i]}`);
+      });
+      // ④ tools/README.md 的合计
+      const tTotal = grabTotal(toolsDoc);
+      if (tTotal !== canonTotal) problems.push(`tools/README.md 合计: ${tTotal} vs 基准 ${canonTotal}`);
+    }
+
+    if (problems.length) {
+      failures++;
+      console.log(`  ✗ 文档里的断言数与基准（${canon.join(' + ')} = ${canonTotal}）对不上：`);
+      for (const p of problems) console.log(`      ${p}`);
+    } else {
+      console.log(`  ✓ 四处一致（${canon.join(' + ')} = ${canonTotal}）：README.md 目录树 / README.md 合计 / tools/README.md 目录树 / tools/README.md 合计`);
+    }
+  }
+}
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
