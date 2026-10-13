@@ -233,52 +233,78 @@ Deepgram 在国内要代理才能注册和使用，直接卡死了大部分用�
 
 ### 方案 B：完全本地（推荐给折腾党，音频不出本机）
 
-**先起一个本地 Whisper 服务**（两种都行，接口是 OpenAI 兼容的）。
+**照着三步做就行。** 下面走的是最省事的一条路；另一条（whisper.cpp）在这节末尾的折叠块里。
 
-**⚠️ 但两个服务都不会把模型替你准备好 —— 先把模型下下来，否则第一步就卡住：**
-
-| | 模型从哪来 | 大小 |
-|---|---|---|
-| **faster-whisper** | 起服务时**自动**从 HuggingFace 拉（`Systran/faster-whisper-large-v3`） | large-v3 约 2.9 GB |
-| **whisper.cpp** | **完全不自动下载** —— 得你自己拿 ggml 模型，把**实际路径**填进 `-m` | 同上 |
-
-- **ggml 模型**在 HuggingFace 的 [`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp) 仓库，
-  文件名形如 `ggml-large-v3.bin`（还有 `ggml-large-v3-turbo.bin`、`ggml-medium.bin` 等）。
-- **机器一般、或者只想先跑通**，可以先用小的：`medium` 约 **1.5 GB**、`small` 约 **466 MB**、
-  **`large-v3-turbo` 约 1.5 GB**（速度和质量的折中，值得先试它）。质量会差一些，但能立刻验证整条链路。
-- **⚠️ 国内访问 HuggingFace 常常很慢或者不通。** 最省事的做法是把下载端点指到镜像
-  （`HF_ENDPOINT=https://hf-mirror.com`）——**hf-mirror 自己的文档就是这么写的**，PowerShell 里是
-  `$env:HF_ENDPOINT = "https://hf-mirror.com"`；也可以直接在镜像站网页上手动下那个文件。
-  **这条路我们没实测过，是照镜像站的文档写的。**
+**第 1 步 · 装服务**（需要先有 Python）
 
 ```bash
-# 用 faster-whisper（模型自动下载；国内可以先设 HF_ENDPOINT 指镜像）
 pip install faster-whisper-server
-faster-whisper-server --model large-v3 --port 8000
-
-# 或者用 whisper.cpp（作者用的就是这个）
-# ⚠️ -m 后面必须是你实际放模型的那个路径，不是文件名：
-#    whisper-server.exe -m D:\models\ggml-large-v3.bin -l ja …
-whisper-server.exe -m ggml-large-v3.bin -l ja --inference-path /v1/audio/transcriptions --host 127.0.0.1 --port 8080
 ```
 
-**起完确认一下：浏览器打开 `http://127.0.0.1:8080/v1/models`，能看到模型名就说明服务好了**
-（看不到就回去看服务端的输出，多半是模型路径填错了）。
+**第 2 步 · 起服务**（模型它会自己下，第一次要等一会儿）
 
-**然后设置页 → 识别服务选 `本地 VAD 断句 + 本地 Whisper`**（列表里第一项），服务地址填你上面起的那个。
+```bash
+faster-whisper-server --model large-v3 --port 8000
+```
 
-> **⚠️ 填到哪为止，取决于你的服务把 `/audio/transcriptions` 挂在哪 —— 不是一律要带 `/v1`。**
->
-> 扩展会在你填的地址后面**自己接上 `/audio/transcriptions`**（OpenAI 兼容路径）。所以：
->
-> | 你的服务 | 该填什么 |
-> |---|---|
-> | 用 `--inference-path /v1/audio/transcriptions`（上面那条命令就是） | `http://127.0.0.1:8080/v1` |
-> | 直接挂在 `/audio/transcriptions`（有些服务默认如此） | `http://127.0.0.1:8080` |
->
-> **怎么判断**：浏览器打开「你打算填的地址 + `/audio/transcriptions`」，或者打开它的 `/models` —— 哪个前缀下能通就填哪个。
->
-> **⚠️ 报 404 / 未找到文件时，先别怀疑服务坏了 —— 很可能是前缀多了一段或少了一段，两个都试一下。**
+> - 第一次启动会从 HuggingFace 下模型，**`large-v3` 约 2.9 GB** —— 等它下完再往下走。
+> - **⚠️ 国内下 HuggingFace 常常很慢或者连不上** —— 慢的话看下面折叠块里的「国内下载」。
+> - 不想等大模型：把 `large-v3` 换成 `small`（约 466 MB）或 `medium`（约 1.5 GB）。
+>   质量差一些，但几分钟就能验证整条链路通不通。
+
+**怎么知道服务起来了**：浏览器打开 `http://127.0.0.1:8000/v1/models`，能看到模型名就成了。
+
+**第 3 步 · 在扩展里填地址**
+
+1. 设置页 → **语音识别** → 识别服务选 `本地 VAD 断句 + 本地 Whisper`（列表里第一项）
+2. **服务地址**填 `http://127.0.0.1:8000/v1`
+3. 点「测试识别连接」看到成功提示 → 保存
+
+> **⚠️ 如果报「未找到文件」或者 404**：那是地址前缀多了一段、或者少了一段 ——
+> 把 `/v1` 去掉再试一次（填 `http://127.0.0.1:8000`），两个都试一下就知道哪个对。
+> **这时候服务本身是好的**，不用去重装。
+
+<details>
+<summary><b>国内下载慢 · 想用 whisper.cpp · 想搞清楚地址为什么有时要带 /v1 —— 点开</b></summary>
+
+#### 国内下载模型
+
+HuggingFace 在国内常常很慢或者不通。最省事的做法是把下载端点指到镜像 ——
+**hf-mirror 自己的文档就是这么写的**（这条路我们没实测过，是照它的文档写的）：
+
+```powershell
+$env:HF_ENDPOINT = "https://hf-mirror.com"
+```
+
+设完再跑第 2 步那条起服务的命令。也可以直接在镜像站网页上手动下模型文件。
+
+#### 改用 whisper.cpp（作者用的就是这个）
+
+**⚠️ whisper.cpp 完全不自动下载模型** —— 得你自己拿 ggml 文件：
+
+- 模型在 HuggingFace 的 [`ggerganov/whisper.cpp`](https://huggingface.co/ggerganov/whisper.cpp) 仓库，
+  文件名形如 `ggml-large-v3.bin`（还有 `ggml-large-v3-turbo.bin` 约 1.5 GB、`ggml-medium.bin` 等）。
+- ⚠️ `-m` 后面必须是**你实际放模型的那个路径**，不是文件名：
+
+```bash
+whisper-server.exe -m D:\models\ggml-large-v3.bin -l ja --inference-path /v1/audio/transcriptions --host 127.0.0.1 --port 8080
+```
+
+#### 地址到底填到哪为止
+
+**⚠️ 不是一律要带 `/v1`** —— 取决于你的服务把 `/audio/transcriptions` 挂在哪。
+
+扩展会在你填的地址后面**自己接上 `/audio/transcriptions`**（OpenAI 兼容路径）。所以：
+
+| 你的服务 | 该填什么 |
+|---|---|
+| 用 `--inference-path /v1/audio/transcriptions`（上面那条命令就是） | `http://127.0.0.1:8080/v1` |
+| 直接挂在 `/audio/transcriptions`（有些服务默认如此） | `http://127.0.0.1:8080` |
+
+**怎么判断**：浏览器打开「你打算填的地址 + `/audio/transcriptions`」，或者打开它的 `/models` ——
+哪个前缀下能通就填哪个。
+
+</details>
 
 #### 两种本地识别路线怎么选
 
