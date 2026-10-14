@@ -5,6 +5,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 
 /**
  * 剥掉注释再拿去做正则检查。
@@ -5910,6 +5911,46 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
       /1048576/.test(pj),
     '需要：delayed-player 初始化并累加 bytes；player 里诊断行与遮罩文案都读它；' +
       '「0 字节」与「有字节」各有一个分支（两种故障的修法不同）；且换成 MB 显示',
+  );
+}
+
+/**
+ * 状态快照：钉住「每段一行」和「行长上限」。
+ *
+ * ⚠️ 为什么这两条要当断言钉住:
+ * 快照存在的**唯一理由**是"在某些故障里，日志什么都没留下"；而它的**唯一硬约束**是
+ * 不能太长 —— 缓冲区 400 行、面板只显示 60 行，一条快照占十几行就会把**启动阶段**
+ * 挤出缓冲区，而那恰恰是最需要的一段。所以"又加了一个字段"这种改动必须有东西拦一下。
+ *
+ * ⚠️ 断言跑的是**真源码**:`snapshot-preview.cjs` 从 `player.js` 里按花括号配对抽出
+ * `snapshotLine`，用假全局驱动它 —— 不是抄一份实现来测（这个项目为"两份实现只改一份"栽过）。
+ * 它同时覆盖"字段全缺时不许抛"。
+ */
+{
+  const require_ = createRequire(import.meta.url);
+  const { scenarios } = require_('./snapshot-preview.cjs');
+  const MAX_CHARS = 220;
+  let worstLine = 0;
+  let worstChars = 0;
+  let threw = '';
+  let badShape = '';
+  let longLine = '';
+  for (const [name, text] of scenarios()) {
+    const lines = String(text).split('\n');
+    if (lines.length !== 2) badShape = `${name} 有 ${lines.length} 行（应为 2）`;
+    if (/生成失败/.test(text)) threw = `${name} → ${text}`;
+    for (const l of lines) {
+      if (l.length > MAX_CHARS) longLine = `${name} 有一行 ${l.length} 字符`;
+      if (l.length > worstChars) worstChars = l.length;
+    }
+    worstLine = Math.max(worstLine, lines.length);
+  }
+  check(
+    '状态快照：每段一行、行长不超上限、字段全缺也不抛',
+    !badShape && !threw && !longLine && worstLine === 2,
+    `每段必须是一行（缓冲区 400 行 / 面板 60 行，太长会把启动阶段挤出去）；` +
+      `单行上限 ${MAX_CHARS} 字符（实测最长 ${worstChars}）；任何字段取不到都要落 '?' 而不是抛。` +
+      ` 问题：${badShape || threw || longLine || '（无）'}`,
   );
 }
 
