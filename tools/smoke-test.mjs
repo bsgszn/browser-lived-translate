@@ -3941,6 +3941,36 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
     const uses = src.match(/lullLookbackMs/g) || [];
     if (uses.length < 2) throw new Error(`lullLookbackMs 只出现 ${uses.length} 次 —— 定义了却没人调用`);
   });
+
+  /**
+   * ⚠️ 这条钉的是一个**算术结论**，防的是"只改一半以为生效了"。
+   *
+   * 有人提过：回看切在换气处说明人还要继续说，那半句该是**软边界**、该和后面拼。
+   * 直觉是对的，但**在当前参数下这个改动无效**：
+   *   回看挪完的段长 = 上限 − 窗口，最短也有 `上限 − 1.5s`
+   *   两档预设：5s → 最短 3.5s · 3.5s → 最短 2.1s
+   *   → 都 ≥1.5s → **必然 `substantial`** → 无论如何都是硬边界
+   * 所以"把 `reason === 'max-length'` 从 hard 里拿掉"**行为一个字都不会变** ✗
+   * 要真变软，必须**同时豁免 substantial**，而那会让 5s+5s 攒成 ~50 字
+   * （本项目实测结论是「Deepgram 没有一条低于 12 字、最长 32 字」）→ 变差 ✗
+   */
+  check('合理断句：挪过的那一刀必然被 substantial 兜成硬边界（去掉 max-length 是无效改动）', () => {
+    for (const maxSec of [5, 3.5]) {
+      const maxMs = maxSec * 1000;
+      const shortest = maxMs - v.lullLookbackMs(maxMs);
+      if (shortest < 1500) {
+        throw new Error(
+          `上限 ${maxSec}s 时最短段只有 ${shortest}ms，低于 substantial 的 1.5s 门槛 —— ` +
+            '那就不是"必然硬收"了，上面那条注释的结论要重新推',
+        );
+      }
+    }
+    // 而且判据里必须显式写着 max-length（不靠"反正 substantial 会兜住"这种隐式依赖）
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
+    if (!/reason === 'max-length' \|\| substantial/.test(src)) {
+      throw new Error('hard 的判据里少了 reason === \'max-length\' —— 那条语义不该只靠 substantial 隐式兜住');
+    }
+  });
 }
 
 check('VAD 必须有迟滞（一个阈值会让概率抖动把一句话切成好几条）', () => {
