@@ -2183,6 +2183,44 @@ check('识别校正：置信度闸门能挡住三类「看着像话、其实在�
  * 只要**其中一段**覆盖的是换气/背景音，旧写法就把整句一起丢。
  * 而 `rejectReason` 判的是"**这一句**有没有人在说话"—— 那是整段，不是某一段。
  */
+/**
+ * ⚠️ 「已拦掉 N 段幻听」那个标签**曾经是错的** —— 它数的是**所有**被质量闸门拒掉的段
+ * （幻听套话 / 无人说话 / 置信度低 / 空文本），却被印成"幻听"。
+ *
+ * 为什么必须改：两者的处置方向**完全相反**
+ *   · `幻听套话` 命中 → 黑名单在干活 ✓
+ *   · `闸门` 触发     → 可能正是**误杀真语音** ✗（实测那句 30 字日语
+ *     `no_speech_prob=0.66` 被丢，而它 `avg_logprob` 是 -0.14，好得很）
+ * 混成一个数字，看到那行的人就不知道该往哪个方向查。
+ */
+check('VAD 拒绝计数：按原因分开，不许把"闸门"也叫成"幻听"', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const S = v.rejectedSummary;
+  if (typeof S !== 'function') {
+    throw new Error('vad.js 没有导出 rejectedSummary —— 提不到模块级就没法验');
+  }
+  // ① 全零 → 什么都不印（不能印一个空壳"已拦掉 "）
+  if (S(0, 0, 0) !== '') throw new Error(`全零时应为空串，实际「${S(0, 0, 0)}」`);
+  // ② ★ 只有闸门触发时，**绝不能**出现"幻听"字样 —— 这条就是防退回旧标签
+  const gateOnly = S(0, 1, 0);
+  if (/幻听/.test(gateOnly)) {
+    throw new Error(`闸门被拒却印成了"幻听"：「${gateOnly}」—— 这正是那个错标签`);
+  }
+  if (!/闸门/.test(gateOnly)) throw new Error(`闸门那类没标出来：「${gateOnly}」`);
+  // ③ 反过来：只有套话命中时，必须出现"幻听"
+  const halluOnly = S(2, 0, 0);
+  if (!/幻听/.test(halluOnly)) throw new Error(`套话命中却没标"幻听"：「${halluOnly}」`);
+  // ④ 三类同时非零 → 三者都要在
+  const all = S(1, 2, 3);
+  for (const k of ['幻听', '闸门', '空文本']) {
+    if (!all.includes(k)) throw new Error(`混合时缺了「${k}」：「${all}」`);
+  }
+  // ⑤ 脏值不许抛、不许印出 NaN/undefined
+  const dirty = S(NaN, undefined, 'x');
+  if (dirty !== '') throw new Error(`脏值应视为 0（得空串），实际「${dirty}」`);
+  if (/NaN|undefined/.test(dirty)) throw new Error(`脏值印出了 NaN/undefined：「${dirty}」`);
+});
+
 check('VAD 质量闸门：多段混合时不整段丢弃（而 refine 那份故意保持"任一段即弃"）', () => {
   const v = loaded['lib/asr/vad.js'];
   const R = v.rejectReason;
