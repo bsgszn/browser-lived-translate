@@ -510,7 +510,7 @@ async function startCapture() {
     const hunch =
       bytes === 0
         ? '⚠️ 录制器一个字节都没吐出来（连音频也没有）—— 问题在录制/编码侧，不是来源画面静止。'
-        : '⚠️ 录制器在正常输出，但数据进不了缓冲 —— 问题在缓冲接收侧（appendBuffer），不是来源没画面。';
+        : '⚠️ 录制器在输出，但缓冲一直填不上 —— 数据可能进不了缓冲（appendBuffer），也可能来源没有新画面。看旁边的「收到 N 帧」和「见底 N 次」能分辨。';
     return (
       `已等 ${waited} 秒 · 缓冲 ${ahead} · 收到 ${total} 帧（掉 ${dropped}） · 见底 ${stalls} 次 · 录制器已输出 ${bytesText}。` +
       hunch

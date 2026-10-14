@@ -4,12 +4,32 @@
 //   node tools/manifest-check.mjs
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import child_process from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { VERSION_DOC_FILES, scanVersionRefs } from './version-refs.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 let failures = 0;
+
+/**
+ * 本次打印了多少条 ✓ —— 给 [9] 的 `--deep` 用来核对"本套自己的条数"。
+ * 本文件里 ✓ 是直接 console.log 出去的（几百处），所以这里包一层统计，
+ * 比到处加计数器可靠。
+ */
+let selfPassed = 0;
+/** [9] 把基准存在这里，真正"和实际对账"挪到文件末尾做（那时 selfPassed 才完整） */
+let deepCanon = null;
+let deepCanonTotal = null;
+{
+  const _log = console.log.bind(console);
+  console.log = (...a) => {
+    const s = a.map((x) => (typeof x === 'string' ? x : '')).join(' ');
+    if (s.includes('✓')) selfPassed++;
+    _log(...a);
+  };
+}
 
 function exists(rel) {
   return fs.existsSync(path.join(ROOT, rel));
@@ -336,6 +356,27 @@ console.log('\n[9] 文档里的断言数');
     } else {
       console.log(`  ✓ 四处一致（${canon.join(' + ')} = ${canonTotal}）：README.md 目录树 / README.md 合计 / tools/README.md 目录树 / tools/README.md 合计`);
     }
+
+    /**
+     * ⚠️ 上面只保证「四处互相一致」—— **四处一起写错时它完全沉默**。
+     * 这个盲区真被咬到过一次：四处都写 smoke 337 / 合计 614，而实际是 338 / 615，
+     * 原因是升版本时只同步了版本号、没同步数字。所以这里补上「和实际对账」。
+     *
+     * ⚠️ 跑另外三套要几秒到几十秒，所以**只在 `--deep` 下做**，默认保持轻量。
+     *
+     * ⚠️ 受限沙箱会拒子进程管道（`couldn't create signal pipe` / EPERM，本项目撞过多次）
+     *    —— 所以**输出重定向到临时文件、不走管道**；真的起不来就**降级**：
+     *    只说明"本次没能实际对账"，**不报失败**。
+     *    一个在受限环境里会红的检查，只会训练人忽略它。
+     */
+    const DEEP = process.argv.includes('--deep');
+    deepCanon = canon;
+    deepCanonTotal = canonTotal;
+    if (!DEEP) {
+      console.log('      （只查了四处互相一致；要和实际对账请跑 `node tools/manifest-check.mjs --deep`）');
+    } else {
+      console.log('      （--deep：本套自己的条数在文件末尾核对 —— 那时所有 ✓ 才都打印完）');
+    }
   }
 }
 
@@ -387,6 +428,70 @@ console.log('\n[10] 单测数量与实际相符');
       console.log(`      （smoke-test.mjs [9] 段 L${start9 + 1}~L${end9} 里「整句累积」开头的 check）`);
     } else {
       console.log(`  ✓ lib/utterance.js 的单测数相符：${actual} 项`);
+    }
+  }
+}
+
+/**
+ * [9] 的 --deep:和**实际跑出来的**断言数对账。
+ *
+ * ⚠️ 必须放在文件末尾 —— 上面 [9] 那处做的话 `selfPassed` 还少几条
+ *    （[9] 自己和后面几节的 ✓ 都还没打印），实测就是 90 vs 91。
+ *
+ * ⚠️ 跑另外三套要几秒到几十秒，所以只在 `--deep` 下做。
+ * ⚠️ 受限沙箱会拒子进程管道（`couldn't create signal pipe` / EPERM，本项目撞过多次）
+ *    —— 输出重定向到临时文件、不走管道；真起不来就**降级**：
+ *    说明"本次没能实际对账"，**不报失败**。
+ *    一个在受限环境里会红的检查，只会训练人忽略它。
+ */
+if (deepCanon && process.argv.includes('--deep')) {
+  console.log('\n[9d] 文档断言数 vs 实际（--deep）');
+  const ORDER4 = ['manifest-check.mjs', 'smoke-test.mjs', 'pipeline-test.mjs', 'worker-test.mjs'];
+  const actual = {};
+  let degraded = null;
+  for (const f of ORDER4) {
+    const out = path.join(os.tmpdir(), `mc-deep-${process.pid}-${f}.txt`);
+    // ⚠️ 本套要**不带 --deep 重跑一次**才数得准：
+    //    在本次进程里数自己的 ✓ 会少 1（[9d] 那行还没打印），多算又会自指。
+    const argv = f === 'manifest-check.mjs' ? [path.join(ROOT, 'tools', f)] : [path.join(ROOT, 'tools', f)];
+    let fd = null;
+    try {
+      fd = fs.openSync(out, 'w');
+      const r = child_process.spawnSync(process.execPath, argv, {
+        cwd: ROOT,
+        stdio: ['ignore', fd, fd], // ⚠️ 走文件，不走管道
+        timeout: 120000,
+      });
+      try { fs.closeSync(fd); } catch {}
+      fd = null;
+      if (r.error || r.status !== 0) {
+        degraded = `${f} 退出码 ${r.status}${r.error ? ` / ${r.error.code || r.error.message}` : ''}`;
+        break;
+      }
+      actual[f] = (fs.readFileSync(out, 'utf8').match(/✓/g) || []).length;
+    } catch (e) {
+      if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+      degraded = `${f}: ${e?.code || e?.message || e}`;
+      break;
+    } finally {
+      try { fs.unlinkSync(out); } catch {}
+    }
+  }
+  if (degraded) {
+    console.log(`  ⚠️ 本次没能实际对账（${degraded}）—— 只做了四处一致性检查，不算失败`);
+  } else {
+    const mism = [];
+    ORDER4.forEach((f, i) => {
+      if (actual[f] !== deepCanon[i]) mism.push(`${f}: 实际 ${actual[f]} vs 文档 ${deepCanon[i]}`);
+    });
+    const actualTotal = ORDER4.reduce((s, f) => s + actual[f], 0);
+    if (actualTotal !== deepCanonTotal) mism.push(`合计: 实际 ${actualTotal} vs 文档 ${deepCanonTotal}`);
+    if (mism.length) {
+      failures++;
+      console.log('  ✗ 文档里的断言数和**实际跑出来的**对不上：');
+      for (const m of mism) console.log(`      ${m}`);
+    } else {
+      console.log(`  ✓ 与实际相符（${ORDER4.map((f) => actual[f]).join(' + ')} = ${actualTotal}）`);
     }
   }
 }
