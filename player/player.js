@@ -241,6 +241,25 @@ async function waitForJob(timeoutMs = 12000) {
   return null;
 }
 
+/**
+ * 向下取到偶数。
+ *
+ * ⚠️ 视频编码器（尤其硬件 H.264）普遍要求宽高是**偶数** —— H.264 的 4:2:0 色度是
+ * 每 2×2 像素采一次，奇数宽高在编码侧要么得补边、要么干脆产不出数据。
+ *
+ * 实测反馈：源是 **2561×1441**（两个都是奇数 —— 比标准的 2560×1440 各多 1 像素）时，
+ * 录制器一个字节都没产出（0 帧、缓冲一直是 0.0s），画面全黑、连声音也没有
+ * （声音来自延迟画面那个 `<video>` 的音轨，它不推进就一起没有）。
+ * 标签页采集的尺寸**完全由 Chrome 决定**，所以我们确实可能拿到奇数。
+ * Chromium 自己的采集代码里也有"奇数缩到偶数"的处理。
+ *
+ * ⚠️ 只动 1 像素，视觉上看不出来。返回 0 表示"给的值没法用"（调用方决定退回原样）。
+ */
+function evenFloor(n) {
+  const v = Math.floor(Number(n) || 0);
+  return v >= 2 ? v - (v % 2) : 0;
+}
+
 async function startCapture() {
   showOverlay('正在取得标签页画面…', '浏览器会同时把原标签页静音——这是 tabCapture 的固有行为，声音改由本页播放。', '');
   diag('正在取得标签页流…', true);
@@ -303,6 +322,33 @@ async function startCapture() {
   atrack.onended = () => stopAll('来源标签页的音频已结束');
   vtrack.onended = () => stopAll('来源标签页的画面已结束');
 
+  /**
+   * —— 宽高取偶 ——
+   *
+   * 标签页采集的尺寸完全由 Chrome 决定，**可能是奇数**（实测见过 2561×1441）。
+   * 而视频编码器普遍要求偶数宽高 —— 奇数在编码侧可能直接产不出任何数据，
+   * 表现是"录制器 0 字节 + 画面全黑 + 连声音也没有"，而字幕照常（音频走独立管线）。
+   *
+   * ⚠️ 这是**排除一个变量**，不是已确认的病因 —— 所以失败不报错、只记一行诊断，
+   * 拿不到新尺寸也照原样继续。只动 1 像素，视觉上看不出来。
+   */
+  const rawSize = vtrack.getSettings();
+  const evenW = evenFloor(rawSize.width);
+  const evenH = evenFloor(rawSize.height);
+  if (evenW >= 2 && evenH >= 2 && (evenW !== rawSize.width || evenH !== rawSize.height)) {
+    try {
+      await vtrack.applyConstraints({ width: evenW, height: evenH });
+      const after = vtrack.getSettings();
+      diag(
+        `宽高取偶 · ${rawSize.width}×${rawSize.height} → ${after.width}×${after.height}` +
+          `（编码器对奇数宽高可能一帧都不产出）`,
+        true,
+      );
+    } catch (e) {
+      diag(`宽高取偶失败，按 ${rawSize.width}×${rawSize.height} 继续 · ${e.message || e}`, true);
+    }
+  }
+
   const vs = vtrack.getSettings();
   diag(
     `已取得流 · 视频 ${vs.width || '?'}×${vs.height || '?'}${vs.frameRate ? `@${Math.round(vs.frameRate)}` : ''}` +
@@ -323,10 +369,16 @@ async function startCapture() {
       const scaled = stream.clone();
       const st = scaled.getVideoTracks()[0];
       const s = st.getSettings();
-      const w = Math.round(((s.width || 1920) * maxHeight) / (s.height || 1080));
-      await st.applyConstraints({ width: w, height: maxHeight });
+      /**
+       * ⚠️ 两边都要**取偶** —— 不只是好看:
+       * `Math.round` 会产出奇数（实测 2561×1440/1441 → 2559），而奇数宽高在编码侧
+       * 可能直接产不出数据。这是当初用 `Math.round` 时留下的隐患。
+       */
+      const w = evenFloor(((s.width || 1920) * maxHeight) / (s.height || 1080)) || 2;
+      const h = evenFloor(maxHeight) || 2;
+      await st.applyConstraints({ width: w, height: h });
       recordStream = scaled;
-      diag(`延迟画面已降到 ${w}×${maxHeight}（原 ${s.width}×${s.height}）· 减轻重编码负担`, true);
+      diag(`延迟画面已降到 ${w}×${h}（原 ${s.width}×${s.height}）· 减轻重编码负担`, true);
     } catch (e) {
       diag(`延迟画面降分辨率失败，按原样编码 · ${e.message || e}`, true);
     }

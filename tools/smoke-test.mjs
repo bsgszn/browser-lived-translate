@@ -2973,13 +2973,58 @@ check('延迟画面可以降分辨率（可选，不是默认）', () => {
   if (s.capture.delayMaxHeight !== 0) throw new Error(`默认应当是原样，实际 ${s.capture.delayMaxHeight}`);
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   if (!/stream\.clone\(\)/.test(src)) throw new Error('没有克隆流去改分辨率（不能动原始轨）');
-  if (!/applyConstraints\(\{ width: w, height: maxHeight \}\)/.test(src)) throw new Error('没有按高度等比缩放');
+  // ⚠️ 宽度必须**由高度等比算出来**，不能写死
+  if (!/evenFloor\(\(\(s\.width \|\| 1920\) \* maxHeight\) \/ \(s\.height \|\| 1080\)\)/.test(src)) {
+    throw new Error('没有按高度等比缩放');
+  }
+  /**
+   * ⚠️ 宽高都必须**取偶**。
+   *
+   * 以前这里用的是 `Math.round`，它会产出奇数（实测 2561×1440/1441 → 2559），
+   * 而奇数宽高在编码侧可能一帧都产不出来 —— 表现是"录制器 0 字节 + 黑屏 + 无声"。
+   * 所以这条断言从"有没有缩放"加强到"缩放后是不是偶数"。
+   */
+  if (!/const w = evenFloor\(/.test(src)) throw new Error('降分辨率的宽度没取偶（奇数会让编码器不出数据）');
+  if (!/const h = evenFloor\(maxHeight\)/.test(src)) throw new Error('降分辨率的高度没取偶');
+  if (!/applyConstraints\(\{ width: w, height: h \}\)/.test(src)) throw new Error('没有按高度等比缩放');
   if (!/await playback\.start\(recordStream\)/.test(src)) throw new Error('录音用的还是原始流，缩放没生效');
   // 缩放失败必须退回原样，不能整个起不来
   if (!/降分辨率失败/.test(src)) throw new Error('缩放失败要退回原样并说明');
   // 只有比目标高时才缩
   if (!/\(vtrack\.getSettings\(\)\.height \|\| 0\) > maxHeight/.test(src)) {
     throw new Error('比目标矮的流不该被放大');
+  }
+});
+
+/**
+ * ⚠️ 采集侧也要取偶。
+ *
+ * 标签页采集的尺寸**完全由 Chrome 决定**（我们没有对尺寸下任何约束），
+ * 实测见过 **2561×1441** —— 两个都是奇数。而视频编码器普遍要求偶数宽高，
+ * 奇数在编码侧可能直接产不出任何数据：录制器 0 字节、画面全黑、连声音也没有
+ * （声音来自延迟画面那个 `<video>` 的音轨，它不推进就一起没有）。
+ *
+ * 这一条验的是"**调用点真的做了这件事**"，不是"函数存在" ——
+ * 本项目在这一点上栽过多次（验了符号存在、没验它起作用）。
+ */
+check('采集到的宽高如果是奇数，必须取偶（奇数会让编码器一帧都不产出）', () => {
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  // 工具函数本身：向下取偶，且对没法用的值返回 0
+  if (!/function evenFloor\(n\) \{/.test(src)) throw new Error('没有 evenFloor 这个取偶工具');
+  if (!/v >= 2 \? v - \(v % 2\) : 0/.test(src)) throw new Error('evenFloor 没有正确取偶');
+  // 采集到轨之后、算码率之前，必须真的调了 applyConstraints 去改
+  const idxGet = src.indexOf('vtrack.onended = ()');
+  const idxNudge = src.indexOf('await vtrack.applyConstraints({ width: evenW, height: evenH })');
+  const idxSize = src.indexOf('const vs = vtrack.getSettings();');
+  if (idxNudge < 0) throw new Error('拿到视频轨后没有把奇数宽高改成偶数');
+  if (!(idxGet < idxNudge && idxNudge < idxSize)) {
+    throw new Error('取偶必须在拿到轨道之后、读取尺寸（算码率）之前 —— 否则码率还是按旧尺寸估的');
+  }
+  // 失败不许抛，要退回原样继续（这只是"排除一个变量"，不是已确认的病因）
+  if (!/宽高取偶失败，按 /.test(src)) throw new Error('取偶失败要退回原样继续，不能整个起不来');
+  // 只有真的是奇数时才动它
+  if (!/evenW !== rawSize\.width \|\| evenH !== rawSize\.height/.test(src)) {
+    throw new Error('偶数尺寸不该被改动');
   }
 });
 
