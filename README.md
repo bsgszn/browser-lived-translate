@@ -1596,7 +1596,7 @@ A：字幕样式改 `content/content.js` 里的 `CSS` 常量；新增识别服�
   node tools/pipeline-test.mjs   # 音频引擎全链路，桩对象驱动
   node tools/worker-test.mjs     # service worker 状态机与消息路由
   ```
-  四套一共 **616 项断言**（91 + 338 + 126 + 60）。
+  四套一共 **616 项断言**（91 + 339 + 126 + 60）。
   `pipeline-test` 会桩掉 `AudioContext` / `AudioWorkletNode` / `WebSocket` / `fetch` / `performance.now`，
   真实走完「启动 → 分析支路 → PCM → 重采样 → ASR 事件 → 翻译（含上下文）→ 下发字幕 → 停止 → 重启」，
   覆盖字幕行复用、译文与原文错配、AGC 收敛与回落、识别滞后夹取、**翻译请求背压与定稿抢占**、缓存命中、去重、资源回收等不变量。
