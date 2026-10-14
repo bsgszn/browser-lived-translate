@@ -3200,7 +3200,47 @@ check('分片时长必须够短：识别滞后 ≈ 分片×2 + 推理，超过�
   // 诊断里必须能看出"识别滞后"这个数 —— 否则迟到时不知道怪识别还是怪翻译
   const player = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   if (!/识别滞后 \$\{asrLagSec\.toFixed\(1\)\}s/.test(player)) throw new Error('诊断里没有报识别滞后');
-  if (!/超过延迟，必然迟到/.test(player)) throw new Error('没有把"滞后超过延迟"标出来');
+  if (!/超过延迟预算 \$\{delayForDiagSec\}s/.test(player)) throw new Error('没有把"滞后超过延迟预算"标出来');
+  // ⚠️ 这条原来断言的是「超过延迟，必然迟到」。改掉它的原因不是放宽，是**去重**：
+  //    `asrLag > 预算` 与同一行开头的 `remain < 0` **数学上完全等价**，两处都在说
+  //    "这句赶不上了"；而 `remain` 会为负，于是实测日志里出现了「-2.3s 后」这种
+  //    自相矛盾的行。现在分工是：开头报"什么时候上屏"，末尾报"滞后 vs 预算"。
+  //    真正的行为验证在下面那条 check（跑真源码）。
+});
+
+/**
+ * 「整句上屏」那行：**「后」不能是负的**。
+ *
+ * ⚠️ 实测日志里出现过（用户 v2.66.29）:
+ *     整句上屏 · **-2.3s 后** · 21 字 · utterance-end · 识别滞后 8.9s
+ * 那个字段取自 `at - Date.now()`（距上屏还有多久），所以迟到时**必然为负** ——
+ * 而它原来无条件印成 `${x}s 后`。而这个问题**早在注释里被记过一次**
+ * （见上面 VAD 那条里的 `-11.6s 后`），却一直没修：因为没有东西能验证它。
+ *
+ * ⚠️ 跑的是**真源码**（`tools/shown-time-preview.cjs` 按花括号配对抽出
+ * `scheduleUtterance`，用假 `schedule` / `settings` / `diag` 驱动）——
+ * 不是抄一份实现来测（这个项目为"两份实现只改一份"栽过）。
+ */
+check('整句上屏那行：「后」不能是负的（实测出现过「-2.3s 后」）', () => {
+  const require_ = createRequire(import.meta.url);
+  const { scenarios, negativeHits } = require_('./shown-time-preview.cjs');
+  const rows = scenarios();
+  // ① 先确认真源码真的跑起来了 —— 否则锚点一变就会变成"空集恒真"的摆设断言
+  if (rows.length !== 4) throw new Error(`场景数应为 4，实际 ${rows.length}`);
+  for (const [name, line] of rows) {
+    if (!line) throw new Error(`场景「${name}」没有输出 —— 真源码可能没跑起来（锚点变了？）`);
+    if (!/整句上屏/.test(line)) throw new Error(`场景「${name}」的输出不像那行诊断：${line}`);
+  }
+  // ② 核心不变量：任何一次都不许印出负数时长
+  const bad = negativeHits();
+  if (bad.length) throw new Error(`出现了负数时长（"后"不能是负的）:\n    ${bad.join('\n    ')}`);
+  // ③ 迟到要说成人话，并且把延迟预算摆出来（否则那个 ⚠ 没有依据可读）
+  const late = (rows.find(([n]) => /迟到 2\.3s/.test(n)) || [])[1] || '';
+  if (!/已迟 2\.3s/.test(late)) throw new Error(`迟到时该印「已迟 2.3s」，实际：${late}`);
+  if (!/超过延迟预算 6\.6s/.test(late)) throw new Error(`迟到时该点出延迟预算，实际：${late}`);
+  // ④ 准时的不许被误判成迟到（边界最容易判错）
+  const onTime = (rows.find(([n]) => /提前/.test(n)) || [])[1] || '';
+  if (/已迟|超过延迟预算/.test(onTime)) throw new Error(`准时的不该报迟到：${onTime}`);
 });
 
 check('排期延迟必须包含「录音/编码滞后」—— 字幕恒偏早的根因', () => {

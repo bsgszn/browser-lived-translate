@@ -1057,11 +1057,29 @@ function scheduleUtterance(u) {
   // ⚠️ 这里用**目标延迟**而不是 EMA 实测值，而且不调用 currentDelayMs()。
   // 那个函数有副作用（刷 EMA），在诊断里顺手调它会污染排期用的那个指数平均。
   const delayForDiagSec = Number(settings.capture.delaySec) || DELAY_MIN_SEC;
-  const asrLagSec = delayForDiagSec - (at - Date.now()) / 1000;
+  /**
+   * 距上屏还有多久 —— **会为负**（排期时刻已经过去了）。
+   *
+   * ⚠️ 这里踩过：直接印 `${x}s 后`，于是日志里出现「**-2.3s 后**」这种自相矛盾的行
+   * （用户实测）。负号的含义是"已经迟了"，不是"还要等负 2.3 秒"。
+   */
+  const remainSec = (at - Date.now()) / 1000;
+  const whenText = remainSec >= 0 ? `${remainSec.toFixed(1)}s 后` : `已迟 ${(-remainSec).toFixed(1)}s`;
+  /**
+   * 识别滞后 = 延迟预算 + 已经迟掉的部分。
+   *
+   * ⚠️ `asrLagSec > delayForDiagSec` 与 `remainSec < 0` **数学上完全等价** ——
+   * 也就是说这两个字段在讲同一件事。所以**分工必须明确**：
+   *   `whenText`  是「什么时候上屏」（相对排期）
+   *   下面这个   是「识别滞后 vs 延迟预算」（量 + 是否超预算）
+   * 因此这里**不再重复写一遍"迟到"**，只把预算摆出来，让那个 ⚠ 有依据可读。
+   */
+  const asrLagSec = delayForDiagSec - remainSec;
+  const overBudget = asrLagSec > delayForDiagSec;
   diag(
-    `整句上屏 · ${((at - Date.now()) / 1000).toFixed(1)}s 后 · ${text.length} 字 · ${u.reason}` +
-      ` · 识别滞后 ${asrLagSec.toFixed(1)}s${asrLagSec > delayForDiagSec ? ' ⚠ 超过延迟，必然迟到' : ''}`,
-    asrLagSec > delayForDiagSec,
+    `整句上屏 · ${whenText} · ${text.length} 字 · ${u.reason}` +
+      ` · 识别滞后 ${asrLagSec.toFixed(1)}s${overBudget ? ` ⚠ 超过延迟预算 ${delayForDiagSec}s` : ''}`,
+    overBudget,
   );
 
   // 立刻开始重识别：它不需要后文，音频在收句的那一刻就齐了。
