@@ -5919,11 +5919,163 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
     /this\.bytes\s*=\s*0\b/.test(dp) &&
       /this\.bytes\s*\+=\s*e\.data\.size\b/.test(dp) &&
       reads >= 2 &&
-      /bytes\s*===\s*0/.test(pj) &&
-      /bytes\s*>\s*0/.test(pj) &&
+      // ⚠️ 两种故障的分支**搬家了**:原来写在 player.js 的诊断行里（`bytes === 0` / `bytes > 0`），
+      // 现在收进纯函数 `classifyThinBuffer`（那才能直接喂数字断言）。
+      // 所以这里跟着改成验"分支还在，而且 player 真的把两种文案都产得出来" —— 不是放宽。
+      /classifyThinBuffer\s*\(/.test(pj) &&
+      /字节/.test(pj) &&
+      /录制器还没输出任何数据/.test(pj) &&
+      /数据进不了 SourceBuffer/.test(pj) &&
       /1048576/.test(pj),
     '需要：delayed-player 初始化并累加 bytes；player 里诊断行与遮罩文案都读它；' +
-      '「0 字节」与「有字节」各有一个分支（两种故障的修法不同）；且换成 MB 显示',
+      '「0 字节」与「有字节」各有一个分支（两种故障的修法不同）；且换成 MB 显示。' +
+      ' 两种故障的分支自 v2.66.26 起在 lib/delayed-player.js 的 classifyThinBuffer 里。',
+  );
+}
+
+/**
+ * `classifyThinBuffer` 的行为 —— **必须有一条针对实测那次误报的用例**。
+ *
+ * ⚠️ 为什么这条比"源码里有那两行"值钱:
+ * 原来的判据只看 `ahead < 1.5 && bytes > 0`，而 `_tick()` 在 `!locked` 时提前 return，
+ * 所以**起播之前 `bufferAheadSec` 一直接近 0**（而且压根没被更新过）。
+ * 结果在**完全健康**的启动里报了「数据进不了 SourceBuffer」，
+ * 而下一行就是「延迟播放已就绪」—— 用户实测日志里两者只差一行。
+ *
+ * ⚠️ 这条误报的危害是把用户**引向错的那一层**，而"录制层 vs 缓冲层"
+ * 正是排查这个故障最贵的一次分辨。所以下面第 3 条用例是**照实测数字写的**。
+ */
+{
+  // ⚠️ 注意:上面那个块里的 `dp` 是**源码字符串**（stripComments 的结果），不是模块。
+  // 这里要按行为断言，所以必须拿**模块**。
+  const dpm = loaded['lib/delayed-player.js'];
+  const delayMs = 6600; // 用户日志里的画面延迟
+  const T = (s) => dpm.classifyThinBuffer(s);
+  check(
+    '薄缓冲分类：健康启动中不许报「进不了 SourceBuffer」（实测误报的回归）',
+    // ① 刚开始：0 字节也正常
+    T({ elapsedMs: 1000, bytes: 0, locked: false, delayMs }) === 'warming' &&
+      // ② 宽限期内仍然 0 字节：正常（MediaRecorder 要几秒才吐第一片）
+      T({ elapsedMs: 9000, bytes: 0, locked: false, delayMs }) === 'warming' &&
+      // ③ ★ 实测那次误报:8 秒、已有 57.9 MB、还没起播（下一行就起播了）→ 必须不报警
+      T({ elapsedMs: 8000, bytes: 57900000, locked: false, delayMs }) === 'warming' &&
+      // ④ 过了宽限期仍然 0 字节 → 录制/编码层没产出
+      T({ elapsedMs: 63000, bytes: 0, locked: false, delayMs }) === 'no-output' &&
+      // ⑤ 有数据、但远超起播时限仍未起播 → 卡在前端
+      T({ elapsedMs: 20000, bytes: 57900000, locked: false, delayMs }) === 'never-started' &&
+      // ⑥ 已起播、前方却一直很薄 → 那才是进不了 SourceBuffer
+      T({ elapsedMs: 20000, bytes: 57900000, locked: true, delayMs }) === 'cannot-append',
+    '四种状态必须分得开，尤其③（健康启动）绝不能被报成 cannot-append。',
+  );
+  check(
+    '薄缓冲分类：脏值一律按「不报警」处理（宁可不说，也别引错方向）',
+    [
+      undefined,
+      null,
+      {},
+      'x',
+      { elapsedMs: NaN, bytes: 0, locked: true, delayMs },
+      { elapsedMs: -1, bytes: 5, locked: true, delayMs },
+      { elapsedMs: 20000, bytes: NaN, locked: true, delayMs },
+      { elapsedMs: 20000, bytes: -1, locked: true, delayMs },
+      // ⚠️ delayMs 不合法时**不许**回退到 0 然后断言「一直没能起播」—— 那是没有依据的指控
+      { elapsedMs: 20000, bytes: 5, locked: false, delayMs: NaN },
+      { elapsedMs: 20000, bytes: 5, locked: false },
+      { elapsedMs: 20000, bytes: 5, locked: false, delayMs: -1 },
+    ].every((s) => T(s) === 'warming'),
+    '拿不到可信输入时宁可不说，也别误报 —— 和 isRecorderStale 同一条原则。',
+  );
+}
+
+/**
+ * 旁路提醒的限流 —— 钉住「同一句不许逐句重复」，同时**不许把它彻底静音**。
+ *
+ * ⚠️ 实测:DeepL 的「术语表未生效」是每句翻译都回调一次，用户日志里出现 8~9 次，
+ * 把约两分钟的缓冲区吃掉一大块。而 `diag()` 的"连续重复不重复记"挡不住它
+ * （中间夹着「翻译开始/完成」，永远不连续）。
+ * 但它又是条**可操作**的提醒，所以只能限流，不能去掉。
+ */
+{
+  const GAP = 5 * 60 * 1000;
+  const u = loaded['lib/util.js'];
+  check(
+    '旁路提醒限流：首次必打、间隔内压掉、过了间隔再打',
+    u.noteDue(0, 1000, GAP) === true &&
+      u.noteDue(1000, 1000 + GAP - 1, GAP) === false &&
+      u.noteDue(1000, 1000 + GAP, GAP) === true &&
+      u.noteDue(1000, 1000 + GAP * 3, GAP) === true,
+    '首次（prevAt=0）必须打；同一句在间隔内压掉；过了间隔要能再打（否则用户永远看不到）。',
+  );
+  check(
+    '旁路提醒限流：脏值偏向「该打」，不把自己锁死',
+    u.noteDue(NaN, Date.now(), GAP) === true &&
+      u.noteDue(undefined, Date.now(), GAP) === true &&
+      u.noteDue(null, Date.now(), GAP) === true &&
+      u.noteDue(5000, NaN, GAP) === true &&
+      u.noteDue(5000, 1000, GAP) === true,
+    '拿不到上次时刻 / 现在时刻、或时间倒流 → 都当"该打"，别静音。',
+  );
+}
+
+/**
+ * 「没有字幕上屏」看门狗 —— 基准必须是**上屏**，不是"拿到识别结果"。
+ *
+ * ⚠️ 实测踩过:原来用 `lastResultAt` 当基准，而它只在 `ev.type === 'final'` 时更新；
+ * 走 utterance-end 收句时它会一直陈旧，于是**字幕正常上屏**的情况下仍然报
+ * 「已经 15 秒没有识别结果」，并且给出的结论「问题在下游（上屏环节）」
+ * **也是错的**（那时字幕正在上屏）—— 纯粹是假警报。
+ *
+ * ⚠️ 还有一处自相矛盾:日志里出现过「已发出 0 次 · 回来 8 次」。
+ * 因为 `asrRequestsDone` 数的是 `status === 'chunk'`（本地 VAD 下 = 切出几段），
+ * 而 `asrRequestsSent` 只数 `status === 'recognizing'`，**VAD 适配器根本不发它**。
+ */
+{
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+
+  /**
+   * ⚠️ 用**锚点**切，不用固定长度 —— 这个项目为固定切片栽过两次
+   * （文件里出现相同锚点串、或代码一撑大就够不到目标）。
+   * 另加长度守卫:锚点变了导致切出空串时**报错**，而不是"悄悄变绿"。
+   */
+  const between = (startAnchor, endAnchor) => {
+    const a = pj.indexOf(startAnchor);
+    if (a < 0) return '';
+    const b = pj.indexOf(endAnchor, a + startAnchor.length);
+    if (b < 0) return '';
+    return pj.slice(a, b);
+  };
+
+  const renderLoop = between('for (const item of schedule.due(', 'setTimeout(pumpSubtitles');
+  check(
+    '看门狗的基准是「字幕真的上屏」：上屏时刻必须打在真正的渲染循环里',
+    renderLoop.length > 100 && /lastShownAt\s*=\s*Date\.now\(\)/.test(renderLoop) && /shownCount\s*\+=\s*1/.test(renderLoop),
+    '⚠️ 不能只打在 diagLate 里 —— 那个函数只对 `item.late` 的条目调用，' +
+      '所以它根本不是"上屏"的信号。断言的锚点是渲染循环（schedule.due → pumpSubtitles 之间），' +
+      `切出 ${renderLoop.length} 字符（守卫要求 > 100）。`,
+  );
+
+  const sinceLine = between('function checkSilentAsr()', 'warn(lines.join');
+  check(
+    '看门狗：基准用 lastShownAt（不是 lastResultAt），且计数按模式说人话',
+    sinceLine.length > 200 &&
+      /Math\.max\(firstAudioAt,\s*lastShownAt/.test(sinceLine) &&
+      // 旧的措辞不能再出现:它把"没上屏"说成"没有识别结果"，误导性强
+      !/没有识别结果/.test(sinceLine) &&
+      /没有字幕上屏/.test(sinceLine) &&
+      // 「已发出」只有在真的发过请求时才印 —— 否则本地 VAD 下会印出自相矛盾的「0 次 · 8 次」
+      /asrRequestsSent\s*>\s*0/.test(sinceLine) &&
+      // 「问题在下游」必须有依据:文本确实刚到手却没上屏
+      /lastResultAt\s*&&\s*Date\.now\(\)\s*-\s*lastResultAt\s*</.test(sinceLine),
+    '基准必须是 lastShownAt；「已发出 N 次」必须在 N>0 时才印；' +
+      '「问题在下游」必须要求 lastResultAt 是**近期**的。' +
+      `切出 ${sinceLine.length} 字符（守卫要求 > 200）。`,
+  );
+
+  check(
+    '看门狗：utterance-end 收句也算「拿到文本了」',
+    /ev\.type === 'utteranceEnd'[\s\S]{0,400}?lastResultAt\s*=\s*Date\.now\(\)/.test(pj),
+    '原来只有 `final` 那一支更新 lastResultAt，走 utterance-end 时它会陈旧，' +
+      '看门狗据此把"其实一直在出结果"误判成"没有结果"。',
   );
 }
 

@@ -16,7 +16,7 @@
 import { getSettings, patchSettings, STORAGE_KEY } from '../lib/settings.js';
 import { createAsrSession } from '../lib/asr/index.js';
 import { translate, isTranslateEnabled } from '../lib/translate/index.js';
-import { Resampler, float32ToInt16, rms } from '../lib/util.js';
+import { Resampler, float32ToInt16, rms, noteDue } from '../lib/util.js';
 import { UtteranceAccumulator } from '../lib/utterance.js';
 import { PcmRing } from '../lib/pcm-ring.js';
 import { createRefiner } from '../lib/asr/refine.js';
@@ -31,7 +31,7 @@ import {
   effectiveLeadMs,
   findStuckFlights,
   countInflight,
-  isRecorderStale,
+  classifyThinBuffer,
 } from '../lib/delayed-player.js';
 
 const $ = (id) => document.getElementById(id);
@@ -94,6 +94,17 @@ let lastAudioNote = '';
 /** 已经发出过多少次识别请求（每个分片一次），以及回来多少次 */
 let asrRequestsSent = 0;
 let asrRequestsDone = 0;
+/**
+ * 字幕**真的上屏**了多少句，以及最近一次的时刻。
+ *
+ * ⚠️ 看门狗必须以这个为准，不能以「拿到识别结果」为准:
+ * 用户看到的"什么都没有"是**屏幕上没有字幕**，而识别文本可能早就到手了
+ * （卡在排期/翻译）。实测踩过:看门狗拿 `lastResultAt` 当基准，
+ * 在字幕**正常上屏**时仍然报「已经 15 秒没有识别结果」，
+ * 还给出「问题在下游（上屏环节）」这个**结论也错**的提示 —— 纯粹是假警报。
+ */
+let shownCount = 0;
+let lastShownAt = 0;
 /** 上次刷新"没有识别结果"提示的时刻（要持续刷新，不能只报一次） */
 let lastNoticeAt = 0;
 /** 上次报告「缓冲落后实况多久」的时刻（每 10 秒报一次，免得刷屏） */
@@ -105,6 +116,34 @@ let lastLevelAt = 0;
 let running = false;
 let pendingTranslate = new Map();
 let finalController = null;
+
+/**
+ * 同一条「旁路提醒」的限流 —— **在首次出现时打，之后同一句最多每 5 分钟一次**。
+ *
+ * ⚠️ 存在理由（实测）:DeepL 的「术语表未生效」是**每一句翻译**都回调一次，
+ * 用户日志里同一句出现了 8~9 次，把约两分钟的日志缓冲区吃掉一大块。
+ * 而 `diag()` 的"连续重复行不重复记"挡不住它 —— 中间夹着「翻译开始/完成」，
+ * 永远不是**连续**的。
+ *
+ * ⚠️ 但也不能"只打一次就永远不说":那是条**可操作**的提醒
+ * （要去设置页把源语言指定成具体语言）。所以按时间限流，并把被压掉的次数
+ * 在下次输出时带上 —— 否则"只出现一次"和"一直没发生"看起来是一样的。
+ */
+const NOTE_REPEAT_MS = 5 * 60 * 1000;
+const noteLastAt = new Map();
+const noteSeenCount = new Map();
+
+/** @returns {string|null} 该打的文本（重复过就带次数），或 null 表示这次压掉 */
+function takeNote(note) {
+  const text = String(note || '').trim();
+  if (!text) return null;
+  const n = (noteSeenCount.get(text) || 0) + 1;
+  noteSeenCount.set(text, n);
+  const now = Date.now();
+  if (!noteDue(noteLastAt.get(text) || 0, now, NOTE_REPEAT_MS)) return null;
+  noteLastAt.set(text, now);
+  return n > 1 ? `${text}（同一提示已出现 ${n} 次，不再逐句重复）` : text;
+}
 
 /**
  * 诊断日志。
@@ -890,6 +929,10 @@ function handleAsrEvent(ev) {
     return;
   }
   if (ev.type === 'utteranceEnd') {
+    // ⚠️ 这里也要记「文本到手了」—— 原来只记 `final` 那一支，
+    // 于是走 utterance-end 收句时 `lastResultAt` 会一直陈旧，
+    // 看门狗据此把"其实一直在出结果"误判成"没有结果"。
+    lastResultAt = Date.now();
     const done = utterances.endUtterance(ev);
     if (done) scheduleUtterance(done);
   }
@@ -1137,7 +1180,12 @@ async function translateSegment(seg) {
           context,
           signal: controller.signal,
           review: true,
-          onNote: (note) => diag(`术语表 · ${note}`, true),
+          onNote: (note) => {
+            // ⚠️ 必须限流:DeepL 那句「术语表未生效」是**每句翻译**都回调一次，
+            // 不限流会把约两分钟的缓冲区吃掉一大块（实测同一句 8~9 次）。
+            const t = takeNote(note);
+            if (t) diag(`术语表 · ${t}`, true);
+          },
         });
         translateEma =
           translateEma === null ? Date.now() - t0 : translateEma + (Date.now() - t0 - translateEma) * 0.3;
@@ -1297,24 +1345,53 @@ function pumpSubtitles() {
        * （判据基准选错这个项目栽过两次，所以这里写清楚。）
        */
       const recElapsedMs = playback.startedAt ? Date.now() - Number(playback.startedAt) : 0;
-      // ⚠️ 判据抽成了纯函数（lib/delayed-player.js 的 isRecorderStale）——
-      // 这样断言只要喂数字，不必在假 video 上推进时间。
-      const warmedUp = isRecorderStale(recElapsedMs, bytes);
+      /**
+       * ⚠️ 判据抽成了纯函数（`lib/delayed-player.js` 的 `classifyThinBuffer`）——
+       * 这样断言只要喂数字，不必在假 video 上推进时间。
+       *
+       * ⚠️ **不能只看 `ahead < 1.5`**：`_tick()` 在 `!locked` 时会提前 return（等缓冲攒够），
+       * 所以**起播之前 `bufferAheadSec` 一直接近 0，而且压根没被更新过**。
+       * 于是「前方 0.0s」在启动阶段是**预期状态**，不是故障 ——
+       * 早先只看 `ahead < 1.5 && bytes > 0`，结果在**完全健康**的启动里报了
+       * 「录制器在输出但缓冲填不上：数据进不了 SourceBuffer」，
+       * 而**下一行**就是「延迟播放已就绪 · 目标 6.6s」。
+       *
+       * 这条误报的危害不只是噪音:它把用户**直接引向错的那一层**，
+       * 而"录制/采集层 vs 缓冲层"正是排查这个故障最贵的一次分辨。
+       */
+      const thin = ahead < 1.5;
+      const thinKind = thin
+        ? classifyThinBuffer({
+            elapsedMs: recElapsedMs,
+            bytes,
+            locked: playback.locked === true,
+            delayMs: currentDelayMs(),
+          })
+        : 'warming';
+      const thinNote = !thin
+        ? ''
+        : thinKind === 'no-output'
+          ? ` ⚠ 录制器还没输出任何数据（已 ${Math.round(recElapsedMs / 1000)} 秒）：可能是录制/编码层面没产出`
+          : thinKind === 'never-started'
+            ? ` ⚠ 一直没能起播（已 ${Math.round(recElapsedMs / 1000)} 秒）：缓冲里有数据但画面起不来，卡在采集/编码侧`
+            : thinKind === 'cannot-append'
+              ? ' ⚠ 录制器在输出但缓冲填不上：数据进不了 SourceBuffer'
+              : bytes === 0
+                ? ' · 录制器还没开始输出（启动初期属正常）'
+                : ' · 缓冲还在攒（启动初期属正常）';
       // 缓冲满却还在掉帧 → 卡在解码/编码侧（CPU/GPU 被抢），不是网络
-      const bad = ahead < 1.5 || dropped > 0;
+      const bad = thin || dropped > 0;
+      /**
+       * ⚠️ 判定出**真故障**时也要进 console。
+       * 原来第二个参数是 `bad && dropped > 0` —— 而那意味着"0 字节"这类故障
+       * 永远进不了 console（它们的 dropped 恒为 0），面板一关就只剩"什么都没有"。
+       */
+      const realFault = thinKind === 'no-output' || thinKind === 'never-started' || thinKind === 'cannot-append';
       diag(
         `缓冲 · 前方 ${ahead.toFixed(1)}s · 录制器已输出 ${bytesText} · 见底 ${playback.stallCount || 0} 次 · 掉帧 ${dropped}/${total}${
-          ahead < 1.5 ? ' ⚠ 偏薄' : ''
-        }${
-          ahead < 1.5 && bytes === 0
-            ? warmedUp
-              ? ` ⚠ 录制器还没输出任何数据（已 ${Math.round(recElapsedMs / 1000)} 秒）：可能是录制/编码层面没产出`
-              : ' · 录制器还没开始输出（启动初期属正常）'
-            : ahead < 1.5 && bytes > 0
-              ? ' ⚠ 录制器在输出但缓冲填不上：数据进不了 SourceBuffer'
-              : ''
-        }${dropped > 0 && ahead >= 1.5 ? ' ⚠ 缓冲够却在掉帧：编码/解码抢不到资源' : ''}`,
-        bad && dropped > 0,
+          thin ? ' ⚠ 偏薄' : ''
+        }${thinNote}${dropped > 0 && ahead >= 1.5 ? ' ⚠ 缓冲够却在掉帧：编码/解码抢不到资源' : ''}`,
+        realFault || (bad && dropped > 0),
       );
     }
   }
@@ -1342,6 +1419,9 @@ function pumpSubtitles() {
       const drop = history.shift();
       rendered.delete(drop);
     }
+    // ⚠️ 这里才是"字幕真的上屏" —— 看门狗要的是这个，不是"识别回来了"。
+    shownCount += 1;
+    lastShownAt = Date.now();
     renderSubs();
   }
   setTimeout(pumpSubtitles, 100);
@@ -1409,10 +1489,23 @@ function warn(text) {
  *
  * 存在理由：识别断了、音源被判成静音、服务地址不对…… 这些都会表现为
  * **什么都没有**。内容进诊断面板，不再上屏。
+ *
+ * ⚠️ **基准是「字幕真的上屏」，不是「拿到识别结果」** —— 踩过的坑:
+ * 原来用 `lastResultAt` 当基准，而它只在 `ev.type === 'final'` 时更新；
+ * 走 utterance-end 收句时它会一直陈旧，于是**字幕正常上屏**的情况下
+ * 仍然报「已经 15 秒没有识别结果」，而且给出的结论
+ * 「识别有结果了，问题在下游（上屏环节）」**也是错的**。
+ * 用户看到的"什么都没有"= 屏幕上没有字幕，所以基准就该是上屏。
+ *
+ * ⚠️ 计数也必须**按模式说人话**：`asrRequestsDone` 数的是 `status === 'chunk'`
+ * （本地 VAD 下 = VAD 切出来的分片），而 `asrRequestsSent` 只数
+ * `status === 'recognizing'` —— **本地 VAD 适配器根本不发这个事件**。
+ * 于是日志里出现过「已发出 0 次 · 回来 8 次」这种自相矛盾的行，
+ * 而"回来 8 次"其实只是"切出了 8 段"。
  */
 function checkSilentAsr() {
   if (!running || !firstAudioAt) return;
-  const since = Math.max(firstAudioAt, lastResultAt || 0);
+  const since = Math.max(firstAudioAt, lastShownAt || 0);
   const waited = Date.now() - since;
   if (waited < 15000) return;
 
@@ -1422,20 +1515,22 @@ function checkSilentAsr() {
   if (Date.now() - lastNoticeAt < 2000) return;
   lastNoticeAt = Date.now();
 
-  // 「已发出 N 次 · 回来 M 次」是这里最有用的两个数：
-  //   N 涨、M 不涨  → 请求发出去了但回不来（服务卡住 / 地址不通）
-  //   N 根本不涨    → 分片没攒满，音频侧的问题
-  //   N、M 都涨     → 请求正常，问题在下游（排期/上屏）
-  const lines = [`已经 ${Math.round(waited / 1000)} 秒没有识别结果`];
+  const lines = [`已经 ${Math.round(waited / 1000)} 秒没有字幕上屏`];
   if (lastAudioNote) lines.push(`收音频：${lastAudioNote}`);
-  lines.push(`识别请求：已发出 ${asrRequestsSent} 次 · 回来 ${asrRequestsDone} 次`);
+  lines.push(`分片 ${asrRequestsDone} 段 · 字幕上屏 ${shownCount} 句`);
+  // ⚠️ 「已发出」只有请求式的适配器才发 `recognizing`；0 不代表异常，所以只在非 0 时才印。
+  if (asrRequestsSent > 0) lines.push(`识别请求：已发出 ${asrRequestsSent} 次 · 回来 ${asrRequestsDone} 次`);
+
   if (asrRequestsSent > asrRequestsDone + 1) {
     lines.push('→ 请求发出去了但回不来：检查本地服务在不在、地址对不对');
-  } else if (asrRequestsSent === 0 && asrRequestsDone === 0) {
-    // 本地 VAD 模式下不发"分片请求"，这个提示要说得准
+  } else if (asrRequestsDone === 0) {
+    // 一段都没切出来：前端的事（本地 VAD 模式下不发"分片请求"，这个提示要说得准）
     lines.push('→ 还没产生任何一句（看上面的 VAD 读数：帧数在涨吗？概率峰值上得去吗？）');
-  } else if (asrRequestsDone > 0) {
-    lines.push('→ 识别有结果了，问题在下游（上屏环节）');
+  } else if (lastResultAt && Date.now() - lastResultAt < 15000) {
+    // ⚠️ 这一支现在**有依据**了：文本确实刚到手，却没上屏。
+    lines.push('→ 识别有结果了，问题在下游（排期 / 翻译 / 上屏环节）');
+  } else {
+    lines.push('→ 切出了分片，但一直没有文本回来：看上面有没有「识别出错」，以及本地服务的地址');
   }
   warn(lines.join('\n'));
 }
