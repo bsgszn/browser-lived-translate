@@ -52,6 +52,16 @@ function fakeVideo(init = {}) {
   };
 }
 
+/** 造一条假的视频轨（快照会读 `getSettings()` 与轨自己的 `readyState`/`muted`/`enabled`） */
+function fakeTrack(init = {}) {
+  return {
+    readyState: init.readyState ?? 'live',
+    muted: init.muted ?? false,
+    enabled: init.enabled ?? true,
+    getSettings: () => init.settings ?? { width: 2560, height: 1440, frameRate: 60 },
+  };
+}
+
 /** 造一个假的 playback */
 function fakePlayback(init = {}) {
   return {
@@ -100,7 +110,7 @@ function scenarios() {
     mk(
       () => fakeVideo({ readyState: 0, paused: true, currentTime: 0 }),
       fakePlayback({ bytes: 0, chunks: 0, appendOk: 0, seekCount: 0 }),
-      { getVideoTracks: () => [{ getSettings: () => ({ width: 2561, height: 1441, frameRate: 60 }) }] },
+      { getVideoTracks: () => [fakeTrack({ settings: { width: 2561, height: 1441, frameRate: 60 } })] },
       0, null, { state: 'running', sampleRate: 48000 }, { visibilityState: 'visible' }
     ),
   ]);
@@ -114,7 +124,7 @@ function scenarios() {
         bytes: 14155776, chunks: 57, appendOk: 57, seekCount: 0,
         sourceBuffer: { updating: false, buffered: { length: 3 } },
       }),
-      { getVideoTracks: () => [{ getSettings: () => ({ width: 2560, height: 1440, frameRate: 60 }) }] },
+      { getVideoTracks: () => [fakeTrack()] },
       0, null, { state: 'running', sampleRate: 48000 }, { visibilityState: 'visible' }
     ),
   ]);
@@ -130,13 +140,36 @@ function scenarios() {
         appendOk: 351, seekCount: 1, lastSeekTarget: 128.6,
         sourceBuffer: { updating: true, buffered: { length: 3 } },
       }),
-      { getVideoTracks: () => [{ getSettings: () => ({ width: 2560, height: 1440, frameRate: 60 }) }] },
+      { getVideoTracks: () => [fakeTrack()] },
       1, 'QuotaExceededError: The SourceBuffer is full', { state: 'running', sampleRate: 48000 },
       { visibilityState: 'visible' }
     ),
   ]);
 
-  // ④ 字段全缺:任何东西取不到都不许抛
+  /**
+   * ④ 录制器**自己停了** + 视频轨 `ended` —— 这是"采集断了"的形态。
+   *
+   * ⚠️ 这个场景以前从快照里**完全看不出来**:尺寸照样报 3840×2160@60，
+   * 字节数还停在断掉之前的那个值，看上去一切正常 —— 直到缓冲被播放头吃光。
+   * 现在靠两处新增读数分辨:`recorder.state = inactive` 与轨道的 `ended`/`静音`。
+   */
+  cases.push([
+    '录制器自己停了（采集断了 / 轨道 ended）',
+    mk(
+      () => fakeVideo({ readyState: 4, paused: false, currentTime: 20.0, ranges: [[0, 21.5]] }),
+      fakePlayback({
+        bytes: 52428800, chunks: 210, actualDelaySec: 0.1, locked: true,
+        stallCount: 0, totalFrames: 700, droppedFrames: 0,
+        appendOk: 210, seekCount: 1, lastSeekTarget: 3.3,
+        recorder: { mimeType: 'video/mp4;codecs="avc1.42E01E,mp4a.40.2"', state: 'inactive' },
+        sourceBuffer: { updating: false, buffered: { length: 1 } },
+      }),
+      { getVideoTracks: () => [fakeTrack({ readyState: 'ended', muted: true })] },
+      0, null, { state: 'running', sampleRate: 48000 }, { visibilityState: 'visible' }
+    ),
+  ]);
+
+  // ⑤ 字段全缺:任何东西取不到都不许抛
   cases.push([
     '字段全缺（测容错，绝不许抛）',
     mk(() => null, null, null, 0, null, null, { visibilityState: 'visible' }),

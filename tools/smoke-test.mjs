@@ -4047,7 +4047,23 @@ check('画质档位必须在设置页可选，并且真的影响码率', () => {
 
 check('采集帧率必须显式给上限（不给的话 Chrome 常只给 30fps，源是 60 就白丢一半）', () => {
   const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
-  const gum = pj.slice(pj.indexOf('getUserMedia'), pj.indexOf('const vtrack'));
+  /**
+   * ⚠️ 结束锚点必须**从起点之后**去找。
+   *
+   * `player.js` 里现在有**两处** `const vtrack`：`snapshotLine` 里读轨道状态那处（在前），
+   * 以及 `startCapture` 里采集那处（在后）。用裸 `indexOf('const vtrack')` 会命中**前面那个**，
+   * 于是 `slice(后, 前)` → **空串** → 这条断言凭空失败 ✗（而 getUserMedia 其实好好的）。
+   *
+   * 这正是本项目记过的陷阱:同一个锚点串在文件里出现两次，`indexOf` 就会定位到错的地方。
+   * 所以这里给 `indexOf` 传第二个参数（起点），把搜索**限制在 getUserMedia 之后**。
+   */
+  const gumStart = pj.indexOf('getUserMedia');
+  const gumEnd = gumStart < 0 ? -1 : pj.indexOf('const vtrack', gumStart);
+  const gum = gumStart < 0 || gumEnd < 0 ? '' : pj.slice(gumStart, gumEnd);
+  // 守卫:切片塌成空串时要说清是"锚点没找到"，而不是含糊地报"没给 maxFrameRate" ✗
+  if (gum.length < 200) {
+    throw new Error(`切片异常（${gum.length} 字符）—— 锚点可能变了：getUserMedia@${gumStart} · const vtrack@${gumEnd}`);
+  }
   if (!/maxFrameRate/.test(gum)) {
     throw new Error('getUserMedia 里没有给 maxFrameRate —— 实测默认只拿到 30fps');
   }
@@ -4527,8 +4543,23 @@ check('预设下拉不能误标（两类预设回答的是不同问题，混在�
 
 check('MSE 配额溢出必须自救（只报一句就丢片 → 播放头停住、右上角全变 0）', () => {
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
-  const pump = src.slice(src.indexOf('_pumpChunks()'), src.indexOf('_pumpChunks()') + 2600);
-  if (!pump) throw new Error('找不到 _pumpChunks()');
+  /**
+   * ⚠️ 原来这里用**固定长度切片** `indexOf('_pumpChunks()') + 2600` —— 有两个坑:
+   *
+   * ① `_pumpChunks()` 在文件里出现**两次**（`ondataavailable` 里的调用、以及方法定义本身），
+   *    裸 `indexOf` 命中的是**前面那个调用点** ✗；
+   * ② 固定长度:方法前面一加代码（这次就是），2600 字符就够不到下面的 `unshift` 了 ——
+   *    而断言**不会报错，只会悄悄变绿**（"裁完之后没放回队首"这条就失去意义了）✗。
+   *
+   * 这个陷阱本项目已经栽过三次。所以改成:**从方法定义起，切到本方法结束**。
+   */
+  const pumpStart = src.indexOf('_pumpChunks() {');
+  const pumpEnd = pumpStart < 0 ? -1 : src.indexOf('\n  }', pumpStart);
+  const pump = pumpStart < 0 || pumpEnd < 0 ? '' : src.slice(pumpStart, pumpEnd + 4);
+  // 守卫:切片太小说明锚点变了 —— 那时应当**报锚点问题**，而不是含糊地说"找不到 _pumpChunks()"
+  if (pump.length < 500) {
+    throw new Error(`_pumpChunks 切片异常（${pump.length} 字符）—— 锚点可能变了（start@${pumpStart} end@${pumpEnd}）`);
+  }
   // ⚠️ 真实事故：4K60 + 高画质 = 128 Mbps = 16 MB/s，而裁剪策略保留播放头前 15 秒、
   // 又允许再攒 20 秒 → 最多 43 秒 = 688 MB，直接撞穿 MSE 配额，报
   //   `SourceBuffer is full, and cannot free space`
@@ -6216,6 +6247,268 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
       ` ③ tools/snapshot-preview.cjs 的 **fakePlayback 函数体内**也要有 ——` +
       `否则预览显示成 '?'，"看不到自己加的字段"那堵墙会再撞一次。` +
       ` 实际: 没读=${JSON.stringify(notRead)} 不存在=${JSON.stringify(notReal)} 预览缺=${JSON.stringify(notInPreview)}`,
+  );
+}
+
+/**
+ * 可见性即时提示的**生命周期** —— 和 `snapTimer` 是同一个坑，所以用同一套钉法。
+ *
+ * ⚠️ 为什么必须钉「停止时摘掉」:
+ * `startCapture()` 每次都会 `addEventListener('visibilitychange', …)`，
+ * 而 `stopAll()` 是唯一停止入口。不摘的话，「开始 → 停止 → 再开始」会**累积监听器** ——
+ * 之后每切一次前台/后台就打 N 条重复日志，把 400 行的缓冲区冲掉。
+ *
+ * ⚠️ 监听器挂之前还要**先摘一次**（自己上次留下的），否则同样会累积。
+ */
+{
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const topFn = (s, name) => {
+    const i = s.indexOf(`function ${name}(`);
+    if (i < 0) return '';
+    const end = s.indexOf('\n}', i);
+    return end < 0 ? s.slice(i) : s.slice(i, end + 2);
+  };
+  const startFn = topFn(src, 'startCapture');
+  const stopFn = topFn(src, 'stopAll');
+  const declared = /let visHandler = null;/.test(src);
+  const addAt = startFn.indexOf("addEventListener('visibilitychange'");
+  const preRemoveAt = startFn.indexOf("removeEventListener('visibilitychange'");
+  const stopped = /removeEventListener\('visibilitychange'/.test(stopFn);
+  const cleared = /visHandler = null;/.test(stopFn);
+  check(
+    '可见性提示：监听器挂在 startCapture、**摘在 stopAll**（不摘会累积，切一次打 N 条）',
+    declared && startFn.length > 0 && stopFn.length > 0 && addAt >= 0 && stopped && cleared,
+    `需要: 模块级 let visHandler = null · startCapture 里 addEventListener · ` +
+      `stopAll 里 removeEventListener 且 visHandler = null。` +
+      ` 实际: 声明=${declared} 挂=${addAt >= 0} 摘=${stopped} 置空=${cleared}`,
+  );
+  check(
+    '可见性提示：挂之前先摘一次自己上一次留下的（防反复开始累积）',
+    preRemoveAt >= 0 && addAt >= 0 && preRemoveAt < addAt,
+    `startCapture 里应当**先** removeEventListener 再 addEventListener` +
+      `（照 snapTimer「先 clearInterval 再 setInterval」那两道保险）。` +
+      ` 实际: 先摘=${preRemoveAt >= 0} 后挂=${addAt >= 0} 顺序对=${preRemoveAt >= 0 && addAt >= 0 && preRemoveAt < addAt}`,
+  );
+}
+
+/**
+ * 掉帧必须**按比例**判，而且要挡住样本不足。
+ *
+ * ⚠️ 真实问题:原来只看绝对条数，于是
+ *   掉帧 1/1195（0.08%）和 19/330（5.8%）报的是**同一句** ⚠，严重度差 70 倍。
+ * 一个总在响的警告会被训练成看不见 —— 那这个信号就废了。
+ * 而"样本不足时不下结论"是防**另一个**方向的误报:1/10 = 10% 显然不该报警。
+ */
+{
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const hasRatio = /total >= 100 \? dropped \/ total : 0/.test(src);
+  const hasThreshold = /dropRatio > 0\.01/.test(src);
+  const goneAbsolute = !/const bad = thin \|\| dropped > 0;/.test(src);
+  const showsPercent = /\(dropRatio \* 100\)\.toFixed\(1\)/.test(src);
+  check(
+    '掉帧按比例判（0.08% 和 5.8% 不能报同一句）、且样本 < 100 帧不判',
+    hasRatio && hasThreshold && goneAbsolute && showsPercent,
+    `需要: const dropRatio = total >= 100 ? dropped / total : 0 · 判据 dropRatio > 0.01 · ` +
+      `文案里带百分比 · 旧的「绝对条数」写法必须消失。` +
+      ` 实际: 比例式=${hasRatio} 阈值=${hasThreshold} 旧写法已除=${goneAbsolute} 显示百分比=${showsPercent}`,
+  );
+}
+
+/**
+ * ⚠️ 用户可见的文本里**不许有 markdown 粗体**。
+ *
+ * 诊断面板用 `box.textContent` 渲染，**不解析 markdown** —— 所以 `**可能**`
+ * 会原样把星号露给用户看。这不是假想:`**迟到 98.37ms**` 真的出现在用户贴的日志里 ✗
+ * （本项目早先为错误文案里的 `**别用 localhost**` 记过一笔，后来又有四处复发）。
+ *
+ * 所以这里扫 `diag()` / `showOverlay()` 的**实参字符串字面量**——
+ * 注意是**剥过注释**之后扫的:注释里写 `**` 是给人读的，不该算。
+ */
+{
+  /**
+   * 从 `(` 起按括号配对取实参文本（跳过字符串字面量，避免里面的括号干扰配对）。
+   * 这不是完整 JS 解析器，但对"实参里有没有 `**`"这个目标是够的。
+   */
+  const argsOf = (s, openIdx) => {
+    let depth = 0;
+    for (let i = openIdx; i < s.length; i++) {
+      const c = s[i];
+      if (c === '(') depth++;
+      else if (c === ')') {
+        depth--;
+        if (depth === 0) return s.slice(openIdx + 1, i);
+      } else if (c === "'" || c === '"' || c === '`') {
+        const q = c;
+        i++;
+        while (i < s.length && s[i] !== q) {
+          if (s[i] === '\\') i++;
+          i++;
+        }
+      }
+    }
+    return s.slice(openIdx + 1);
+  };
+  const bad = [];
+  let scanned = 0;
+  for (const rel of ['player/player.js', 'lib/delayed-player.js']) {
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), rel), 'utf8'));
+    for (const call of ['diag(', 'showOverlay(']) {
+      let from = 0;
+      for (;;) {
+        const at = src.indexOf(call, from);
+        if (at < 0) break;
+        from = at + call.length;
+        const args = argsOf(src, from - 1);
+        scanned++;
+        const line = src.slice(0, at).split('\n').length;
+        args.split('\n').forEach((al, k) => {
+          if (/'[^']*\*\*[^']*'|"[^"]*\*\*[^"]*"|`[^`]*\*\*[^`]*`/.test(al)) {
+            bad.push(`${rel}:${line + k}`);
+          }
+        });
+      }
+    }
+  }
+  check(
+    '用户可见文本里没有 markdown 粗体（面板用 textContent，**会原样露出星号**）',
+    scanned > 20 && bad.length === 0,
+    `诊断面板不渲染 markdown，所以 diag()/showOverlay() 的字符串里不能有 ** —— ` +
+      `用户看到的是字面的星号（实测日志里出现过 \`**迟到 98.37ms**\`）。` +
+      ` 实际: 扫了 ${scanned} 个调用、发现 ${bad.length} 处${bad.length ? ' → ' + bad.join(' , ') : ''}`,
+  );
+}
+
+/**
+ * 录制器**自己**出错 / 自己停下来时，必须有话说。
+ *
+ * ⚠️ 这两个事件原来**完全没有 handler** —— 于是故障只剩"字节不涨 / 缓冲填不上"这种
+ * **结果**，日志里看不到**原因**。而排查那条"黑屏无声有字幕"最贵的一步，
+ * 恰恰是分辨**哪一层**断的。
+ *
+ * ⚠️ `onstop` 必须用 `this.stopped` 区分"我们停的"和"它自己停的"——
+ * 否则每次正常收摊都会报一条"录制器停了" ✗。
+ */
+{
+  const dpSrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
+  const hasErr = /this\.recorder\.onerror\s*=/.test(dpSrc);
+  const hasStop = /this\.recorder\.onstop\s*=/.test(dpSrc);
+  // onstop 体内要有 this.stopped 的守卫
+  const stopBody = (() => {
+    const i = dpSrc.indexOf('this.recorder.onstop');
+    if (i < 0) return '';
+    const j = dpSrc.indexOf('};', i);
+    return j < 0 ? dpSrc.slice(i, i + 400) : dpSrc.slice(i, j + 2);
+  })();
+  const guarded = /this\.stopped/.test(stopBody);
+  // playe r.js 要真的消费这两个 phase（否则 handler 报了也没人看）
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const consumesErr = /s\.phase === 'recorder-error'/.test(pj);
+  const consumesStop = /s\.phase === 'recorder-stopped'/.test(pj);
+  check(
+    '录制器报错/自己停了必须有话说（原来这两个事件没有 handler，故障只剩结果没有原因）',
+    hasErr && hasStop && guarded && consumesErr && consumesStop,
+    `需要: delayed-player 里 recorder.onerror + recorder.onstop（且 onstop 用 this.stopped 守卫，` +
+      `否则正常收摊也报）+ player.js 里消费这两个 phase。` +
+      ` 实际: onerror=${hasErr} onstop=${hasStop} 守卫=${guarded} 消费错=${consumesErr} 消费停=${consumesStop}`,
+  );
+}
+
+/**
+ * 「录制器停了」必须是一个**独立的分类**，不能被算成 `cannot-append`。
+ *
+ * ⚠️ 不分类的话:起播之后录制器一停，`_tick()` 不再推进缓冲，前方缓冲被播放头吃光 →
+ * `ahead` 掉到 0 → 落到 `cannot-append`，日志说「数据进不了 SourceBuffer」✗ ——
+ * 而真正断的是**采集**。那又是一次"把用户引向错的那一层"。
+ *
+ * 判据是纯函数，所以这里**直接喂数字**断言（比查源码字符串强得多）。
+ */
+{
+  const dp = loaded['lib/delayed-player.js'];
+  const f = dp.classifyThinBuffer;
+  const stoppedCase = f({ elapsedMs: 20000, bytes: 52428800, locked: true, delayMs: 6600, recorderInactive: true });
+  const cannotAppend = f({ elapsedMs: 20000, bytes: 52428800, locked: true, delayMs: 6600 });
+  // 它必须**优先于** bytes===0 那条（原因优先于症状）
+  const stoppedZero = f({ elapsedMs: 63000, bytes: 0, locked: false, delayMs: 6600, recorderInactive: true });
+  // 脏值不许误报
+  const dirty = f({ elapsedMs: 20000, bytes: 100, recorderInactive: 'yes' });
+  check(
+    '录制器停了是独立分类（不被算成 cannot-append —— 那会把用户引向错的那一层）',
+    stoppedCase === 'recorder-stopped' &&
+      cannotAppend === 'cannot-append' &&
+      stoppedZero === 'recorder-stopped' &&
+      dirty === 'warming',
+    `需要: recorderInactive===true → 'recorder-stopped'（且优先于 bytes===0）· ` +
+      `不传时仍是 'cannot-append' · 非布尔值不算。` +
+      ` 实际: 停了=${stoppedCase} 没传=${cannotAppend} 停了且0字节=${stoppedZero} 脏值=${dirty}`,
+  );
+  // player.js 必须把 recorderInactive 传进去，而且只在"它自己停的"时为真
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const passes = /recorderInactive,/.test(pj) || /recorderInactive\s*[,}]/.test(pj);
+  const computes = /playback\.stopped !== true/.test(pj);
+  check(
+    'recorderInactive 只在「它自己停的」时为真（我们主动 stop 时不算，否则收摊也报警）',
+    passes && computes,
+    `player.js 要算 recorderInactive = recorder.state === 'inactive' && playback.stopped !== true，` +
+      `并把它传给 classifyThinBuffer。 实际: 传入=${passes} 有 stopped 守卫=${computes}`,
+  );
+}
+
+/**
+ * 快照必须带上**轨自己的状态**（`readyState`/`muted`/`enabled`）。
+ *
+ * ⚠️ `getSettings()` 给不了这三样，而它们每一种都会让"录制器 0 字节":
+ * 来源流断了（`ended`）、轨被静音、轨被禁用 —— 而**尺寸照样报 3840×2160@60**，
+ * 看上去一切正常 ✗。所以光有尺寸不够。
+ *
+ * 三处必须同时有（照 `appendOk` 那套跨文件核对）:
+ *   ① `snapshotLine` 里读它 ② 它是真的 track 属性（浏览器 API，不是我们的字段）
+ *   ③ 预览工具的假轨里也有 —— 否则预览显示成 `?`，"看不到自己加的字段"那堵墙再撞一次。
+ */
+{
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const i = pj.indexOf('function snapshotLine(');
+  const snapFn = i < 0 ? '' : pj.slice(i, pj.indexOf('\n}', i) + 2);
+  const reads = ['readyState', 'muted', 'enabled'].filter(
+    (f) => !new RegExp(`vtrack\\?\\.${f}\\b`).test(snapFn),
+  );
+  const pv = fs.readFileSync(path.join(process.cwd(), 'tools', 'snapshot-preview.cjs'), 'utf8');
+  const pvFn = (() => {
+    const k = pv.indexOf('function fakeTrack(');
+    return k < 0 ? '' : pv.slice(k, pv.indexOf('\n}', k) + 2);
+  })();
+  const pvMissing = ['readyState', 'muted', 'enabled'].filter((f) => !new RegExp(`${f}\\s*:`).test(pvFn));
+  check(
+    '快照带轨道自身状态（ended/静音/禁用 都会让录制器 0 字节，而尺寸看不出来）',
+    snapFn.length > 0 && pvFn.length > 0 && !reads.length && !pvMissing.length,
+    `需要: snapshotLine 里读 vtrack?.readyState / muted / enabled，` +
+      `且 tools/snapshot-preview.cjs 的 fakeTrack 里也有这三项。` +
+      ` 实际: 快照没读=${JSON.stringify(reads)} 预览缺=${JSON.stringify(pvMissing)}`,
+  );
+}
+
+/**
+ * ⭐ 「轨道尺寸」这个读数必须是 **applyConstraints 之后**的值。
+ *
+ * ⚠️ 这是它**唯一**的用途:回答「采集侧的取偶到底生效没有」。
+ * 如果 `const vs = vtrack.getSettings()` 读在 `applyConstraints` **之前**，
+ * 那快照里永远显示取偶**前**的尺寸 —— 而那个读数是唯一能验证这条改动的东西，
+ * 读错了等于**永远验证不了，还看不出来** ✗。
+ *
+ * 注意 `applyConstraints` 在文件里出现多次（降分辨率那条路也用它），
+ * 所以要限定在 `startCapture` 里、且在 `const vs` 之前。
+ */
+{
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const i = src.indexOf('function startCapture(');
+  const startFn = i < 0 ? '' : src.slice(i, src.indexOf('\n}', i) + 2);
+  const ac = startFn.indexOf('await vtrack.applyConstraints(');
+  const vs = startFn.indexOf('const vs = vtrack.getSettings()');
+  const evenF = startFn.indexOf('evenFloor(');
+  check(
+    '快照里的轨道尺寸是 applyConstraints 之后的值（否则"取偶生效没有"永远验证不了）',
+    startFn.length > 200 && ac >= 0 && vs >= 0 && evenF >= 0 && ac < vs && evenF < vs,
+    `startCapture 里必须: evenFloor 判定 → await vtrack.applyConstraints → **然后才** const vs = vtrack.getSettings()。` +
+      ` 实际: 取偶=${evenF} applyConstraints=${ac} 读尺寸=${vs} 顺序对=${ac >= 0 && vs >= 0 && ac < vs}`,
   );
 }
 

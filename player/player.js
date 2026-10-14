@@ -240,11 +240,23 @@ function snapshotLine(tag) {
     }, null);
     /**
      * ⚠️ 轨道的**实际**设置 —— 这是唯一能回答「applyConstraints 到底生效没有」的读数。
-     * 采集侧的取偶改动至今没被验证过，而它只能从这里看出来。
      * `stream` 是模块级变量，所以不用新加状态。
+     * ⚠️ 它取的是**活的**那条轨（`stream` 自己的），而采集侧取偶正是改这条轨，
+     * 所以这里拿到的就是**取偶之后**的值 —— 顺序上取偶在 `已取得流` 之前完成。
+     *
+     * ⚠️ 还要带轨**自己**的状态，那是 `getSettings()` 给不了的:
+     * `readyState` 变 `ended`（来源流断了）、`muted`、`enabled=false`
+     * —— 这三种都会让"录制器 0 字节"，而光看尺寸完全看不出来 ✗
+     * （尺寸照样报 3840×2160@60，看着一切正常）。
+     * 为了守住"快照只有一行"，**muted/enabled 只在异常时**才拼上去。
      */
-    const vs = g(() => stream?.getVideoTracks?.()[0]?.getSettings?.(), null) || {};
-    const vt = `${vs.width || '?'}×${vs.height || '?'}@${vs.frameRate ? Math.round(vs.frameRate) : '?'}`;
+    const vtrack = g(() => stream?.getVideoTracks?.()[0], null);
+    const vs = g(() => vtrack?.getSettings?.(), null) || {};
+    const vtState = String(g(() => vtrack?.readyState));
+    const vtFlag =
+      (g(() => vtrack?.muted) === true ? '·静音' : '') +
+      (g(() => vtrack?.enabled) === false ? '·已禁用' : '');
+    const vt = `${vs.width || '?'}×${vs.height || '?'}@${vs.frameRate ? Math.round(vs.frameRate) : '?'} ${vtState}${vtFlag}`;
     return (
       `〔快照 ${tag}·录制〕` +
       ` ${g(() => r?.mimeType) || '(空)'}/${g(() => r?.state)}` +
@@ -456,7 +468,7 @@ async function startCapture() {
   visHandler = () => {
     if (document.visibilityState === 'hidden') {
       diag(
-        '⚠ 播放页被切到后台了 —— 画面采集**可能**被浏览器节流，画面/声音可能停住。把本页保持在前台可见。',
+        '⚠ 播放页被切到后台了 —— 画面采集可能被浏览器节流，画面/声音可能停住。把本页保持在前台可见。',
         false,
       );
     } else {
@@ -543,7 +555,7 @@ async function startCapture() {
       const after = vtrack.getSettings();
       diag(
         `宽高取偶 · ${rawSize.width}×${rawSize.height} → ${after.width}×${after.height}` +
-          `（规范化；这**不是**黑屏的病因，实测奇数尺寸编码正常）`,
+          `（规范化；这不是黑屏的病因，实测奇数尺寸编码正常）`,
         true,
       );
     } catch (e) {
@@ -605,12 +617,33 @@ async function startCapture() {
         if (s.bitrateNote) diag(`视频码率 · ${s.bitrateNote}`, true);
       }
       if (s.phase === 'append-error') {
-      appendFails += 1;
-      lastAppendError = s.message || '';
-      diag(`缓冲写入失败 · ${s.message}`, true);
-    }
+        appendFails += 1;
+        lastAppendError = s.message || '';
+        diag(`缓冲写入失败 · ${s.message}`, true);
+      }
       // 配额溢出后自救成功了 —— 要让用户知道"卡了一下但恢复了"
       if (s.phase === 'quota-recovered') diag('缓冲配额溢出 · 已清理并重试成功', true);
+      /**
+       * ⚠️ 录制器**自己**报错 / **自己**停了 —— 这两个事件以前没有任何 handler，
+       * 于是故障只剩"字节不涨 / 缓冲填不上"这种**结果**，日志里看不到**原因**。
+       *
+       * 措辞要给出可判断的后果:录制器停了 = 画面和声音都会停
+       * （声音来自延迟 `<video>` 的音轨），而字幕走独立音频管线、照常 ——
+       * 这正是用户报的那条「只有字幕没画面没声音」的形态之一。
+       */
+      if (s.phase === 'recorder-error') {
+        diag(
+          `⚠ 录制器报错 · ${s.message} —— 录制一断，画面和声音都会停（字幕走独立管线，照常）`,
+          true,
+        );
+      }
+      if (s.phase === 'recorder-stopped') {
+        diag(
+          `⚠ 录制器停了（不是我们停的）· 已输出 ${s.bytes || 0} 字节／${s.chunks || 0} 片、` +
+            `跑了 ${Math.round((s.elapsedMs || 0) / 1000)} 秒 —— 来源流可能断了（标签页关闭/跳转、编码器出错）`,
+          true,
+        );
+      }
       /**
        * 延迟涨太多，跳过了一段把延迟硬拉回目标。
        * 这是"保命"动作：不做的话延迟会一路涨到撞穿 MSE 配额、播放头卡死
@@ -1225,8 +1258,8 @@ async function translateSegment(seg) {
         const late = Date.now() - seg.at;
         diag(
           late > 0
-            ? `翻译完成 · ${cost}ms · **迟到 ${late}ms**（窗口只有 ${Math.max(0, seg.at - t0)}ms，把「画面延迟」调大）`
-            : `翻译完成 · ${cost}ms · 赶上了（余量 ${-late}ms）`,
+            ? `翻译完成 · ${cost}ms · 迟到 ${Math.round(late)}ms（窗口只有 ${Math.round(Math.max(0, seg.at - t0))}ms，把「画面延迟」调大）`
+            : `翻译完成 · ${cost}ms · 赶上了（余量 ${Math.round(-late)}ms）`,
           late > 0,
         );
         // 只缓存成功的：把失败也缓存住，同一句话就永远不会再重试
@@ -1392,25 +1425,35 @@ function pumpSubtitles() {
        * 而"录制/采集层 vs 缓冲层"正是排查这个故障最贵的一次分辨。
        */
       const thin = ahead < 1.5;
+      /**
+       * ⚠️ `recorderInactive` 只在**它自己停了**时为真:我们主动 `stop()` 时
+       * `playback.stopped` 已置真，所以不会被算成"自己停的"（否则正常收摊也会报警）。
+       * 不把这一条传进去的话，录制器一停就会被误判成 `cannot-append` ✗
+       * （前方缓冲被播放头吃光 → 落到"数据进不了 SourceBuffer"，而真正断的是采集）。
+       */
+      const recorderInactive = playback.recorder?.state === 'inactive' && playback.stopped !== true;
       const thinKind = thin
         ? classifyThinBuffer({
             elapsedMs: recElapsedMs,
             bytes,
             locked: playback.locked === true,
             delayMs: currentDelayMs(),
+            recorderInactive,
           })
         : 'warming';
       const thinNote = !thin
         ? ''
-        : thinKind === 'no-output'
-          ? ` ⚠ 录制器还没输出任何数据（已 ${Math.round(recElapsedMs / 1000)} 秒）：可能是录制/编码层面没产出`
-          : thinKind === 'never-started'
-            ? ` ⚠ 一直没能起播（已 ${Math.round(recElapsedMs / 1000)} 秒）：缓冲里有数据但画面起不来，卡在采集/编码侧`
-            : thinKind === 'cannot-append'
-              ? ' ⚠ 录制器在输出但缓冲填不上：数据进不了 SourceBuffer'
-              : bytes === 0
-                ? ' · 录制器还没开始输出（启动初期属正常）'
-                : ' · 缓冲还在攒（启动初期属正常）';
+        : thinKind === 'recorder-stopped'
+          ? ` ⚠ 录制器已经停了（不是我们停的）：采集断了，画面和声音都会停 —— 看上面那条「录制器停了」`
+          : thinKind === 'no-output'
+            ? ` ⚠ 录制器还没输出任何数据（已 ${Math.round(recElapsedMs / 1000)} 秒）：可能是录制/编码层面没产出`
+            : thinKind === 'never-started'
+              ? ` ⚠ 一直没能起播（已 ${Math.round(recElapsedMs / 1000)} 秒）：缓冲里有数据但画面起不来，卡在采集/编码侧`
+              : thinKind === 'cannot-append'
+                ? ' ⚠ 录制器在输出但缓冲填不上：数据进不了 SourceBuffer'
+                : bytes === 0
+                  ? ' · 录制器还没开始输出（启动初期属正常）'
+                  : ' · 缓冲还在攒（启动初期属正常）';
       // 缓冲满却还在掉帧 → 卡在解码/编码侧（CPU/GPU 被抢），不是网络
       /**
        * 掉帧改**按比例**判 —— 原来只看绝对条数，于是
@@ -1425,7 +1468,11 @@ function pumpSubtitles() {
        * 原来第二个参数是 `bad && dropped > 0` —— 而那意味着"0 字节"这类故障
        * 永远进不了 console（它们的 dropped 恒为 0），面板一关就只剩"什么都没有"。
        */
-      const realFault = thinKind === 'no-output' || thinKind === 'never-started' || thinKind === 'cannot-append';
+      const realFault =
+        thinKind === 'no-output' ||
+        thinKind === 'never-started' ||
+        thinKind === 'cannot-append' ||
+        thinKind === 'recorder-stopped';
       diag(
         `缓冲 · 前方 ${ahead.toFixed(1)}s · 录制器已输出 ${bytesText} · 见底 ${playback.stallCount || 0} 次 · 掉帧 ${dropped}/${total}${
           thin ? ' ⚠ 偏薄' : ''
@@ -1730,7 +1777,7 @@ function watchExternalSettings() {
     diag('设置已从别处更新', true);
     if (needRestart.length) {
       diag(
-        `⚠ ${needRestart.map(([, label]) => label).join('、')} 的改动**要重新开始同声传译才会生效**` +
+        `⚠ ${needRestart.map(([, label]) => label).join('、')} 的改动要重新开始同声传译才会生效` +
           `（这几项在启动时就定死了，无法中途更改）`,
         true,
       );
