@@ -71,6 +71,18 @@ let lastAppendError = null;
  */
 let snapTimer = 0;
 const SNAP_PERIOD_MS = 60000;
+/**
+ * `visibilitychange` 的监听器（采集开始时挂、停止时摘）。
+ *
+ * ⚠️ 为什么要有它:实测日志里出现过
+ *   〔快照 2s·播放〕… 可见 hidden    〔快照 8s·录制〕字节 1252／2 片
+ * —— 2 秒到 8 秒之间**几乎什么都没产出**，而同一次快照里写着 `可见 hidden`。
+ *
+ * ⚠️ 而那是**相关，不是因果** —— 我们只有那一条观测，还没有对照实验。
+ * 所以措辞**必须留余地**（"可能被节流"），不能写成"切后台就会黑屏" ✗。
+ * 而"回到前台"也只说"已回到前台"，**不说"采集已恢复"** —— 那个因果同样没测到。
+ */
+let visHandler = null;
 let asr = null;
 let resampler = null;
 /** 滚动音频缓冲：延迟模式留着音频，才能拿它重新识别一遍 */
@@ -432,6 +444,26 @@ async function startCapture() {
    */
   clearInterval(snapTimer);
   snapTimer = setInterval(() => diag(snapshotLine('周期'), false), SNAP_PERIOD_MS);
+
+  /**
+   * 页面被切到后台时**即时**说一声 —— 以前只有快照里能看到可见性，
+   * 而快照 60 秒才一次，中途切走时日志里一片空白 ✗（实测就是这样）。
+   *
+   * ⚠️ 措辞留余地:我们只观测到"hidden 期间字节几乎不涨"这一条**相关**，
+   * 没有对照实验，所以是"可能被节流"，不是"就会黑屏" ✗。
+   */
+  if (visHandler) document.removeEventListener('visibilitychange', visHandler);
+  visHandler = () => {
+    if (document.visibilityState === 'hidden') {
+      diag(
+        '⚠ 播放页被切到后台了 —— 画面采集**可能**被浏览器节流，画面/声音可能停住。把本页保持在前台可见。',
+        false,
+      );
+    } else {
+      diag('播放页已回到前台', false);
+    }
+  };
+  document.addEventListener('visibilitychange', visHandler);
 
   /**
    * 采集帧率上限。0 = 不限制。不显式给的话 Chrome 默认常常只给 30fps。
@@ -1380,7 +1412,14 @@ function pumpSubtitles() {
                 ? ' · 录制器还没开始输出（启动初期属正常）'
                 : ' · 缓冲还在攒（启动初期属正常）';
       // 缓冲满却还在掉帧 → 卡在解码/编码侧（CPU/GPU 被抢），不是网络
-      const bad = thin || dropped > 0;
+      /**
+       * 掉帧改**按比例**判 —— 原来只看绝对条数，于是
+       *   掉帧 1/1195（0.08%） 和 19/330（5.8%）报的是**同一句** ⚠，严重度差 70 倍 ✗。
+       * 而一个总在响的警告会被训练成看不见（这一轮已有先例）。
+       * ⚠️ 样本不足（< 100 帧）时不下结论 —— 否则 1/10 = 10% 会误报。
+       */
+      const dropRatio = total >= 100 ? dropped / total : 0;
+      const bad = thin || dropRatio > 0.01;
       /**
        * ⚠️ 判定出**真故障**时也要进 console。
        * 原来第二个参数是 `bad && dropped > 0` —— 而那意味着"0 字节"这类故障
@@ -1390,7 +1429,11 @@ function pumpSubtitles() {
       diag(
         `缓冲 · 前方 ${ahead.toFixed(1)}s · 录制器已输出 ${bytesText} · 见底 ${playback.stallCount || 0} 次 · 掉帧 ${dropped}/${total}${
           thin ? ' ⚠ 偏薄' : ''
-        }${thinNote}${dropped > 0 && ahead >= 1.5 ? ' ⚠ 缓冲够却在掉帧：编码/解码抢不到资源' : ''}`,
+        }${thinNote}${
+          dropRatio > 0.01 && ahead >= 1.5
+            ? ` ⚠ 缓冲够却在掉帧（${(dropRatio * 100).toFixed(1)}%）：编码/解码抢不到资源`
+            : ''
+        }`,
         realFault || (bad && dropped > 0),
       );
     }
@@ -1839,6 +1882,10 @@ function stopAll(reason) {
    */
   clearInterval(snapTimer);
   snapTimer = 0;
+  if (visHandler) {
+    document.removeEventListener('visibilitychange', visHandler);
+    visHandler = null;
+  }
   try {
     asr?.stop();
   } catch {
