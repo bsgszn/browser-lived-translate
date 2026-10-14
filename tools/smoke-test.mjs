@@ -3890,6 +3890,57 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
     const s = loaded['lib/settings.js'];
     if (s.DEFAULT_SETTINGS.asr.vad.vadSmartCut !== true) throw new Error('DEFAULT_SETTINGS 里 vadSmartCut 不是 true');
   });
+
+  /**
+   * ⚠️ 回看窗口**不随上限放大** —— 这一条防的是"你设的数不是你得到的数"。
+   *
+   * 如果窗口跟着上限一起变大：
+   *   上限 8 秒、窗口 4 秒 → 回看 4 秒内**几乎总能找到**某个低谷
+   *   → 实际切点常年落在 4 秒附近 → **用户设的 8 秒被偷偷改成了 4 秒** ✗
+   */
+  check('合理断句：上限 8 秒时窗口仍是 1.5 秒（不随上限放大）', () => {
+    const f = v.lullLookbackMs;
+    if (typeof f !== 'function') throw new Error('vad.js 没有导出 lullLookbackMs');
+    const w = f(8000);
+    if (Math.abs(w - 1500) > 1e-6) {
+      throw new Error(`上限 8s 时窗口是 ${w}ms，应该是 1500ms —— 窗口随上限放大会让"设的 8 秒被偷偷变成 4 秒"`);
+    }
+    // 上限更大时也必须还是 1.5s
+    if (Math.abs(f(60000) - 1500) > 1e-6) throw new Error('上限 60s 时窗口也必须是 1500ms');
+  });
+
+  /**
+   * ⚠️ 但上限**很小**时必须有比例保底，否则回看反而制造碎片：
+   *   上限 2 秒、窗口还是 1.5 秒 → 实际段长掉到 0.5~2.0 秒 ✗
+   */
+  check('合理断句：上限 2 秒时窗口收到 0.8 秒（小上限有比例保底）', () => {
+    const w = v.lullLookbackMs(2000);
+    if (Math.abs(w - 800) > 1e-6) throw new Error(`上限 2s 时窗口是 ${w}ms，应该是 800ms（2 × 40%）`);
+    // 边界：上限 3.75s 时正好是 1500ms
+    if (Math.abs(v.lullLookbackMs(3750) - 1500) > 1e-6) throw new Error('上限 3.75s 应该正好是 1500ms');
+    // 上限 3.5s（快语速档）→ 1400ms
+    if (Math.abs(v.lullLookbackMs(3500) - 1400) > 1e-6) throw new Error('上限 3.5s 应该是 1400ms');
+    // 脏值不许抛
+    for (const bad of [0, -1, NaN, undefined, null, 'x']) v.lullLookbackMs(bad);
+  });
+
+  /**
+   * ⚠️ 这一条是变异测试逼出来的（M10「调用点不把上限传进窗口」**没被抓到**）：
+   * 上面两条只验了公式本身，而**公式可以是对的却没人用** —— 那就成了死代码，
+   * 窗口会静默退回固定值，而所有断言照样全绿 ✗
+   *
+   * 所以这里精确匹配**调用点的实参**（不是查符号有没有出现）。
+   */
+  check('合理断句：窗口公式必须被调用点真的用上（否则是死代码）', () => {
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
+    if (!/lookbackMs:\s*lullLookbackMs\(\s*vadOpts\.maxSpeechMs\s*\)/.test(src)) {
+      throw new Error(
+        '调用点没有把 vadOpts.maxSpeechMs 传进 lullLookbackMs —— 那 lullLookbackMs 就是死代码，窗口会退回固定值',
+      );
+    }
+    const uses = src.match(/lullLookbackMs/g) || [];
+    if (uses.length < 2) throw new Error(`lullLookbackMs 只出现 ${uses.length} 次 —— 定义了却没人调用`);
+  });
 }
 
 check('VAD 必须有迟滞（一个阈值会让概率抖动把一句话切成好几条）', () => {
