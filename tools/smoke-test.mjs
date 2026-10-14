@@ -395,6 +395,31 @@ check('延迟值被夹在合理区间', () => {
   }
 });
 
+check('录制器「没输出」的报警：宽限期边界与脏值', () => {
+  const G = dp.REC_GRACE_MS;
+  if (G !== 10000) throw new Error(`宽限期应是 10000ms，实际 ${G}`);
+  // ⚠️ 这几条是针对实测的：真实采集开头几拍就是 0 字节，健康启动不该报警。
+  if (dp.isRecorderStale(0, 0) !== false) throw new Error('刚开始就报警了（假警报）');
+  if (dp.isRecorderStale(G - 1, 0) !== false) throw new Error('宽限期内就报警了（假警报）');
+  // ⚠️ 边界明确取 >=：满 10 秒就算过了宽限期。
+  if (dp.isRecorderStale(G, 0) !== true) throw new Error('满宽限期却仍不报警');
+  if (dp.isRecorderStale(G + 1, 0) !== true) throw new Error('宽限期后仍然 0 字节却不报警');
+  // 反馈者那次是 63 秒仍然 0 —— 这条必须能报出来，不能被宽限期一起漏掉。
+  if (dp.isRecorderStale(60000, 0) !== true) throw new Error('63 秒仍然 0 字节却不报警');
+  // 有数据就绝不报警（否则又是一条噪音）。
+  if (dp.isRecorderStale(0, 12345) !== false) throw new Error('已经有数据却报警');
+  if (dp.isRecorderStale(60000, 12345) !== false) throw new Error('已经有数据却报警');
+  // 脏值一律不报警 —— 拿不到可信输入时宁可不说，也别误报。
+  for (const bad of [NaN, Infinity, -Infinity, -1, undefined, null, 'x']) {
+    if (dp.isRecorderStale(bad, 0) !== false) {
+      throw new Error(`elapsedMs=${String(bad)} 是脏值，不该报警`);
+    }
+    if (dp.isRecorderStale(G + 1, bad) !== false) {
+      throw new Error(`bytes=${String(bad)} 是脏值，不该报警`);
+    }
+  }
+});
+
 check('纠偏：死区内不动 playbackRate', () => {
   for (const d of [0, 0.1, -0.1, 0.24, -0.24]) {
     if (dp.lagCorrectionRate(d) !== 1) throw new Error(`drift=${d} 不该调速`);

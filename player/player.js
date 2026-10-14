@@ -31,6 +31,7 @@ import {
   effectiveLeadMs,
   findStuckFlights,
   countInflight,
+  isRecorderStale,
 } from '../lib/delayed-player.js';
 
 const $ = (id) => document.getElementById(id);
@@ -1156,9 +1157,10 @@ function pumpSubtitles() {
        * 遮罩要 15 秒兜底才出现，拿它当基准等于把宽限期白送掉。
        * （判据基准选错这个项目栽过两次，所以这里写清楚。）
        */
-      const REC_GRACE_MS = 10000;
       const recElapsedMs = playback.startedAt ? Date.now() - Number(playback.startedAt) : 0;
-      const warmedUp = recElapsedMs >= REC_GRACE_MS;
+      // ⚠️ 判据抽成了纯函数（lib/delayed-player.js 的 isRecorderStale）——
+      // 这样断言只要喂数字，不必在假 video 上推进时间。
+      const warmedUp = isRecorderStale(recElapsedMs, bytes);
       // 缓冲满却还在掉帧 → 卡在解码/编码侧（CPU/GPU 被抢），不是网络
       const bad = ahead < 1.5 || dropped > 0;
       diag(
