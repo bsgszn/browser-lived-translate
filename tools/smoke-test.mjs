@@ -4008,6 +4008,114 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
       throw new Error('hard 的判据里少了 reason === \'max-length\' —— 那条语义不该只靠 substantial 隐式兜住');
     }
   });
+
+  /**
+   * ⚠️⚠️ 下面这组是**实测踩出来的回归**，防的是"只取单个窗的最低 RMS"那个旧写法。
+   *
+   * 旧写法（v2.66.36 及以前）只看**一个 30ms 窗**的最低 RMS，于是：
+   *   · 40ms 的短弱音（词中间的 っ / ん / 摩擦音 s）**就会被选中** ✗
+   *   · 而换气与词中弱音同时存在时，旧循环"从末尾往回 + 严格小于"⇒ 两个同样安静的窗
+   *     谁也不小于谁 ⇒ **先遇到的赢，而先遇到的是更靠后的** ⇒ 选中词中弱音 ✗
+   * 实测（browser-test/lullcut-audit2.cjs 的 E 组）：200ms 真换气 @3.7s ＋ 30ms 弱音 @4.4s
+   * → 旧写法切在那个 30ms 弱音上（**词中间**），这就是用户报的"偶尔切得不合理" ✗
+   *
+   * 修法：**连续 `minLullMs` 毫秒都低于阈值**才算一次换气 ✓
+   * 验收见 browser-test/lullcut-verify.cjs（38 项）+ mutate-lullcut-26638.cjs（变异 6/8 + 2 等价）
+   */
+  {
+    /** 造一段音频：主段人声量级，可在多个位置挖低谷（[起点秒, 时长ms, 幅度]） */
+    const mkDips = (dips, amp = 0.25, seconds = 5) => {
+      const n = Math.round(seconds * RATE);
+      const out = new Int16Array(n);
+      for (let i = 0; i < n; i += 1) out[i] = Math.round(Math.sin(i / 7) * 32768 * amp);
+      for (const [atSec, ms, dipAmp = 0] of dips) {
+        const from = Math.round(atSec * RATE);
+        const to = Math.min(n, from + Math.round((ms / 1000) * RATE));
+        for (let i = from; i < to; i += 1) out[i] = Math.round(Math.sin(i / 7) * 32768 * dipAmp);
+      }
+      return out;
+    };
+    const cutAt = (pcm) => {
+      const back = v.findLullCut(pcm, RATE, { lookbackMs: 1500 });
+      return { back, at: (pcm.length - back) / RATE };
+    };
+    const insideLull = (at, atSec, ms) => at >= atSec - 0.06 && at <= atSec + ms / 1000 + 0.06;
+
+    check('合理断句：很短的弱音（词中间的 っ/ん/摩擦音）→ 不许被当成换气', () => {
+      for (const ms of [20, 30, 40, 50, 80]) {
+        const r = cutAt(mkDips([[4.0, ms]]));
+        if (r.back !== 0) {
+          throw new Error(`${ms}ms 的短弱音被当成了换气（切点 ${r.at.toFixed(3)}s）—— 那多半在词中间`);
+        }
+      }
+    });
+
+    check('合理断句：100~300ms 的真换气仍要被认（别把门槛抬过头）', () => {
+      for (const ms of [100, 150, 200, 300]) {
+        const r = cutAt(mkDips([[4.0, ms]]));
+        if (!(r.back > 0)) throw new Error(`${ms}ms 的真换气没被认 —— 门槛抬过头了`);
+        if (!insideLull(r.at, 4.0, ms)) throw new Error(`切点 ${r.at.toFixed(3)}s 没落在 ${ms}ms 换气段里`);
+      }
+    });
+
+    check('合理断句：换气与短弱音同时存在 → 必须选**真换气**（回归的核心）', () => {
+      for (const ms of [30, 40, 80]) {
+        const r = cutAt(mkDips([[3.7, 200], [4.4, ms]]));
+        if (!(r.back > 0) || !insideLull(r.at, 3.7, 200)) {
+          throw new Error(`${ms}ms 弱音 + 200ms 换气 → 切在 ${r.at.toFixed(3)}s，没选真换气`);
+        }
+      }
+    });
+
+    check('合理断句：整段都安静（处处低于阈值）→ 不许挪（那是噪声不是换气）', () => {
+      for (const amp of [0.005, 0.02, 0.029]) {
+        const r = cutAt(mkDips([], amp));
+        if (r.back !== 0) throw new Error(`全段幅度 ${amp} 却挪了 ${r.back} —— 没有"响—轻"对照就不该动`);
+      }
+    });
+
+    check('合理断句：合格的低谷落在 keepMs（末尾 300ms）之内 → 不许被选', () => {
+      const r = cutAt(mkDips([[3.7, 200], [4.85, 200]]));
+      if (!(r.back > 0) || !insideLull(r.at, 3.7, 200)) {
+        throw new Error(`末尾那个低谷被选中了（切点 ${r.at.toFixed(3)}s）—— keepMs 保护没生效`);
+      }
+      if (cutAt(mkDips([[4.85, 200]])).back !== 0) throw new Error('末尾那个是唯一低谷时应该一个都不认');
+    });
+
+    check('合理断句：两个都合格的换气 → 取**最靠后**的（挪走的音频最少）', () => {
+      const r = cutAt(mkDips([[3.6, 200], [4.5, 200]]));
+      if (!(r.back > 0) || !insideLull(r.at, 4.5, 200)) {
+        throw new Error(`切在 ${r.at.toFixed(3)}s —— 应该选 4.5s 那个（选最靠前的会让段短得多）`);
+      }
+    });
+
+    check('合理断句：挪动量永远不超过回看窗口（不变量）', () => {
+      for (const ms of [100, 150, 200, 300]) {
+        const pcm = mkDips([[4.0, ms]]);
+        const { back } = cutAt(pcm);
+        if (back !== 0 && back > 1.5 * RATE) throw new Error(`${ms}ms：挪了 ${back}，超过 1.5s 窗口`);
+      }
+    });
+
+    /**
+     * ⚠️ 「必须持续」这个旋钮**必须存在且被真的用上** ——
+     * 否则它会退回"只看单个 30ms 窗"的旧行为，而上面几条会一起变红。
+     * 这条精确匹配**默认值**与**用到它的那处**，不是查符号有没有出现。
+     */
+    check('合理断句：判据里有"低谷必须持续"这个旋钮，且包络窗细到能分开 80ms 与 100ms', () => {
+      const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
+      const def = src.match(/minLullMs\s*=\s*(\d+(?:\.\d+)?)/);
+      if (!def) throw new Error('findLullCut 里没有 minLullMs —— 那就退回"只看单个窗的最低 RMS"了');
+      const ms = Number(def[1]);
+      // 实测边界：80ms 必须**拒**、100ms 必须**收** ⇒ 门槛只能落在 (0, 100] 且给两侧留余量
+      if (!(ms > 0 && ms <= 90)) throw new Error(`minLullMs = ${ms}ms 不合理：80ms 的弱音会被误收，或 100ms 的真换气被误拒`);
+      // 包络窗必须是 10ms 级 —— 30ms 的栅格分不开 80ms 与 100ms（变异 M3 就是这条抓的）
+      const win = src.match(/windowMs\s*=\s*(\d+(?:\.\d+)?)/);
+      if (!win) throw new Error('findLullCut 里没有 windowMs');
+      if (Number(win[1]) > 15) throw new Error(`windowMs = ${win[1]}ms 太粗 —— 分不开 80ms 与 100ms 的低谷`);
+      if (!/run\s*>=\s*needSamples/.test(src)) throw new Error('没有把"连续长度"和门槛比较的那一步');
+    });
+  }
 }
 
 check('VAD 必须有迟滞（一个阈值会让概率抖动把一句话切成好几条）', () => {
