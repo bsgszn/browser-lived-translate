@@ -150,12 +150,21 @@ function snapshotLine(tag) {
       const x = p?.actualDelaySec;
       return x === null || x === undefined ? '—' : Number(x).toFixed(1);
     });
+    /**
+     * ⚠️ 轨道的**实际**设置 —— 这是唯一能回答「applyConstraints 到底生效没有」的读数。
+     * 采集侧的取偶改动至今没被验证过，而它只能从这里看出来。
+     * `stream` 是模块级变量，所以不用新加状态。
+     */
+    const vs = g(() => stream?.getVideoTracks?.()[0]?.getSettings?.(), null) || {};
+    const vt = `${vs.width || '?'}×${vs.height || '?'}@${vs.frameRate ? Math.round(vs.frameRate) : '?'}`;
     return (
-      `〔快照 ${tag}〕` +
-      ` 录制 ${g(() => r?.mimeType) || '(空)'}/${g(() => r?.state)}` +
-      ` · 字节 ${g(() => p?.bytes)} · SB ${sb ? '有' : '无'}${g(() => (sb?.updating ? '/更新中' : ''))}/${sbRanges} 段` +
-      ` · MS ${g(() => p?.mediaSource?.readyState)}` +
-      ` · video rs${g(() => v?.readyState)} ${g(() => (v?.paused ? '暂停' : '播放中'))}` +
+      `〔快照 ${tag}·录制〕` +
+      ` ${g(() => r?.mimeType) || '(空)'}/${g(() => r?.state)}` +
+      ` · 字节 ${g(() => p?.bytes)}／${g(() => p?.chunks)} 片` +
+      ` · 轨道 ${vt}` +
+      ` · SB ${sb ? '有' : '无'}${g(() => (sb?.updating ? '/更新中' : ''))}/${sbRanges} 段 · MS ${g(() => p?.mediaSource?.readyState)}` +
+      `\n〔快照 ${tag}·播放〕` +
+      ` rs${g(() => v?.readyState)} ${g(() => (v?.paused ? '暂停' : '播放中'))}` +
       ` t${g(() => Number(v?.currentTime || 0).toFixed(1))}/${vRanges} 段` +
       (vEnd === null ? '' : ` 末尾 ${Number(vEnd).toFixed(1)}`) +
       ` · locked ${g(() => p?.locked)} · 被拒 ${g(() => p?.playBlocked)} · 延迟 ${lag}` +
