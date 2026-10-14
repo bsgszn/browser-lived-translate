@@ -3804,6 +3804,94 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
   if (!/win: 576/.test(vs)) throw new Error('候选里缺 576 窗');
 });
 
+/**
+ * 「合理断句」（findLullCut）——
+ *
+ * ⚠️ 这一组全部**直接喂合成音频跑真函数**，不是查符号存在。
+ * 而它是"到上限时把切点挪到换气处"的唯一判据，所以正反两个方向都要钉住：
+ *   有换气 → 挪过去；**没换气 / 换气在窗口外 → 返回 0（逐字退回原样）**
+ */
+{
+  const v = loaded['lib/asr/vad.js'];
+  const RATE = 16000;
+  /** 造一段音频：整体人声量级，可在 lullAtSec 处插一段安静（换气） */
+  const mkAudio = ({ seconds = 5, amp = 0.1, lullAtSec = null, lullMs = 300 }) => {
+    const n = Math.round(seconds * RATE);
+    const out = new Int16Array(n);
+    const from = lullAtSec === null ? -1 : Math.round(lullAtSec * RATE);
+    const to = lullAtSec === null ? -1 : from + Math.round((lullMs / 1000) * RATE);
+    for (let i = 0; i < n; i += 1) {
+      const inLull = i >= from && i < to;
+      const x = inLull ? 0.0008 : amp * Math.sin((2 * Math.PI * 220 * i) / RATE);
+      out[i] = Math.round(x * 32768);
+    }
+    return out;
+  };
+
+  check('合理断句：有换气 → 切点落在换气段内', () => {
+    if (typeof v.findLullCut !== 'function') throw new Error('vad.js 没有导出 findLullCut');
+    const lullFrom = 4.2;
+    const lullMs = 300;
+    const back = v.findLullCut(mkAudio({ lullAtSec: lullFrom, lullMs }), RATE);
+    if (!(back > 0)) throw new Error(`有换气却返回 ${back} —— 那等于没生效`);
+    const cutAt = 5 - back / RATE;
+    if (cutAt < lullFrom - 0.06 || cutAt > lullFrom + lullMs / 1000 + 0.06) {
+      throw new Error(`切在 ${cutAt.toFixed(3)}s，没落在换气段 ${lullFrom}~${(lullFrom + lullMs / 1000).toFixed(2)}s 里`);
+    }
+  });
+
+  check('合理断句：全程很响（没有换气）→ 返回 0，逐字退回原样', () => {
+    const back = v.findLullCut(mkAudio({ amp: 0.25 }), RATE);
+    if (back !== 0) throw new Error(`没有换气却挪了 ${back} 个采样 —— 应该原样切`);
+  });
+
+  check('合理断句：换气在回看窗口之外 → 不越界（否则会变成 3+5，更碎）', () => {
+    const back = v.findLullCut(mkAudio({ lullAtSec: 3.0 }), RATE);
+    if (back / RATE > 1.5) throw new Error(`挪回 ${(back / RATE).toFixed(2)}s，超过 1.5s 的窗口`);
+  });
+
+  check('合理断句：脏输入不许抛（这一路在实时音频里跑）', () => {
+    for (const bad of [null, undefined, new Int16Array(0), 'x', 123]) v.findLullCut(bad, RATE);
+    v.findLullCut(mkAudio({ lullAtSec: 4.2 }), NaN);
+    v.findLullCut(mkAudio({ lullAtSec: 4.2 }), 0);
+  });
+
+  /**
+   * ⚠️ 「人声量级」的阈值**全项目只有一份**。
+   * 回看若另造一个数，迟早出现「VAD 说这是语音、回看说这是低谷」的自相矛盾。
+   */
+  check('合理断句复用人声量级那一个阈值（不许另造一个 0.03）', () => {
+    if (!(v.HUMAN_LEVEL_RMS > 0)) throw new Error('HUMAN_LEVEL_RMS 没导出或不是正数');
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
+    const hits = src.match(/0\.03/g) || [];
+    if (hits.length > 1) throw new Error(`vad.js 里 "0.03" 出现了 ${hits.length} 次 —— 阈值被复制成了两份`);
+    if (!/loudRms\s*=\s*HUMAN_LEVEL_RMS/.test(src)) throw new Error('findLullCut 的 loudRms 默认值不是 HUMAN_LEVEL_RMS');
+    if (!/lastInputRms\s*>\s*HUMAN_LEVEL_RMS/.test(src)) throw new Error('"疑似 VAD 失效"那处没有用 HUMAN_LEVEL_RMS');
+  });
+
+  /**
+   * ⚠️ 回看**只能对 `max-length` 生效**：
+   *   · `silence` 那一路本来就切在停顿上，再挪一次纯属多余
+   *   · `finalize` 是"要停了"，必须把剩下的都收走，往回切会把结尾丢掉
+   * 所以这一条**精确匹配调用点的形态**，不是查字符串有没有出现。
+   */
+  check('合理断句只对 max-length 生效（silence / finalize 不许回看）', () => {
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
+    const m = src.match(/if\s*\(\s*reason\s*===\s*'max-length'\s*&&\s*vadOpts\.smartCut\s*\)/);
+    if (!m) throw new Error("没有找到 `reason === 'max-length' && vadOpts.smartCut` 这个判据");
+    if (/reason\s*!==\s*'max-length'/.test(src)) throw new Error('判据被写反了');
+  });
+
+  check('合理断句的开关默认开（老配置里没这个字段也必须开）', () => {
+    const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
+    if (!/smartCut:\s*config\.vadSmartCut\s*!==\s*false/.test(src)) {
+      throw new Error('开关不是 `config.vadSmartCut !== false` —— 那样老配置会被当成关，等于改了默认值老用户拿不到');
+    }
+    const s = loaded['lib/settings.js'];
+    if (s.DEFAULT_SETTINGS.asr.vad.vadSmartCut !== true) throw new Error('DEFAULT_SETTINGS 里 vadSmartCut 不是 true');
+  });
+}
+
 check('VAD 必须有迟滞（一个阈值会让概率抖动把一句话切成好几条）', () => {
   const g = new gateMod.VadGate({ threshold: 0.5, minSpeechMs: 250, minSilenceMs: 300, frameMs: 36 });
   if (g.exitThreshold >= g.threshold) {

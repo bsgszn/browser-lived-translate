@@ -302,6 +302,15 @@
               <input type="number" id="vd-maxSpeechSec" min="5" max="60" step="1" />
               <small class="hint">一句最长多久。超了强制切断 —— 否则有人一直不停顿就永远不出字幕。</small>
             </label>
+            <div class="checks">
+              <label class="check"><input type="checkbox" id="vd-smartCut" /> <span>合理断句（到上限时回看换气处，不从词中间切）</span></label>
+            </div>
+            <small class="hint" style="display: block; margin: -6px 0 12px 26px">
+              上面那个上限是<b>按时间</b>切的：切点落在"第 5 秒时正在说的那个音"上，可能切在词中间，两边都缺字。
+              打开这一项之后，到上限时会<b>回头看最近约 1.5 秒</b>，找到一次换气就把切点挪过去
+              （8 秒的一口气会从 <code>5.0 + 3.0</code> 变成 <code>4.5 + 3.5</code>）。
+              <b>找不到换气就完全和从前一样</b>，所以关掉它只是"回到从前"，不是修正什么。
+            </small>
             <label class="field">
               <span>前后留白（毫秒）</span>
               <input type="number" id="vd-padMs" min="0" max="800" step="50" />
