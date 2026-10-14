@@ -19,7 +19,7 @@ node tools/worker-test.mjs      # 60 项：service worker 状态机与消息路�
 npm test
 ```
 
-不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **650 项断言**。
+不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **277 项断言**。
 
 ### `manifest-check.mjs`
 
