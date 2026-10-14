@@ -2173,6 +2173,61 @@ check('识别校正：置信度闸门能挡住三类「看着像话、其实在�
   if (j(null).ok) throw new Error('null 不该通过');
 });
 
+/**
+ * ⚠️ 这条守的是**用户实测踩到的一次误杀**：
+ *   `丢弃一段识别结果 · 判定为无人说话（no_speech_prob=0.66）`
+ *   `原文「車のあれをあんまりよく知らないみたいな人もやっぱ」`
+ * ——一句 30 字、通顺的日语被丢掉了，而 0.66 只是"有点可能没人说话"。
+ *
+ * 机理：一个 4~5 秒的 VAD 段会被 Whisper 切成**多个 segments**，
+ * 只要**其中一段**覆盖的是换气/背景音，旧写法就把整句一起丢。
+ * 而 `rejectReason` 判的是"**这一句**有没有人在说话"—— 那是整段，不是某一段。
+ */
+check('VAD 质量闸门：多段混合时不整段丢弃（而 refine 那份故意保持"任一段即弃"）', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const R = v.rejectReason;
+  const Q = v.qualityStats;
+  if (typeof R !== 'function') throw new Error('vad.js 没有导出 rejectReason —— 提不到模块级就没法验');
+  if (typeof Q !== 'function') throw new Error('vad.js 没有导出 qualityStats');
+  const seg = (o) => ({ temperature: 0, no_speech_prob: 0, avg_logprob: -0.3, ...o });
+  const text = '車のあれをあんまりよく知らないみたいな人もやっぱ';
+
+  // ★ 用户实测那次：多段里只有一段 0.66 → 必须**放行**
+  if (R(text, { segments: [seg({ no_speech_prob: 0.66 }), seg({ no_speech_prob: 0.02 })] })) {
+    throw new Error('多段混合时仍然整段丢弃 —— 用户那句 30 字日语还是会被丢');
+  }
+  // 单段：行为必须**逐字不变**（触发即全触发，和改之前一致）
+  if (!R(text, { segments: [seg({ no_speech_prob: 0.66 })] })) throw new Error('单段 0.66 应当照旧丢弃');
+  if (!R(text, { segments: [seg({ no_speech_prob: 0.9 })] })) throw new Error('单段 0.9 应当丢弃');
+  // 全部段落都触发 → 丢
+  if (!R(text, { segments: [seg({ no_speech_prob: 0.7 }), seg({ no_speech_prob: 0.75 })] })) {
+    throw new Error('全部段落都判无人说话时必须丢 —— 否则幻觉就放回来了');
+  }
+  // 三类判据各自都要能拦（单段）
+  const r0 = R(text, { segments: [seg({ no_speech_prob: 0.9 })] }) || '';
+  const r1 = R(text, { segments: [seg({ temperature: 0.4 })] }) || '';
+  const r2 = R(text, { segments: [seg({ avg_logprob: -1.8 })] }) || '';
+  if (!/no_speech_prob/.test(r0)) throw new Error(r0);
+  if (!/temperature/.test(r1)) throw new Error(r1);
+  if (!/avg_logprob/.test(r2)) throw new Error(r2);
+  // 没有 segments 的后端（dashscope）→ 通过（和改之前一致）
+  if (R(text, {})) throw new Error('没有 segments 时不该丢 —— dashscope 返回里没有这些字段');
+  // 空文本仍然要拦
+  if (!R('', { segments: [seg({})] })) throw new Error('空文本必须拦');
+  // 读数
+  const q = Q({ segments: [seg({ no_speech_prob: 0.66 }), seg({ no_speech_prob: 0.02 })] });
+  if (q.segs !== 2 || q.noSpeech !== 1) throw new Error('qualityStats 读数不对：' + JSON.stringify(q));
+  if (Q({}).segs !== 0) throw new Error('没有 segments 时 segs 应当是 0');
+
+  // ⚠️ **反向钉住**：refine 那份**故意不改** —— 它丢掉一句的代价小（流式文本还在），
+  //    "宁可错杀"是对的。谁要是为了"统一"把它也改成整段一致，这条会红。
+  const j2 = refine.judgeRefinement;
+  const multi = j2({ segments: [seg({}), seg({ avg_logprob: -1.5 })] });
+  if (multi.ok) {
+    throw new Error('refine 那份不该跟着改 —— 它的代价小，"宁可错杀"是有意的（见 judgeRefinement 注释）');
+  }
+});
+
 await checkAsync('识别校正：拿不到置信度时 refine 必须报 ok=false', async () => {
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
   s.asr.provider = 'whisper-chunked';
