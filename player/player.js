@@ -44,6 +44,17 @@ let job = null;
 let stream = null;
 let ctx = null;
 let playback = null;
+/**
+ * ⚠️ `appendBuffer` 失败的**累计次数**与**最后一次原因**。
+ *
+ * 为什么不能只靠现有那行 `diag('缓冲写入失败 · …')`:那是**一次性**的。
+ * 而快照是**周期性**的 —— 它要在"某次失败之后又过了很久"时，仍然看得出
+ * **曾经失败过几次、最后一次是什么**。两种记录方式互补，谁也替代不了谁。
+ *
+ * 重置点:`startCapture()` 开头（每次新采集从零开始）。
+ */
+let appendFails = 0;
+let lastAppendError = null;
 let asr = null;
 let resampler = null;
 /** 滚动音频缓冲：延迟模式留着音频，才能拿它重新识别一遍 */
@@ -163,13 +174,24 @@ function snapshotLine(tag) {
       ` · 字节 ${g(() => p?.bytes)}／${g(() => p?.chunks)} 片` +
       ` · 轨道 ${vt}` +
       ` · SB ${sb ? '有' : '无'}${g(() => (sb?.updating ? '/更新中' : ''))}/${sbRanges} 段 · MS ${g(() => p?.mediaSource?.readyState)}` +
+      /**
+       * ⚠️ append 失败要进快照 —— 否则"录到了但写不进去"这条分支只能靠
+       * 恰好抓到那一瞬间的一次性日志，事后完全看不出来。
+       * 错误文本可能很长（配额溢出的原文很长），截断到 40 字，**保住"只有一行"这条硬约束**。
+       */
+      ` · append 失败 ${appendFails}${lastAppendError ? `(${String(lastAppendError).slice(0, 40)})` : ''}` +
       `\n〔快照 ${tag}·播放〕` +
       ` rs${g(() => v?.readyState)} ${g(() => (v?.paused ? '暂停' : '播放中'))}` +
       ` t${g(() => Number(v?.currentTime || 0).toFixed(1))}/${vRanges} 段` +
       (vEnd === null ? '' : ` 末尾 ${Number(vEnd).toFixed(1)}`) +
       ` · locked ${g(() => p?.locked)} · 被拒 ${g(() => p?.playBlocked)} · 延迟 ${lag}` +
       ` · 见底 ${g(() => p?.stallCount)} · 帧 ${g(() => p?.totalFrames)}/${g(() => p?.droppedFrames)}` +
-      ` · 可见 ${g(() => document.visibilityState)}`
+      ` · 可见 ${g(() => document.visibilityState)}` +
+      /**
+       * AudioContext 的**当前**状态。起采集时已经打过一次（`AudioContext 48000Hz · running`），
+       * 但那是**一次性**的 —— 它中途变成 suspended/interrupted 时，只有周期快照看得见。
+       */
+      ` · AC ${g(() => ctx?.state)}@${g(() => ctx?.sampleRate)}`
     );
   } catch (e) {
     return `〔快照 ${tag}〕(生成失败: ${e?.message || e})`;
@@ -335,6 +357,10 @@ async function startCapture() {
   showOverlay('正在取得标签页画面…', '浏览器会同时把原标签页静音——这是 tabCapture 的固有行为，声音改由本页播放。', '');
   diag('正在取得标签页流…', true);
 
+  // 每次新采集从零开始 —— 否则上一次的失败次数会累加到这一次的快照里，读起来会误导
+  appendFails = 0;
+  lastAppendError = null;
+
   /**
    * 采集帧率上限。0 = 不限制。不显式给的话 Chrome 默认常常只给 30fps。
    *
@@ -474,7 +500,11 @@ async function startCapture() {
         // 码率直接决定运动画面糊不糊，必须能一眼看到
         if (s.bitrateNote) diag(`视频码率 · ${s.bitrateNote}`, true);
       }
-      if (s.phase === 'append-error') diag(`缓冲写入失败 · ${s.message}`, true);
+      if (s.phase === 'append-error') {
+      appendFails += 1;
+      lastAppendError = s.message || '';
+      diag(`缓冲写入失败 · ${s.message}`, true);
+    }
       // 配额溢出后自救成功了 —— 要让用户知道"卡了一下但恢复了"
       if (s.phase === 'quota-recovered') diag('缓冲配额溢出 · 已清理并重试成功', true);
       /**
