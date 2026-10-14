@@ -3062,14 +3062,22 @@ check('延迟画面可以降分辨率（可选，不是默认）', () => {
     throw new Error('没有按高度等比缩放');
   }
   /**
-   * ⚠️ 宽高都必须**取偶**。
+   * ⚠️ 宽高都取偶 —— 但这是**规范化，不是修 bug**。
    *
-   * 以前这里用的是 `Math.round`，它会产出奇数（实测 2561×1440/1441 → 2559），
-   * 而奇数宽高在编码侧可能一帧都产不出来 —— 表现是"录制器 0 字节 + 黑屏 + 无声"。
-   * 所以这条断言从"有没有缩放"加强到"缩放后是不是偶数"。
+   * 以前这里用的是 `Math.round`，它会产出奇数（实测 2561×1440/1441 → 2559）。
+   * ⚠️ **但"奇数会让编码器产不出数据"这个猜测已被两次实测推翻**（见 `player.js`
+   * 里 `evenFloor` 的注释），所以取偶在这里只是让尺寸规整，**别把它当病因**。
+   *
+   * ⚠️ 取偶工具本身也在这里一起验 —— 它原来还有第二个调用点（采集侧），
+   * v2.66.31 删掉了（收益为零、代价未知），现在**只剩降分辨率这一处**。
    */
-  if (!/const w = evenFloor\(/.test(src)) throw new Error('降分辨率的宽度没取偶（奇数会让编码器不出数据）');
+  if (!/function evenFloor\(n\) \{/.test(src)) throw new Error('没有 evenFloor 这个取偶工具');
+  if (!/v >= 2 \? v - \(v % 2\) : 0/.test(src)) throw new Error('evenFloor 没有正确取偶');
+  if (!/const w = evenFloor\(/.test(src)) throw new Error('降分辨率的宽度没取偶');
   if (!/const h = evenFloor\(maxHeight\)/.test(src)) throw new Error('降分辨率的高度没取偶');
+  // ⚠️ 采集侧**不该**再有取偶了（v2.66.31 删掉）—— 防止它被无意中加回来
+  if (/evenW|evenH/.test(src)) throw new Error('采集侧的取偶已经删掉了，不该再出现 evenW/evenH');
+  if (/宽高取偶/.test(src)) throw new Error('采集侧取偶的诊断文案已经删掉了，不该再出现');
   if (!/applyConstraints\(\{ width: w, height: h \}\)/.test(src)) throw new Error('没有按高度等比缩放');
   if (!/await playback\.start\(recordStream\)/.test(src)) throw new Error('录音用的还是原始流，缩放没生效');
   // 缩放失败必须退回原样，不能整个起不来
@@ -3081,36 +3089,19 @@ check('延迟画面可以降分辨率（可选，不是默认）', () => {
 });
 
 /**
- * ⚠️ 采集侧也要取偶。
+ * ⚠️ **这里原来有一条"采集侧也要取偶"的断言 —— v2.66.31 删掉了。**
  *
- * 标签页采集的尺寸**完全由 Chrome 决定**（我们没有对尺寸下任何约束），
- * 实测见过 **2561×1441** —— 两个都是奇数。而视频编码器普遍要求偶数宽高，
- * 奇数在编码侧可能直接产不出任何数据：录制器 0 字节、画面全黑、连声音也没有
- * （声音来自延迟画面那个 `<video>` 的音轨，它不推进就一起没有）。
+ * 它验的是采集到原始轨之后 `applyConstraints` 取偶那条路。那条路被删了，理由是
+ * **收益为零、而代价未知**（详见 `player.js` 里 `startCapture` 那段说明）:
+ *   · 收益零 —— "奇数让编码器产不出数据"已被两次实测推翻
+ *   · 代价未知 —— `applyConstraints` 在原始 tab-capture 轨上会不会触发逐帧缩放，没测过
  *
- * 这一条验的是"**调用点真的做了这件事**"，不是"函数存在" ——
- * 本项目在这一点上栽过多次（验了符号存在、没验它起作用）。
+ * ⚠️ 它里面关于 `evenFloor` 函数本身的两条断言**没有丢** —— 挪进了上面那条
+ * 「延迟画面可以降分辨率」里（那是这个工具现在**唯一**的调用点）。
+ *
+ * ⚠️ 而上面那条里**新增**了两条反向断言（不许再出现 `evenW`/`evenH`/「宽高取偶」），
+ * 防止这段被无意中加回来 —— 因为"删掉的东西悄悄长回来"是这个项目见过的形态。
  */
-check('采集到的宽高如果是奇数，必须取偶（奇数会让编码器一帧都不产出）', () => {
-  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
-  // 工具函数本身：向下取偶，且对没法用的值返回 0
-  if (!/function evenFloor\(n\) \{/.test(src)) throw new Error('没有 evenFloor 这个取偶工具');
-  if (!/v >= 2 \? v - \(v % 2\) : 0/.test(src)) throw new Error('evenFloor 没有正确取偶');
-  // 采集到轨之后、算码率之前，必须真的调了 applyConstraints 去改
-  const idxGet = src.indexOf('vtrack.onended = ()');
-  const idxNudge = src.indexOf('await vtrack.applyConstraints({ width: evenW, height: evenH })');
-  const idxSize = src.indexOf('const vs = vtrack.getSettings();');
-  if (idxNudge < 0) throw new Error('拿到视频轨后没有把奇数宽高改成偶数');
-  if (!(idxGet < idxNudge && idxNudge < idxSize)) {
-    throw new Error('取偶必须在拿到轨道之后、读取尺寸（算码率）之前 —— 否则码率还是按旧尺寸估的');
-  }
-  // 失败不许抛，要退回原样继续（这只是"排除一个变量"，不是已确认的病因）
-  if (!/宽高取偶失败，按 /.test(src)) throw new Error('取偶失败要退回原样继续，不能整个起不来');
-  // 只有真的是奇数时才动它
-  if (!/evenW !== rawSize\.width \|\| evenH !== rawSize\.height/.test(src)) {
-    throw new Error('偶数尺寸不该被改动');
-  }
-});
 
 check('录制格式必须 H.264 优先（VP9/VP8 多是软件编码，4K 下和本地识别抢 GPU）', () => {
   const dp = loaded['lib/delayed-player.js'];
@@ -6581,32 +6572,6 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
     `需要: snapshotLine 里读 vtrack?.readyState / muted / enabled，` +
       `且 tools/snapshot-preview.cjs 的 fakeTrack 里也有这三项。` +
       ` 实际: 快照没读=${JSON.stringify(reads)} 预览缺=${JSON.stringify(pvMissing)}`,
-  );
-}
-
-/**
- * ⭐ 「轨道尺寸」这个读数必须是 **applyConstraints 之后**的值。
- *
- * ⚠️ 这是它**唯一**的用途:回答「采集侧的取偶到底生效没有」。
- * 如果 `const vs = vtrack.getSettings()` 读在 `applyConstraints` **之前**，
- * 那快照里永远显示取偶**前**的尺寸 —— 而那个读数是唯一能验证这条改动的东西，
- * 读错了等于**永远验证不了，还看不出来** ✗。
- *
- * 注意 `applyConstraints` 在文件里出现多次（降分辨率那条路也用它），
- * 所以要限定在 `startCapture` 里、且在 `const vs` 之前。
- */
-{
-  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
-  const i = src.indexOf('function startCapture(');
-  const startFn = i < 0 ? '' : src.slice(i, src.indexOf('\n}', i) + 2);
-  const ac = startFn.indexOf('await vtrack.applyConstraints(');
-  const vs = startFn.indexOf('const vs = vtrack.getSettings()');
-  const evenF = startFn.indexOf('evenFloor(');
-  check(
-    '快照里的轨道尺寸是 applyConstraints 之后的值（否则"取偶生效没有"永远验证不了）',
-    startFn.length > 200 && ac >= 0 && vs >= 0 && evenF >= 0 && ac < vs && evenF < vs,
-    `startCapture 里必须: evenFloor 判定 → await vtrack.applyConstraints → **然后才** const vs = vtrack.getSettings()。` +
-      ` 实际: 取偶=${evenF} applyConstraints=${ac} 读尺寸=${vs} 顺序对=${ac >= 0 && vs >= 0 && ac < vs}`,
   );
 }
 

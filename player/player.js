@@ -424,7 +424,7 @@ async function waitForJob(timeoutMs = 12000) {
  *
  * 来历:反馈者的标签页是 **2561×1441**（两个都是奇数 —— 比标准的 2560×1440 各多 1 像素），
  * 而他的录制器一个字节都没产出。当时猜"奇数宽高让编码器产不出数据"，
- * 于是加了这里的取偶（H.264 的 4:2:0 色度确实是每 2×2 采一次，
+ * 于是加了取偶（H.264 的 4:2:0 色度确实是每 2×2 采一次，
  * Chromium 自己的采集代码里也有"奇数缩到偶数"的处理 —— 推理不算离谱）。
  *
  * ⚠️ **但两次独立实测都推翻了这个猜测:**
@@ -433,8 +433,11 @@ async function waitForJob(timeoutMs = 12000) {
  *   ② 真实标签页采集:窗口 2561×1441，正常录出 26.6 MB ✓
  *   → **奇数尺寸完全不影响编码。**
  *
- * 保留取偶的理由只剩"偶数更规范"（1 像素的差，视觉上看不出来），
- * **不是**因为它修好了什么。真正的原因至今未定 —— 见 `bytes` 那套诊断。
+ * ⚠️ **v2.66.31 起，这里只服务于"延迟画面降分辨率"那一条路**（采集侧的取偶被删掉了，
+ * 因为那是在原始 tab-capture 轨上做 `applyConstraints`，收益为零而代价未知 —— 见下面
+ * `startCapture` 里那段说明）。降分辨率这条路**本来就在缩放**，取偶不增加任何成本，
+ * 而它确实会产出奇数:`Math.round(2561 × 1440 / 1441)` = **2559**。
+ * 所以这里保留是"顺手规范化"，同样**不是**在修什么。
  *
  * 返回 0 表示"给的值没法用"（调用方决定退回原样）。
  */
@@ -536,33 +539,18 @@ async function startCapture() {
   vtrack.onended = () => stopAll('来源标签页的画面已结束');
 
   /**
-   * —— 宽高取偶 ——
+   * ⚠️ 这里**曾经**对采集到的原始轨做"奇数取偶"（`applyConstraints`），v2.66.31 删掉了。
    *
-   * 标签页采集的尺寸完全由 Chrome 决定，**可能是奇数**（实测见过 2561×1441）。
-   * 而视频编码器普遍要求偶数宽高 —— 奇数在编码侧可能直接产不出任何数据，
-   * 表现是"录制器 0 字节 + 画面全黑 + 连声音也没有"，而字幕照常（音频走独立管线）。
+   * 删的理由不是"它对性能有害" —— 那一条**没测成**（`applyConstraints` 在原始
+   * tab-capture 轨上究竟会失败被忽略、只改元数据、还是**触发逐帧缩放**，三种可能一种都没验证）。
+   * 理由是**它的收益是零、而代价未知**:
+   *   · 收益零 —— "奇数让编码器产不出数据"这个猜测已被两次实测推翻（见 `evenFloor` 的注释）
+   *   · 代价未知 —— 万一它触发逐帧缩放，那就是每帧一次额外重采样，而 CPU 正是这里的瓶颈
+   *   · 拿未知代价换零收益，不划算；而删掉的代价是**有界的**（见下面 `evenFloor` 的用法）
    *
-   * ⚠️ 这**不是**已确认的病因 —— 实测已经推翻"奇数导致零帧"这个猜测（见 evenFloor 的注释）。
-   * 留着它只是规范化，所以失败不报错、只记一行诊断，拿不到新尺寸也照原样继续。
-   * 只动 1 像素，视觉上看不出来。
+   * ⚠️ 对绝大多数用户，"留"和"删"其实没区别 —— 1920×1080 / 2560×1440 / 3840×2160
+   * **全是偶数**，根本走不进那段。所以这不是一个紧急修复。
    */
-  const rawSize = vtrack.getSettings();
-  const evenW = evenFloor(rawSize.width);
-  const evenH = evenFloor(rawSize.height);
-  if (evenW >= 2 && evenH >= 2 && (evenW !== rawSize.width || evenH !== rawSize.height)) {
-    try {
-      await vtrack.applyConstraints({ width: evenW, height: evenH });
-      const after = vtrack.getSettings();
-      diag(
-        `宽高取偶 · ${rawSize.width}×${rawSize.height} → ${after.width}×${after.height}` +
-          `（规范化；这不是黑屏的病因，实测奇数尺寸编码正常）`,
-        true,
-      );
-    } catch (e) {
-      diag(`宽高取偶失败，按 ${rawSize.width}×${rawSize.height} 继续 · ${e.message || e}`, true);
-    }
-  }
-
   const vs = vtrack.getSettings();
   diag(
     `已取得流 · 视频 ${vs.width || '?'}×${vs.height || '?'}${vs.frameRate ? `@${Math.round(vs.frameRate)}` : ''}` +
