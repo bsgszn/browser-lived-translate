@@ -3169,7 +3169,20 @@ check('排期延迟必须包含「录音/编码滞后」—— 字幕恒偏早�
 check('调速必须用平滑后的偏差（bufferedEnd 是台阶值，瞬时偏差是锯齿波）', () => {
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
   if (!/this\.driftEma/.test(src)) throw new Error('没有平滑偏差');
-  const fn = src.slice(src.indexOf('const target = end - this.delaySec'), src.indexOf('const target = end - this.delaySec') + 1800);
+  /**
+   * ⚠️ 切片用「从锚点切到**本方法结束**（下一个顶格 `  }`）」，**不要用固定长度**。
+   *
+   * 原来这里是 `+ 1800` —— 而这个陷阱本项目已经栽过两次:代码一长，固定窗口就够不到
+   * 目标，而断言**不会报错，只会悄悄变绿**（那比红了更糟）。
+   *
+   * ⚠️ 还有它的**近亲**，也刚踩过:锚点 `const target = end - this.delaySec` 只要在文件里
+   * 再出现一次（加 seek 计数器时就多了一处），`indexOf` 就会**定位到错的地方**，
+   * 于是断言变红而代码其实没问题。所以那个局部量现在叫 `seekTo`。
+   */
+  const anchor = src.indexOf('const target = end - this.delaySec');
+  const endOfMethod = src.indexOf('\n  }', anchor);
+  const fn = anchor < 0 ? '' : src.slice(anchor, endOfMethod < 0 ? undefined : endOfMethod);
+  if (fn.length < 200) throw new Error('切片没切到内容 —— 锚点或结束标记变了');
   if (!/const drift = this\.driftEma/.test(fn)) throw new Error('调速没有用平滑值');
   if (!/driftEma = this\.driftEma === null \? driftRaw/.test(fn)) throw new Error('没有 EMA 平滑');
   // 两次写 playbackRate 之间要有下限间隔
@@ -5951,6 +5964,106 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
     `每段必须是一行（缓冲区 400 行 / 面板 60 行，太长会把启动阶段挤出去）；` +
       `单行上限 ${MAX_CHARS} 字符（实测最长 ${worstChars}）；任何字段取不到都要落 '?' 而不是抛。` +
       ` 问题：${badShape || threw || longLine || '（无）'}`,
+  );
+}
+
+/**
+ * 状态快照的**周期定时器生命周期**。
+ *
+ * ⚠️⚠️ 这里最关键的一条是「停止时必须清掉」。
+ *
+ * `startCapture()` 里每次都会 `setInterval`，而 `stopAll()` 是唯一的停止入口。
+ * 如果停止时不清，那么「开始 → 停止 → 再开始」会**累积多个定时器** ——
+ * 越跑越密，日志里快照越冒越多。用户那边感受到的就是"用着用着就卡了"，
+ * 而排查时会以为是播放的问题。**这是这条改动唯一可能伤到用户的方式，所以钉死它。**
+ *
+ * ⚠️ 切片用「切到下一个顶格 `}` 为止」，**不用固定长度切片** ——
+ * 这个项目因为这个陷阱栽过两次（代码一撑大，`indexOf(x) + 4200` 就够不到目标了，
+ * 而断言不会报错，只会悄悄变绿）。
+ */
+{
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  /** 切出一个顶层函数的完整函数体（到下一个顶格 `}` 为止） */
+  const topFn = (s, name) => {
+    const i = s.indexOf(`function ${name}(`);
+    if (i < 0) return '';
+    const end = s.indexOf('\n}', i);
+    return end < 0 ? s.slice(i) : s.slice(i, end + 2);
+  };
+  const startFn = topFn(src, 'startCapture');
+  const stopFn = topFn(src, 'stopAll');
+  const declared = /let snapTimer = 0;/.test(src);
+  const period = /const SNAP_PERIOD_MS = 60000;/.test(src);
+  const ci = startFn.indexOf('clearInterval(snapTimer)');
+  const si = startFn.indexOf('snapTimer = setInterval(');
+  check(
+    '状态快照：周期定时器有声明、startCapture 里先清后建（防反复开始累积）',
+    declared && period && ci >= 0 && si >= 0 && ci < si,
+    `需要: 模块级 let snapTimer = 0 · const SNAP_PERIOD_MS = 60000 · ` +
+      `startCapture 里**先** clearInterval 再 setInterval。` +
+      ` 实际: 声明=${declared} 周期=${period} 先清后建=${ci >= 0 && si >= 0 && ci < si}`,
+  );
+  check(
+    '状态快照：stopAll 必须清掉周期定时器（不清会累积，越跑越密）',
+    startFn.length > 0 && stopFn.length > 0 && /clearInterval\(snapTimer\)/.test(stopFn),
+    `stopAll 是唯一的停止入口，必须在里面 clearInterval(snapTimer)。` +
+      ` 实际: startCapture 切到 ${startFn.length} 字符、stopAll 切到 ${stopFn.length} 字符、` +
+      `stopAll 里有 clearInterval=${/clearInterval\(snapTimer\)/.test(stopFn)}`,
+  );
+}
+
+/**
+ * 快照字段与「工具要跟着数据一起改」。
+ *
+ * ⚠️ 为什么最后一条（预览工具）也要当断言钉住:
+ * `snapshot-preview.cjs` 是前几个会话为了"不用浏览器也能看到快照长什么样"而造的。
+ * 但它只覆盖**当时已有**的字段 —— 于是后加的字段在预览里显示成 `?`，
+ * **"看不到自己加的快照字段"那堵墙又撞了一次**（连着两个会话都撞到）。
+ * 所以:快照读的字段、`delayed-player.js` 里真实存在的字段、预览工具的假对象，
+ * **三处必须同时有** —— 少一处就报错。
+ *
+ * ⚠️ 字段「真的存在」这一条是**跨文件核对**，不是查字符串:
+ * 只查 `snapshotLine` 里写没写 `p?.appendOk` 是不够的（拼错属性名照样通过），
+ * 必须回到 `delayed-player.js` 确认 `this.appendOk` 真的被声明/自增过。
+ */
+{
+  const playerSrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const dpSrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
+  const pvSrc = fs.readFileSync(path.join(process.cwd(), 'tools', 'snapshot-preview.cjs'), 'utf8');
+  const sliceFn = (s, name) => {
+    const i = s.indexOf(`function ${name}(`);
+    if (i < 0) return '';
+    const z = s.indexOf('\n}', i);
+    return s.slice(i, z < 0 ? undefined : z + 2);
+  };
+  const snapFn = sliceFn(playerSrc, 'snapshotLine');
+  const fields = ['appendOk', 'seekCount', 'lastSeekTarget'];
+  /**
+   * ⚠️⚠️ 这里**必须用带边界的正则，不能用 `includes()`** ——
+   * 第一版就是 `.includes('p?.appendOk')`，而 `'p?.appendOkX'.includes('p?.appendOk')` 为 **true**，
+   * 于是"把属性名拼错"这条变异**完全抓不到** ✗。
+   * 这正是本项目记过八次的那个陷阱（"验了符号存在，没验它起作用"）。
+   * 变异测试当场把它抓出来了 —— 这就是为什么变异测试不能省。
+   */
+  const RE_TAIL = '(?![A-Za-z0-9_])';
+  const notRead = fields.filter((f) => !new RegExp(`p\\?\\.${f}${RE_TAIL}`).test(snapFn));
+  const notReal = fields.filter((f) => !new RegExp(`this\\.${f}${RE_TAIL}`).test(dpSrc));
+  /**
+   * ⚠️ 预览工具必须在 **`fakePlayback` 的函数体内**有这些字段 ——
+   * 不能在**整个文件**里找:场景数据里也写着 `appendOk: 0`，
+   * 所以"删掉 fakePlayback 那一行"这种变异会被场景里那处**掩盖掉**（第一版就是这样漏掉的）。
+   */
+  const pvFn = sliceFn(pvSrc.replace(/\/\*[\s\S]*?\*\//g, ''), 'fakePlayback');
+  const notInPreview = fields.filter((f) => !new RegExp(`${f}\\s*:`, '').test(pvFn));
+  check(
+    '状态快照：新字段「快照读了 / delayed-player 里真有 / 预览工具也有」三处齐全',
+    snapFn.length > 0 && pvFn.length > 0 && !notRead.length && !notReal.length && !notInPreview.length,
+    `appendOk / seekCount / lastSeekTarget 必须三处都有:` +
+      ` ① snapshotLine 里读它（p?.X，**带词边界** —— includes 会让 appendOkX 蒙混过关）` +
+      ` ② delayed-player.js 里 this.X 真的存在（跨文件核对，抓拼错的属性名）` +
+      ` ③ tools/snapshot-preview.cjs 的 **fakePlayback 函数体内**也要有 ——` +
+      `否则预览显示成 '?'，"看不到自己加的字段"那堵墙会再撞一次。` +
+      ` 实际: 没读=${JSON.stringify(notRead)} 不存在=${JSON.stringify(notReal)} 预览缺=${JSON.stringify(notInPreview)}`,
   );
 }
 

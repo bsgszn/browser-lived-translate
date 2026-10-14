@@ -66,6 +66,14 @@ function fakePlayback(init = {}) {
     stallCount: init.stallCount ?? 0,
     totalFrames: init.totalFrames ?? 0,
     droppedFrames: init.droppedFrames ?? 0,
+    /**
+     * ⚠️ 这两个是后加的字段。
+     * 加的时候**必须同时改这里** —— 否则预览里会显示成 `?`，
+     * 于是"看不到自己加的快照字段"这堵墙会再撞一次（前几个会话就撞过）。
+     */
+    appendOk: init.appendOk ?? 0,
+    seekCount: init.seekCount ?? 0,
+    lastSeekTarget: init.lastSeekTarget ?? null,
   };
 }
 
@@ -91,7 +99,7 @@ function scenarios() {
     '反馈者那种（0 字节 / 无缓冲 / video 没动）',
     mk(
       () => fakeVideo({ readyState: 0, paused: true, currentTime: 0 }),
-      fakePlayback({ bytes: 0, chunks: 0 }),
+      fakePlayback({ bytes: 0, chunks: 0, appendOk: 0, seekCount: 0 }),
       { getVideoTracks: () => [{ getSettings: () => ({ width: 2561, height: 1441, frameRate: 60 }) }] },
       0, null, { state: 'running', sampleRate: 48000 }, { visibilityState: 'visible' }
     ),
@@ -102,7 +110,10 @@ function scenarios() {
     '健康启动（有字节 / 缓冲在建 / 还没起播）',
     mk(
       () => fakeVideo({ readyState: 2, paused: true, currentTime: 0, ranges: [[0, 7.2]] }),
-      fakePlayback({ bytes: 14155776, chunks: 57, sourceBuffer: { updating: false, buffered: { length: 3 } } }),
+      fakePlayback({
+        bytes: 14155776, chunks: 57, appendOk: 57, seekCount: 0,
+        sourceBuffer: { updating: false, buffered: { length: 3 } },
+      }),
       { getVideoTracks: () => [{ getSettings: () => ({ width: 2560, height: 1440, frameRate: 60 }) }] },
       0, null, { state: 'running', sampleRate: 48000 }, { visibilityState: 'visible' }
     ),
@@ -116,6 +127,7 @@ function scenarios() {
       fakePlayback({
         bytes: 88080384, chunks: 352, actualDelaySec: 6.6, locked: true,
         stallCount: 0, totalFrames: 396, droppedFrames: 2,
+        appendOk: 351, seekCount: 1, lastSeekTarget: 128.6,
         sourceBuffer: { updating: true, buffered: { length: 3 } },
       }),
       { getVideoTracks: () => [{ getSettings: () => ({ width: 2560, height: 1440, frameRate: 60 }) }] },

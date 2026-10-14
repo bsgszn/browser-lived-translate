@@ -55,6 +55,22 @@ let playback = null;
  */
 let appendFails = 0;
 let lastAppendError = null;
+/**
+ * 周期快照的定时器。
+ *
+ * ⚠️⚠️ **必须在停止时清掉**，否则"开始 → 停止 → 再开始"会累积多个定时器，
+ * 越跑越密 —— 那正是"用着用着就卡了"的成因。
+ *
+ * ⚠️ 为什么周期打是必要的（2s/8s/20s 那三次不够）:
+ * 缓冲区是 400 行的环形缓冲，实测约 3 行/秒 → **只装得下约 130 秒**。
+ * 故障发生在第 5 分钟时，附近**没有任何快照** ✗。
+ * 周期快照把"关键状态的轨迹"留下来：60 秒 2 行 → 400 行能装约 200 分钟。
+ *
+ * ⚠️ 而它不会把日志刷成全是快照:活跃时每秒约 3 行日志，快照只占约 1%；
+ * 而完全静止时 `diag()` 自带"连续重复行不重复记"的去重，同一条只会留一行。
+ */
+let snapTimer = 0;
+const SNAP_PERIOD_MS = 60000;
 let asr = null;
 let resampler = null;
 /** 滚动音频缓冲：延迟模式留着音频，才能拿它重新识别一遍 */
@@ -162,6 +178,16 @@ function snapshotLine(tag) {
       return x === null || x === undefined ? '—' : Number(x).toFixed(1);
     });
     /**
+     * 起播 seek 的**次数**与**最后一次的位置**。
+     * ⚠️ 只留这两个，不留完整历史 —— 见 `delayed-player.js` 里那两个字段的注释。
+     * 正常只该有 1 次；次数大于 1 说明起播反复过。
+     */
+    const seekN = g(() => p?.seekCount);
+    const seekT = g(() => {
+      const x = p?.lastSeekTarget;
+      return x === null || x === undefined ? null : Number(x).toFixed(1);
+    }, null);
+    /**
      * ⚠️ 轨道的**实际**设置 —— 这是唯一能回答「applyConstraints 到底生效没有」的读数。
      * 采集侧的取偶改动至今没被验证过，而它只能从这里看出来。
      * `stream` 是模块级变量，所以不用新加状态。
@@ -179,12 +205,13 @@ function snapshotLine(tag) {
        * 恰好抓到那一瞬间的一次性日志，事后完全看不出来。
        * 错误文本可能很长（配额溢出的原文很长），截断到 40 字，**保住"只有一行"这条硬约束**。
        */
-      ` · append 失败 ${appendFails}${lastAppendError ? `(${String(lastAppendError).slice(0, 40)})` : ''}` +
+      ` · append 成功 ${g(() => p?.appendOk)}／失败 ${appendFails}${lastAppendError ? `(${String(lastAppendError).slice(0, 40)})` : ''}` +
       `\n〔快照 ${tag}·播放〕` +
       ` rs${g(() => v?.readyState)} ${g(() => (v?.paused ? '暂停' : '播放中'))}` +
       ` t${g(() => Number(v?.currentTime || 0).toFixed(1))}/${vRanges} 段` +
       (vEnd === null ? '' : ` 末尾 ${Number(vEnd).toFixed(1)}`) +
       ` · locked ${g(() => p?.locked)} · 被拒 ${g(() => p?.playBlocked)} · 延迟 ${lag}` +
+      ` · seek ${seekN}${seekT === null ? '' : `@${seekT}`}` +
       ` · 见底 ${g(() => p?.stallCount)} · 帧 ${g(() => p?.totalFrames)}/${g(() => p?.droppedFrames)}` +
       ` · 可见 ${g(() => document.visibilityState)}` +
       /**
@@ -360,6 +387,12 @@ async function startCapture() {
   // 每次新采集从零开始 —— 否则上一次的失败次数会累加到这一次的快照里，读起来会误导
   appendFails = 0;
   lastAppendError = null;
+  /**
+   * ⚠️ 先清掉上一次的定时器再建新的 —— 否则"开始 → 停止 → 再开始"会累积多个，
+   * 越跑越密（那正是"用着用着就卡了"的成因）。`stopAll()` 里也会清一次，两道保险。
+   */
+  clearInterval(snapTimer);
+  snapTimer = setInterval(() => diag(snapshotLine('周期'), false), SNAP_PERIOD_MS);
 
   /**
    * 采集帧率上限。0 = 不限制。不显式给的话 Chrome 默认常常只给 30fps。
@@ -1702,6 +1735,15 @@ function stopAll(reason) {
   }
   running = false;
   diag(`停止 · ${reason}`, true);
+  /**
+   * ⚠️ 必须清掉周期快照的定时器。
+   *
+   * `stopAll()` 是唯一的停止入口（用户点停止、来源结束、出错、`boot()` 的 catch），
+   * 所以清在这里能覆盖所有路径。不清的话，停掉之后定时器还在跑 ——
+   * 日志里会继续冒快照（而且所有字段都成了 `null`），既误导又白占缓冲区。
+   */
+  clearInterval(snapTimer);
+  snapTimer = 0;
   try {
     asr?.stop();
   } catch {
