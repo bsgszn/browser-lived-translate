@@ -1754,10 +1754,68 @@ check('整句累积：说话人一直不停顿 → 跨度超上限就先上屏�
 
 check('整句累积：看门狗 —— ASR 没发 utteranceEnd 时按静默超时兜底', () => {
   const a = new utt.UtteranceAccumulator({ watchdogMs: 3000 });
-  a.addFinal({ text: 'x', start: 0, duration: 1 }, 1000);
+  // ⚠️ 这段文本必须够长：看门狗现在会顺延"太短"的累积（见下一条）。
+  // 本条的意图是"超时兜底这条路通不通"，不是"短文本会不会被吐" —— 所以用长文本。
+  a.addFinal({ text: '这是足够长的一句', start: 0, duration: 1 }, 1000);
   if (a.tick(2500) !== null) throw new Error('还没超时就不该动');
   const out = a.tick(4100);
   if (!out || out.reason !== 'watchdog') throw new Error('超时应当兜底上屏');
+});
+
+check('整句累积：看门狗不撤销断句逻辑"和后面拼"的决定（太短就顺延）', () => {
+  // 实测日志里的模式：分片说「2 字 · 先不收，和后面拼」，3 秒后看门狗把它单独吐了出来 ✗
+  // —— 而「字幕太碎」是这个项目最早的抱怨
+  const a = new utt.UtteranceAccumulator({ watchdogMs: 3000 });
+  a.addFinal({ text: 'はい', start: 0, duration: 1 }, 1000000);
+  if (a.tick(1003000) !== null) throw new Error('2 字不该被看门狗单独吐出来');
+  if (a.deferredCount !== 1) throw new Error(`顺延计数应当记 1，实际 ${a.deferredCount}`);
+
+  // 说话继续 → 文本变长 → 顺延之后能正常收，而且是**合并后**的整句
+  a.addFinal({ text: 'そうですね、わかりました', start: 1, duration: 2 }, 1003100);
+  const merged = a.tick(1006200);
+  if (!merged) throw new Error('文本变长之后应当能收句');
+  if (merged.text !== 'はい そうですね、わかりました') throw new Error(`没合并：${merged.text}`);
+  if (merged.reason !== 'watchdog') throw new Error(`reason 不对：${merged.reason}`);
+});
+
+check('整句累积：顺延必须有硬上限 —— 真实短内容不能被吞掉', () => {
+  // 反例：「はい」是真实的 2 字回答。顺延是为了不碎，**绝不能变成永远不吐**。
+  const a = new utt.UtteranceAccumulator({ watchdogMs: 3000 });
+  a.addFinal({ text: 'はい', start: 0, duration: 1 }, 2000000);
+  if (a.tick(2003000) !== null) throw new Error('到看门狗时应当先顺延');
+  const out = a.tick(2009000); // 硬上限 = 3 × 3000 = 9000ms
+  if (!out) throw new Error('到硬上限必须无条件上屏，否则真实内容被吞');
+  if (out.text !== 'はい') throw new Error(`内容不对：${out.text}`);
+});
+
+check('整句累积：顺延不影响的路径（够长 / 未超时 / 显式 flush）', () => {
+  // 够长 → 正常吐
+  const long = new utt.UtteranceAccumulator({ watchdogMs: 3000 });
+  long.addFinal({ text: '这是一个足够长的句子', start: 0, duration: 2 }, 1000000);
+  if (!long.tick(1003000)) throw new Error('够长的文本不该被顺延拦住');
+
+  // 未到看门狗 → 一律不动
+  const early = new utt.UtteranceAccumulator({ watchdogMs: 3000 });
+  early.addFinal({ text: '这是一个足够长的句子', start: 0, duration: 2 }, 1000000);
+  if (early.tick(1002999) !== null) throw new Error('没到看门狗就不该动');
+
+  // 显式 flush（停采集）→ 多短都要吐，否则停采集时字幕永远不出来
+  const stop = new utt.UtteranceAccumulator({ watchdogMs: 3000 });
+  stop.addFinal({ text: 'はい', start: 0, duration: 1 }, 1000000);
+  const out = stop.flush('manual');
+  if (!out || out.text !== 'はい') throw new Error('显式 flush 不该被顺延拦住');
+
+  // 收句之后顺延计数归零
+  if (stop.deferredCount !== 0) throw new Error('收句后顺延计数应当归零');
+});
+
+check('整句累积：硬上限跟着 setWatchdogMs 走（分片模式会调大看门狗）', () => {
+  const a = new utt.UtteranceAccumulator({ watchdogMs: 3000 });
+  a.setWatchdogMs(10000);
+  if (a.watchdogHardMs < 10000) throw new Error(`硬上限倒挂了：hard=${a.watchdogHardMs} < watchdog=10000`);
+  a.addFinal({ text: 'はい', start: 0, duration: 1 }, 1000000);
+  if (a.tick(1010000) !== null) throw new Error('10s 时应当顺延（太短）');
+  if (!a.tick(1030000)) throw new Error('30s 时到硬上限，必须吐');
 });
 
 check('整句累积：同一条文本重复喂不会重复累积（is_final 和 speech_final 是同一个分片）', () => {
