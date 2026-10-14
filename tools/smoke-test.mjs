@@ -5814,5 +5814,34 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
 });
 
 
+/**
+ * 零帧故障：`bytes` 必须被显示出来。
+ *
+ * ⚠️ 这条断言存在的理由是一次实测教训：反馈者报「黑屏 + 无声 + 字幕正常」，
+ * 日志里只有 `掉帧 0/0`，而那个读数来自 `video.getVideoPlaybackQuality()`
+ * ——**播放/解码侧**的指标。它证明不了"录制器有没有产出数据"。
+ *
+ * 而真正能分开两种故障的 `bytes`（`MediaRecorder` 的 `ondataavailable` 累加）
+ * 当时只在 delayed-player 里被写、**从来没被读过**，于是只能靠猜，而且猜错过。
+ *
+ * 所以这条断言钉住的是**调用点**（有没有真的拿它算显示文本），不是"符号存在"。
+ */
+{
+  const dp = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
+  const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const reads = (pj.match(/playback\??\.bytes/g) || []).length;
+  check(
+    '零帧故障：录制器字节数被显示出来（否则两种故障分不开）',
+    /this\.bytes\s*=\s*0\b/.test(dp) &&
+      /this\.bytes\s*\+=\s*e\.data\.size\b/.test(dp) &&
+      reads >= 2 &&
+      /bytes\s*===\s*0/.test(pj) &&
+      /bytes\s*>\s*0/.test(pj) &&
+      /1048576/.test(pj),
+    '需要：delayed-player 初始化并累加 bytes；player 里诊断行与遮罩文案都读它；' +
+      '「0 字节」与「有字节」各有一个分支（两种故障的修法不同）；且换成 MB 显示',
+  );
+}
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);

@@ -430,9 +430,28 @@ async function startCapture() {
     const dropped = playback?.droppedFrames || 0;
     const stalls = playback?.stallCount || 0;
     const waited = Math.round((Date.now() - startedAt) / 1000);
+    /**
+     * ⚠️ `bytes` 是**录制器实际吐出来的字节数**（`delayed-player.js` 的 `ondataavailable` 累加）。
+     *
+     * 它和 `掉帧` 是两个不同层面的读数，**必须一起看才能分开两种完全不同的故障**：
+     *   · `掉帧` 来自 `video.getVideoPlaybackQuality()` —— **播放/解码侧**
+     *   · `bytes` 来自 `MediaRecorder` —— **录制/编码侧**
+     *
+     * 而这个区分是有实际意义的（实测反馈里两种都出现过）：
+     *   · `bytes` 一直是 0    → 录制器什么都没产出 **（连音频都没录到）** —— 修在录制侧
+     *   · `bytes` 在涨        → 录到了，但 `appendBuffer` 进不去 —— 修在缓冲接收侧
+     *     （这两种的修法完全不同，而以前只显示"收到 0 帧"，**分不出来**）
+     */
+    const bytes = Number(playback?.bytes) || 0;
+    const bytesText =
+      bytes === 0 ? '0 字节' : bytes < 1048576 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
+    const hunch =
+      bytes === 0
+        ? '⚠️ 录制器一个字节都没吐出来（连音频也没有）—— 问题在录制/编码侧，不是来源画面静止。'
+        : '⚠️ 录制器在正常输出，但数据进不了缓冲 —— 问题在缓冲接收侧（appendBuffer），不是来源没画面。';
     return (
-      `已等 ${waited} 秒 · 缓冲 ${ahead} · 收到 ${total} 帧（掉 ${dropped}） · 见底 ${stalls} 次。` +
-      '通常是来源画面静止、或那个标签页没有画面输出 —— 让它动起来试试。'
+      `已等 ${waited} 秒 · 缓冲 ${ahead} · 收到 ${total} 帧（掉 ${dropped}） · 见底 ${stalls} 次 · 录制器已输出 ${bytesText}。` +
+      hunch
     );
   };
   let noDataShownAt = 0;
@@ -1054,11 +1073,28 @@ function pumpSubtitles() {
     if (Number.isFinite(ahead)) {
       const dropped = playback.droppedFrames || 0;
       const total = playback.totalFrames || 0;
+      /**
+       * ⚠️ `bytes` = 录制器吐出的字节数（录制/编码侧）；`掉帧` = video 的解码质量（播放/解码侧）。
+       *
+       * 两个一起看才能分开两种**修法完全不同**的故障：
+       *   0 字节而前方一直不涨  → 录制侧没产出（连音频都没有）
+       *   有字节而前方一直不涨  → 录制正常，数据进不了 SourceBuffer
+       * 以前这两行都不显示 `bytes`，于是「黑屏」只能靠猜 —— 实测里确实猜错过一次。
+       */
+      const bytes = Number(playback.bytes) || 0;
+      const bytesText =
+        bytes === 0 ? '0 字节' : bytes < 1048576 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
       // 缓冲满却还在掉帧 → 卡在解码/编码侧（CPU/GPU 被抢），不是网络
       const bad = ahead < 1.5 || dropped > 0;
       diag(
-        `缓冲 · 前方 ${ahead.toFixed(1)}s · 见底 ${playback.stallCount || 0} 次 · 掉帧 ${dropped}/${total}${
+        `缓冲 · 前方 ${ahead.toFixed(1)}s · 录制器已输出 ${bytesText} · 见底 ${playback.stallCount || 0} 次 · 掉帧 ${dropped}/${total}${
           ahead < 1.5 ? ' ⚠ 偏薄' : ''
+        }${
+          ahead < 1.5 && bytes === 0
+            ? ' ⚠ 录制器一直没输出：问题在录制/编码/尺寸层面'
+            : ahead < 1.5 && bytes > 0
+              ? ' ⚠ 录制器在输出但缓冲填不上：数据进不了 SourceBuffer'
+              : ''
         }${dropped > 0 && ahead >= 1.5 ? ' ⚠ 缓冲够却在掉帧：编码/解码抢不到资源' : ''}`,
         bad && dropped > 0,
       );
