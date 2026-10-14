@@ -117,13 +117,67 @@ function renderDiag() {
 }
 
 /**
+ * 一份**紧凑的**状态快照（一行）。
+ *
+ * ⚠️ 为什么要有它:现有日志全是「某件事**发生了**」的记录，而故障常常是
+ * 「某件事**从没发生**」—— 那时最需要的那段反而什么都没留下。
+ * 排查"黑屏无声有字幕"时就是这样:「卡顿」只在播放卡住时才打，而播放根本没开始;
+ * 「延迟播放已就绪」只在准备好时才打，而它从没准备好。
+ *
+ * ⚠️ 必须是一行:缓冲区 400 行、面板只显示 60 行。一条快照占 20 行的话，
+ * 三次快照就把**启动阶段**挤出缓冲区 —— 而那恰恰是最需要的一段。
+ *
+ * ⚠️ 任何字段取不到都不许抛 —— **打日志绝不能把播放搞挂**。
+ */
+function snapshotLine(tag) {
+  try {
+    const v = $('video');
+    const p = playback;
+    const g = (fn, d = '?') => {
+      try {
+        const x = fn();
+        return x === null || x === undefined ? d : x;
+      } catch {
+        return d;
+      }
+    };
+    const r = p?.recorder;
+    const sb = p?.sourceBuffer;
+    const sbRanges = g(() => sb?.buffered?.length ?? 0);
+    const vRanges = g(() => v?.buffered?.length ?? 0);
+    const vEnd = g(() => (v?.buffered?.length ? v.buffered.end(v.buffered.length - 1) : null), null);
+    const lag = g(() => {
+      const x = p?.actualDelaySec;
+      return x === null || x === undefined ? '—' : Number(x).toFixed(1);
+    });
+    return (
+      `〔快照 ${tag}〕` +
+      ` 录制 ${g(() => r?.mimeType) || '(空)'}/${g(() => r?.state)}` +
+      ` · 字节 ${g(() => p?.bytes)} · SB ${sb ? '有' : '无'}${g(() => (sb?.updating ? '/更新中' : ''))}/${sbRanges} 段` +
+      ` · MS ${g(() => p?.mediaSource?.readyState)}` +
+      ` · video rs${g(() => v?.readyState)} ${g(() => (v?.paused ? '暂停' : '播放中'))}` +
+      ` t${g(() => Number(v?.currentTime || 0).toFixed(1))}/${vRanges} 段` +
+      (vEnd === null ? '' : ` 末尾 ${Number(vEnd).toFixed(1)}`) +
+      ` · locked ${g(() => p?.locked)} · 被拒 ${g(() => p?.playBlocked)} · 延迟 ${lag}` +
+      ` · 见底 ${g(() => p?.stallCount)} · 帧 ${g(() => p?.totalFrames)}/${g(() => p?.droppedFrames)}` +
+      ` · 可见 ${g(() => document.visibilityState)}`
+    );
+  } catch (e) {
+    return `〔快照 ${tag}〕(生成失败: ${e?.message || e})`;
+  }
+}
+
+/**
  * 把**完整**日志复制走（不只是面板上显示的那几十行）。
  *
  * 排查问题时最需要的就是这个：面板再长也只能显示一屏，
  * 而"流式给出 / 校正结果"是成对出现的，中间夹着别的输出。
+ *
+ * ⚠️ 末尾**额外拼一份当前快照**（不替换缓冲区）—— 这样这一份日志是**自足**的，
+ * 不用再回头问用户"你当时是什么状态"。
  */
 async function copyDiag() {
-  const text = diagLines.join('\n') || '(还没有日志)';
+  const text = `${diagLines.join('\n') || '(还没有日志)'}\n${snapshotLine('复制时')}`;
   try {
     await navigator.clipboard.writeText(text);
     diag(`已复制 ${diagLines.length} 行日志到剪贴板`, false);
@@ -550,6 +604,19 @@ async function startCapture() {
       showOverlay('还没收到画面数据…', overlayNoDataBody(), '');
     }
   }, 300);
+
+  /**
+   * 定时快照（2s / 8s / 20s 各一行）。
+   *
+   * ⚠️ 为什么不能只靠"事件触发时才打日志":那种设计在「某件事从没发生」的故障里
+   * **什么都不留** —— 而这一轮排查黑屏时遇到的正是这一类。
+   *
+   * ⚠️ 三个固定时间点、每次一行:既能覆盖"启动初期 / 起播前后 / 稳定期"，
+   * 又不会把 400 行缓冲区吃光（吃光就等于丢掉启动阶段，而那最需要）。
+   */
+  [2, 8, 20].forEach((sec) => {
+    setTimeout(() => diag(snapshotLine(`${sec}s`), false), sec * 1000);
+  });
 
   setTimeout(() => {
     /**
