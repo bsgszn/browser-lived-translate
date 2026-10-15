@@ -4158,8 +4158,17 @@ check('VAD 太短的话段要被标出来（由适配器决定丢弃，状态机
 
 check('VAD 两级边界：软边界只出文本，硬边界/句末标点才收句（对齐 Deepgram 的做法）', () => {
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
-  // 软边界：无论如何先发 final（文本先到手）
-  if (!/onEvent\(\{ type: 'final', text, start: startSec, duration: durationSec \}\);/.test(src)) {
+  /**
+   * 软边界：无论如何先发 final（文本先到手）。
+   *
+   * ⚠️ 这里原来要求**整行字面完全一致**（`…, duration: durationSec });`）——
+   * 于是给这个事件**加一个字段**（`cut: reason`，给"合并短尾巴"用的）就把它弄红了，
+   * 而行为一个字都没变。这就是"断言绑死在实现细节上"那一类误报。
+   *
+   * 所以判据放宽到**这行行为的本质**：`type: 'final'` 且带 `text`，字段可增可减。
+   * 它仍然抓得住真正的回归 —— 把这行删掉、或者把 `text` 去掉，都会红。
+   */
+  if (!/onEvent\(\{[^}]*type: 'final'[^}]*\btext\b[^}]*\}\)/.test(src)) {
     throw new Error('软边界没有先发 final —— 文本会一直不上屏');
   }
   // 硬边界三条件
