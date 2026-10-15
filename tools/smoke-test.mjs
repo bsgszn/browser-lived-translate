@@ -2023,6 +2023,66 @@ check('接线：累积器的秒数上限是收过的值（15 秒在口语下能�
 });
 
 /**
+ * ⚠️ 片数（`parts`）是回答「这条字幕为什么这么长」**唯一**的直接证据 ——
+ *      `44 字 · utterance-end`  那一段音频本身就说得多（**单**个分片）
+ *      `99 字 · max-span`        攒到了上限（**好几个**分片）
+ *    光看字数和 `reason` 分不出来 ✗（这正是用户报「好像过度合并了」时判不了的原因）。
+ *
+ * ⚠️ 这里最容易写错的是**读它的时机**：`_flush` 结尾有 `this.reset()`，
+ *    而 `reset()` 会把 `parts` 清空 —— 一旦把 `parts: this.parts.length` 挪到
+ *    `reset()` 之后，它就**恒为 0**，而那看起来只是"没累积"、不会报错 ✗
+ *    （同一族：359 字那条、3030 字那条都是"兜底静默失效"）
+ */
+check('整句累积：片数反映真实分片数（且在 reset 之前读，否则恒为 0）', () => {
+  const a = new utt.UtteranceAccumulator({ maxSpanSec: 10, maxChars: 60 });
+  // 三个**不同**的分片 —— 相同文本会被去重（那是另一条断言的职责）
+  a.addFinal({ text: 'あ'.repeat(5), start: 0, duration: 1 }, 1);
+  a.addFinal({ text: 'い'.repeat(5), start: 1, duration: 1 }, 2);
+  a.addFinal({ text: 'う'.repeat(5), start: 2, duration: 1 }, 3);
+  const out = a.flush('manual');
+  if (!out) throw new Error('flush 没吐出东西');
+  if (out.parts !== 3) throw new Error(`三个分片该报 3 片，实际 ${out.parts}`);
+  // 同一个实例接着用：片数不能把上一句算进来（reset 必须归零）
+  a.addFinal({ text: 'え'.repeat(5), start: 3, duration: 1 }, 4);
+  const out2 = a.flush('manual');
+  if (!out2) throw new Error('第二句没吐出来');
+  if (out2.parts !== 1) throw new Error(`第二句该报 1 片，实际 ${out2.parts}（reset 没归零？）`);
+});
+
+/**
+ * 跑的是**真源码**（`shown-time-preview.cjs` 抽出真 `scheduleUtterance`）——
+ * 不是抄一份实现来测（这个项目为"两份实现只改一份"栽过）。
+ */
+check('整句上屏那行：累积到上限时带片数与跨度（否则答不出"为什么这么长"）', () => {
+  const require_ = createRequire(import.meta.url);
+  const { runOnce } = require_('./shown-time-preview.cjs');
+  // ⭐ 直接喂"到上限"的那种：99 字、7 个分片、跨度 10.4s
+  const line = runOnce(2100, { text: 'あ'.repeat(99), reason: 'max-span', start: 0, duration: 10.4, parts: 7 });
+  if (!line) throw new Error('真源码没跑起来（锚点变了？）');
+  if (!/· max-span ·/.test(line)) throw new Error(`reason 没了：${line}`);
+  if (!/累积 7 片/.test(line)) throw new Error(`没报片数：${line}`);
+  if (!/跨度 10\.4s/.test(line)) throw new Error(`没报跨度：${line}`);
+  // ⚠️ 对照：**单个**分片的那种长句，必须能和"攒出来的"一眼分开
+  const one = runOnce(2100, { text: 'い'.repeat(44), reason: 'utterance-end', start: 0, duration: 5.2, parts: 1 });
+  if (!/累积 1 片/.test(one)) throw new Error(`单个分片该报 1 片：${one}`);
+  if (/累积 7 片/.test(one)) throw new Error('两种长句在日志里又分不开了');
+});
+
+check('整句上屏那行：缺值印 ? 且单位要留着（两个裸 ? 分不清谁是谁）', () => {
+  const require_ = createRequire(import.meta.url);
+  const { runOnce } = require_('./shown-time-preview.cjs');
+  // 服务不给时间戳 → `duration` 是 undefined；调用方没带 `parts` 也不该炸
+  const line = runOnce(2100, { text: 'x'.repeat(20), reason: 'max-chars', start: null, duration: undefined });
+  if (!line) throw new Error('真源码没跑起来（锚点变了？）');
+  if (/undefined|NaN/.test(line)) throw new Error(`印出了裸 undefined / NaN：${line}`);
+  if (!/累积 \? 片/.test(line)) throw new Error(`片数缺值时该印「? 片」：${line}`);
+  if (!/跨度 \?s/.test(line)) throw new Error(`跨度缺值时该印「?s」：${line}`);
+  // ⚠️ 数值必须是收过的（15 位浮点在这个项目里露过一次：`98.37255859375ms`）
+  const ok = runOnce(2100, { text: 'y'.repeat(9), reason: 'watchdog', start: 0, duration: 0.9166666, parts: 2 });
+  if (!/跨度 0\.9s/.test(ok)) throw new Error(`跨度没收敛到一位小数：${ok}`);
+});
+
+/**
  * ⚠️ 合并的**上界**：`maxGapSec` 那道守卫是 `Number.isFinite(gap) && gap > maxGapSec`，
  *    而 `prev.end` 缺失时 gap 是 NaN → **整道守卫被跳过**（不是"放行一个略超的间隔"）
  *    → 实测**并 500 次都没停 = 3030 字** ✗（对照组有 end 时并 3 次就自然停，48 字 ✓）

@@ -1128,8 +1128,27 @@ function scheduleUtterance(u) {
    */
   const asrLagSec = delayForDiagSec - remainSec;
   const overBudget = asrLagSec > delayForDiagSec;
+  /**
+   * 「这条字幕为什么这么长」—— 原来答不出来。
+   *
+   * ⚠️ `reason` 本来就印着（`max-span` / `max-chars` 就在那一格），但**只有标签没有量**，
+   *    于是这两种情况在日志里长得一样 ✗:
+   *      `44 字 · utterance-end`  那一段音频本身就说得多（**单**个分片）
+   *      `99 字 · max-span`        攒到了上限（**好几个**分片）
+   *    —— 而用户报「句子会很长，好像过度合并了」时要判的正是这个。
+   * 所以补两个数：**片数**（累没累积）+ **跨度**（那段音频有多久）。
+   *
+   * ⚠️ 缺值一律印 `?`，**但单位要留着**：别印 `undefined` / `NaN`
+   *    （这个项目为裸 `undefined` 和 `98.37255859375ms` 那种 15 位浮点各栽过一次 ✗）。
+   *    ⚠️ 而且 `?` 后面**必须**带单位 —— 否则同一行里两个 `?`（片数 / 跨度）分不清谁是谁 ✗
+   */
+  const fmtNum = (v, digits, suffix) =>
+    v === null || v === undefined || !Number.isFinite(Number(v))
+      ? `?${suffix}`
+      : `${Number(v).toFixed(digits)}${suffix}`;
   diag(
     `整句上屏 · ${whenText} · ${text.length} 字 · ${u.reason}` +
+      ` · 累积 ${fmtNum(u.parts, 0, ' 片')} · 跨度 ${fmtNum(u.duration, 1, 's')}` +
       ` · 识别滞后 ${asrLagSec.toFixed(1)}s${overBudget ? ` ⚠ 超过延迟预算 ${delayForDiagSec}s` : ''}`,
     overBudget,
   );

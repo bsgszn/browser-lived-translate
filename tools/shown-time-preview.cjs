@@ -45,9 +45,10 @@ function extractFn(src, name) {
  * 用真源码跑一次 `scheduleUtterance`。
  *
  * @param {number} offsetMs 排期时刻相对"现在"的偏移：正数 = 还没到点，负数 = 已经迟了
+ * @param {object} [utterance] 喂给它的那一段；不传就用一句普通的（`parts` 缺省 → 那行该印 `?`）
  * @returns {string} 那行诊断（没打印就返回空串）
  */
-function runOnce(offsetMs) {
+function runOnce(offsetMs, utterance) {
   const src = fs.readFileSync(PLAYER, 'utf8');
   const fnSrc = extractFn(src, 'scheduleUtterance');
   const printed = [];
@@ -88,7 +89,9 @@ function runOnce(offsetMs) {
   };
   const keys = Object.keys(fake);
   const fn = new Function(...keys, `${fnSrc}; return scheduleUtterance;`)(...keys.map((k) => fake[k]));
-  fn({ text: 'こんにちは、これはテストです', reason: 'utterance-end', start: 0, duration: 2.4 });
+  fn(
+    utterance || { text: 'こんにちは、これはテストです', reason: 'utterance-end', start: 0, duration: 2.4 },
+  );
   return printed[0] || '';
 }
 
