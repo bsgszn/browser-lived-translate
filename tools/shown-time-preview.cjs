@@ -90,7 +90,16 @@ function runOnce(offsetMs, utterance) {
   const keys = Object.keys(fake);
   const fn = new Function(...keys, `${fnSrc}; return scheduleUtterance;`)(...keys.map((k) => fake[k]));
   fn(
-    utterance || { text: 'こんにちは、これはテストです', reason: 'utterance-end', start: 0, duration: 2.4 },
+    utterance || {
+      text: 'こんにちは、これはテストです',
+      reason: 'utterance-end',
+      start: 0,
+      duration: 2.4,
+      // ⚠️ 默认带上 `parts`：不带的话四个场景全印「累积 ? 片」，
+      //    看这个工具的人会以为那个字段**根本没接线** ✗
+      //    （"缺值印 ? 且单位留着"那条路有专门的断言在管，不靠这里演示）
+      parts: 1,
+    },
   );
   return printed[0] || '';
 }
