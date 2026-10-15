@@ -3421,6 +3421,26 @@ check('整句上屏那行：「后」不能是负的（实测出现过「-2.3s �
   if (/已迟|超过延迟预算/.test(onTime)) throw new Error(`准时的不该报迟到：${onTime}`);
 });
 
+await checkAsync('合并短段：不建新条目、时间轴不动、改不到就不并（跑真源码的 tryMergeTail）', async () => {
+  /**
+   * ⚠️ 这个功能最容易做错的**不是判据**（那有纯函数单测），而是**接线**：
+   *   ① 合并之后再建排期条目 → 同一段话上屏两次
+   *   ② 合并动了时间轴 → 第一段晚 2~5 秒才出现（而识别滞后本来就贴着 6.6s 预算）
+   *   ③ prev 已经改不到了还并 → 这条文本凭空消失
+   * 而这三件事都在 player/player.js（浏览器模块，Node 跑不起来），
+   * 所以照 shown-time-preview 的做法：从源码抽出真函数，用假全局跑它。
+   */
+  const require_ = createRequire(import.meta.url);
+  const { runOnce, invariants } = require_('./tail-merge-preview.cjs');
+  // ① 先确认真源码真的跑起来了 —— 否则锚点一变就会变成"空集恒真"的摆设断言
+  const smokeRun = await runOnce({ queued: true }, { text: 'ああああ', duration: 1.0, start: 4.3, reason: 'utterance-end', cut: 'max-length' }, { smartCut: true });
+  if (!smokeRun.merged) throw new Error('真源码没跑起来（锚点变了？）—— 该并的没并');
+  if (!smokeRun.lines.length) throw new Error('真源码没跑起来 —— 一条诊断都没打');
+  // ② 核心不变量
+  const bad = await invariants();
+  if (bad.length) throw new Error(`合并短段的不变量被破坏:\n    ${bad.join('\n    ')}`);
+});
+
 check('排期延迟必须包含「录音/编码滞后」—— 字幕恒偏早的根因', () => {
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   if (!/function recorderLagMs/.test(src)) throw new Error('没有 recorderLagMs 辅助函数');
@@ -5909,6 +5929,62 @@ check('dashscope 解析必须被**调用点**真的用上（本项目两次栽�
   if (!/pickDashscopeText\(/.test(opt)) throw new Error('设置页测试按钮没有用共用解析');
   if (!/dashscopeShapeNote\(/.test(opt)) throw new Error('设置页没有把形状说明显示出来');
   if (/output\?\.choices\?\.\[0\]/.test(opt)) throw new Error('设置页还留着自己那份解析');
+});
+
+check('合并短段必须被**调用点**真的用上，且判据字段三层同名（本项目反复栽在"验了函数没验调用点"）', () => {
+  /**
+   * ⚠️ `tailMergeTrigger` 写对了但没人调，就是死代码 —— 而纯函数那几条断言照样全绿。
+   * 上一个会话就在这里栽过：公式对、调用点没把参数传进去，10 条变异只抓到 9 条。
+   *
+   * player.js 是浏览器模块（用到 document），Node 里跑不起来，所以只能查源码形状。
+   * 但形状要查**调用点**，不能只查"符号在文件里出现过"。
+   */
+  const player = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  // 出现 ≥2 次 = 定义 + 调用；只出现 1 次就是"定义了没人用"
+  const calls = (player.match(/tryMergeTail\s*\(/g) || []).length;
+  if (calls < 2) throw new Error(`tryMergeTail 只出现 ${calls} 次 —— 定义了但没被调用（死代码）`);
+  if (!/if \(tryMergeTail\(\{ \.\.\.u, text \}\)\) return;/.test(player)) {
+    throw new Error('合并的结果没被用来**提前返回** —— 那会照样建排期条目，等于多出一条字幕');
+  }
+  /**
+   * ⚠️ `cut` 必须存进排期条目：合并时要看**上一段**的切法，那时 `u` 已经过去了。
+   * 漏了这一条，触发源①永远拿不到 `max-length`，功能静默失效。
+   */
+  if (!/translation: '', cut: String\(u\.cut \|\| ''\)/.test(player)) {
+    throw new Error('排期条目没存 cut —— 触发源①（max-length）会静默失效');
+  }
+  /**
+   * ⚠️ 三层必须用**同一个字段名**：vad.js 发 `cut` → utterance.js 收集 `cut` → player.js 读 `u.cut`。
+   * 任何一层改名都会静默断链（这个项目为"同一事实记多遍、只改一处"栽过多次）。
+   */
+  const vadSrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
+  if (!/duration: durationSec, cut: reason \}\)/.test(vadSrc)) throw new Error('vad.js 没有把 cut 发出去');
+  const uttSrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'utterance.js'), 'utf8'));
+  if (!/cut: this\.lastCut \|\| ''/.test(uttSrc)) throw new Error('utterance.js 没有把 cut 交出去');
+  if (!/if \(ev\?\.cut\) this\.lastCut = String\(ev\.cut\)/.test(uttSrc)) throw new Error('utterance.js 没有收集 cut');
+
+  /**
+   * ⚠️ 开关必须和断句层读的是**同一个字段、同一种判法**。
+   * 断句层判 `!== false`（老配置没这个字段时算开）；这里要是判 `=== true`，
+   * 老用户就会变成"断句按开着做、合并按关着做"这种半开半关的状态。
+   */
+  if (!/settings\?\.asr\?\.vad\?\.vadSmartCut !== false/.test(player)) {
+    throw new Error('smartCutEnabled 读的字段或判法和 lib/asr/vad.js 不一致');
+  }
+  if (!/smartCut: config\.vadSmartCut !== false/.test(vadSrc)) {
+    throw new Error('vad.js 那边的判法变了 —— 两处必须一致（注意配置字段叫 vadSmartCut、本地选项叫 smartCut）');
+  }
+
+  /**
+   * ⚠️ 译文版本对号：翻的过程中这句可能被并进新内容，那份译文只对应前半截。
+   * 少了这道对号，字幕会显示"半句译文 + 整句原文"。
+   * 出现 ≥2 次 = 取号 + 对号。
+   */
+  const gens = (player.match(/Number\(seg\.gen\) \|\| 0/g) || []).length;
+  if (gens < 3) throw new Error(`译文版本对号只出现 ${gens} 次 —— 取号/作废判断/归位判断三处要都有`);
+  if (!/seg\.translated = \(Number\(seg\.gen\) \|\| 0\) === gen;/.test(player)) {
+    throw new Error('被合并改过文本的那句仍会被标成"已翻" —— 泵不会重翻，字幕停在旧译文上');
+  }
 });
 
 check('dashscope 原生请求体：sample_rate 必须是字符串、音频消息必须在最后', () => {

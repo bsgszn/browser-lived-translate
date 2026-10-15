@@ -70,6 +70,16 @@ function runOnce(offsetMs) {
     diag: (line) => printed.push(line),
     refineEnabled: () => false,
     refiner: null,
+    /**
+     * ⚠️ `scheduleUtterance` 现在开头会先问一句"这条短段要不要并进上一句"，
+     * 所以这个假作用域里必须有它 —— 少了就是 `ReferenceError`，
+     * 而这个工具正是那条断言（「后」不能是负的）跑的地方，它一挂断言就红。
+     *
+     * 这里固定返回 false = **不合并**，也就是走"照常排期"那条路：
+     * 本工具要验的是那行「整句上屏」的文案，合并那条路有自己的单测。
+     * ⚠️ 合并的行为**不在这里**验 —— 别把这个 stub 当成"合并被测过了"。
+     */
+    tryMergeTail: () => false,
     Date,
     Math,
     Number,

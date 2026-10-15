@@ -32,6 +32,8 @@ import {
   findStuckFlights,
   countInflight,
   classifyThinBuffer,
+  tailMergeTrigger,
+  mergeTailText,
 } from '../lib/delayed-player.js';
 
 const $ = (id) => document.getElementById(id);
@@ -1020,14 +1022,70 @@ const utterances = new UtteranceAccumulator({ maxSpanSec: 15, watchdogMs: 3000 }
  * 上屏时刻 = 这句**开口**的时刻 + D —— 也就是画面正好播到他张嘴的那一帧。
  * （不是"说完 + D"：那样字幕要等画面播完整句、再补等一个 D，就成了"人都快说完了才上"。）
  */
+/**
+ * 「合理断句」开着没。
+ *
+ * ⚠️ 判 `!== false` 而不是 `=== true`：老配置里没有这个字段，那也应当算开。
+ *    必须和 `lib/asr/vad.js` 读它的方式**一致** —— 两处不一致就会出现
+ *    "断句按开着做、合并按关着做"这种半开半关的状态。
+ */
+function smartCutEnabled() {
+  return settings?.asr?.vad?.vadSmartCut !== false;
+}
+
+/**
+ * 这条短段该不该并进上一句？该并就并掉，返回 true（调用方**不要再排期**）。
+ *
+ * ⚠️ 时间轴一个字不动：第一段照常按原排期上屏，这里只把文本并回去、原地替换那一条
+ *    （复用"译文晚到时替换已上屏条目"那套机制）。
+ *    刻意**不**取消第一段的排期去等这条短段 —— 那会让它晚 2~5 秒才出现，
+ *    而实测的识别滞后本来就贴着延迟预算（6.6s），再等就必然迟到。
+ */
+function tryMergeTail(u) {
+  const prev = segs[segs.length - 1];
+  const trigger = tailMergeTrigger(prev, u, { smartCut: smartCutEnabled() });
+  if (!trigger) return false;
+  /**
+   * ⚠️ prev 必须**还能被改到**，否则这条文本会凭空消失。
+   *   两种都行：还排在队里（上屏时就用新文本）、或正显示在屏幕上（替换它）。
+   *   "已经上屏、又被挤出 history"的那种不行 —— 改它没人看得见，这条就白并了。
+   */
+  const stillQueued = schedule.items.includes(prev);
+  const onScreen = rendered.has(prev.id);
+  if (!stillQueued && !onScreen) return false;
+
+  prev.original = mergeTailText(prev.original, u.text);
+  prev.tailMerged = (Number(prev.tailMerged) || 0) + 1;
+  /**
+   * 重新翻一次 —— 但**不等待**：旧译文先留着（有就显示），新译文回来原地替换。
+   * ⚠️ 不能把 `translation` 清空：`renderable()` 见到空译文会把条目**扣住**最多 4 秒，
+   *    那就正好破坏了"上屏时间不变"这个前提。
+   */
+  prev.translated = false;
+  prev.inFlight = false;
+  prev.startedAt = 0;
+  // 让正在飞的那份译文作废（否则它回来会把**旧短文本**的译文盖上去，见 translateSegment）
+  prev.gen = (Number(prev.gen) || 0) + 1;
+  if (onScreen) renderSubs();
+  diag(
+    `并进上一句 · ${String(u.text).length} 字（${trigger}）· 并后 ${prev.original.length} 字 · 上屏时刻不变`,
+    false,
+  );
+  return true;
+}
+
 function scheduleUtterance(u) {
   const text = String(u?.text || '').trim();
   if (!text) return;
 
+  // 短段并进上一句 —— 并掉了就**不建新条目**（时间轴不动，也不会多出一条字幕）
+  if (tryMergeTail({ ...u, text })) return;
+
   const id = `d${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
   const timing = { start: u.start, duration: u.duration };
   const at = schedule.push(
-    { id, original: text, translation: '' },
+    // ⚠️ `cut` 要存进条目：合并判据要看**上一段**的切法，那时 u 已经过去了
+    { id, original: text, translation: '', cut: String(u.cut || '') },
     timing,
     firstAudioAt || Date.now(),
     currentDelayMs(),
@@ -1211,6 +1269,15 @@ async function translateSegment(seg) {
   seg.startedAt = Date.now();
   inflight += 1;
   const t0 = Date.now();
+  /**
+   * 这一趟翻译对应的**文本版本**。
+   *
+   * ⚠️ 翻的过程中这句可能被"合并短段"追加了新内容 —— 那份译文对应的是**旧的短文本**，
+   *    贴上去就是"字幕显示半句译文、而原文已经是整句"，比不翻还糟。
+   *    所以回来时对一次号，对不上就作废，并且**不能**把 translated 置真
+   *    （置真了泵就不会重翻，字幕会永久停在错译文上）。
+   */
+  const gen = Number(seg.gen) || 0;
 
   try {
     if (!isTranslateEnabled(settings)) return;
@@ -1279,9 +1346,14 @@ async function translateSegment(seg) {
     }
 
     if (out) {
-      seg.translation = out;
-      // 还没上屏 → 上屏时自带译文；已经上屏 → 直接替换那一条
-      if (rendered.has(seg.id)) renderSubs();
+      if ((Number(seg.gen) || 0) !== gen) {
+        // 期间被并进了新内容 → 这份译文作废（原文已经变长，它只对应前半截）
+        diag(`译文作废 · 这句刚被并进了新内容，需重翻`, true);
+      } else {
+        seg.translation = out;
+        // 还没上屏 → 上屏时自带译文；已经上屏 → 直接替换那一条
+        if (rendered.has(seg.id)) renderSubs();
+      }
     }
   } catch (e) {
     diag(`翻译失败 · ${Date.now() - t0}ms · ${e?.message || e}`, true);
@@ -1290,7 +1362,8 @@ async function translateSegment(seg) {
     // 在飞计数就永久少还一份，攒够上限后翻译彻底停摆。
     seg.inFlight = false;
     seg.startedAt = 0;
-    seg.translated = true;
+    // ⚠️ 被合并改过文本的**不算翻完** —— 留 false 让泵重翻，否则字幕停在旧译文上
+    seg.translated = (Number(seg.gen) || 0) === gen;
     inflight = Math.max(0, inflight - 1);
   }
 }
