@@ -613,6 +613,100 @@ check('字幕排期：clear() 清空', () => {
     if (dp.countInflight(null) !== 0) throw new Error('非数组应为 0');
     if (dp.countInflight([]) !== 0) throw new Error('空数组应为 0');
   });
+
+  // ───────── 合并短段（合理断句的配套）─────────
+
+  check('短段门槛：和断句层的 substantial 用同一条线（1.5s / 10 字）', () => {
+    const mk = (o) => ({ text: 'あ'.repeat(o.chars ?? 3), duration: o.dur, start: 5, reason: 'utterance-end' });
+    // 够长的不算短段（两条都要过线才算"够长"，和断句层一致）
+    if (dp.isShortTail(mk({ dur: 1.5, chars: 3 }))) throw new Error('1.5s 整应当算"够长"（和 substantial 同线）');
+    if (dp.isShortTail(mk({ dur: 0.5, chars: 10 }))) throw new Error('10 字整应当算"够长"');
+    // 短段
+    if (!dp.isShortTail(mk({ dur: 1.4, chars: 9 }))) throw new Error('1.4s / 9 字应当算短段');
+    // ⚠️ 没有合法时间戳时只看字数，且**不能**当成"够长" —— 否则短段永远并不上，功能等于没做
+    if (!dp.isShortTail({ text: 'あああ', duration: undefined })) throw new Error('没时间戳时应当按字数判');
+    // NaN / 字符串数字 / null 都算"拿不到时间戳"，行为和 undefined **必须一致** ——
+    // 不一致的话，换个服务就可能悄悄改变合并行为，而日志上看不出来
+    for (const bad of [NaN, null, 'abc', undefined]) {
+      const got = dp.isShortTail({ text: 'あああ', duration: bad });
+      if (got !== true) throw new Error(`duration=${String(bad)} 应当和"没有时间戳"同一种处理，得到 ${got}`);
+    }
+    // 而合法数字照常按时间判
+    if (!dp.isShortTail({ text: 'あああ', duration: '1.2' })) throw new Error('字符串形式的合法秒数应当按时间判');
+    // 空文本不并（否则会并进去一条空的）
+    if (dp.isShortTail({ text: '   ', duration: 0.5 })) throw new Error('空文本不算短段');
+    if (dp.isShortTail(null)) throw new Error('null 不算短段');
+  });
+
+  check('合并触发源①：max-length 的短尾巴 —— **只在合理断句开着时**才并', () => {
+    const prev = { cut: 'max-length', original: 'あ'.repeat(20), end: 4.2 };
+    const tail = { text: 'あ'.repeat(4), duration: 1.0, start: 4.3, reason: 'utterance-end' };
+    if (dp.tailMergeTrigger(prev, tail, { smartCut: true }) !== 'max-length') {
+      throw new Error('开着合理断句时应当并（那条尾巴就是它切出来的）');
+    }
+    // ⚠️ 关掉合理断句 → 不回看、也就不该并（逻辑自洽：尾巴不是它造成的）
+    if (dp.tailMergeTrigger(prev, tail, { smartCut: false }) !== '') {
+      throw new Error('关掉合理断句时不该并 max-length 那条路');
+    }
+    // 默认参数下（没显式传 smartCut）必须**不并** —— 别让"忘了传"变成"悄悄开着"
+    if (dp.tailMergeTrigger(prev, tail) !== '') throw new Error('没传 smartCut 时不该并');
+  });
+
+  check('合并触发源②：watchdog 碎片 —— **和合理断句开关无关**（实测那些碎片就是在关着时出现的）', () => {
+    const prev = { cut: 'silence', original: 'あ'.repeat(20), end: 4.2 };
+    const frag = { text: 'あ'.repeat(6), duration: 1.2, start: 4.3, reason: 'watchdog' };
+    if (dp.tailMergeTrigger(prev, frag, { smartCut: false }) !== 'watchdog') {
+      throw new Error('合理断句**关着**时，watchdog 碎片也必须并（用户实测的边界）');
+    }
+    if (dp.tailMergeTrigger(prev, frag, { smartCut: true }) !== 'watchdog') {
+      throw new Error('合理断句开着时同样要并');
+    }
+  });
+
+  check('watchdog 碎片也要保护真实短回答（「はい」那种不该被并进上一句）', () => {
+    // 上一句自己就是完整的（结束在句号上）→ 后面那条短句是独立的
+    const prev = { cut: 'silence', original: '今日はいい天気ですね。', end: 4.2 };
+    const answer = { text: 'はい', duration: 0.5, start: 4.3, reason: 'watchdog' };
+    if (dp.tailMergeTrigger(prev, answer, { smartCut: false }) !== '') {
+      throw new Error('上一句说完了 → 后面那条短句是独立的，不能并');
+    }
+    // 而上一句没说完（末尾没标点）→ 该并
+    const open = { cut: 'silence', original: '今日はいい天気ですね', end: 4.2 };
+    if (dp.tailMergeTrigger(open, answer, { smartCut: false }) !== 'watchdog') {
+      throw new Error('上一句没说完 → 该并');
+    }
+    // endsCompleteSentence 本身
+    if (!dp.endsCompleteSentence('あ。') || !dp.endsCompleteSentence('ok!')) throw new Error('句末标点没认出来');
+    if (dp.endsCompleteSentence('あ')) throw new Error('没标点不该算说完');
+    if (dp.endsCompleteSentence('')) throw new Error('空串不算说完');
+  });
+
+  check('不该合并的四种情况：不够短 / 隔太久 / 没有上一句 / 空文本', () => {
+    const prev = { cut: 'max-length', original: 'あ'.repeat(20), end: 4.2 };
+    // ① 后一段不短（3+3 那种）→ 两次停顿可能都是真实换气，各自成句是对的
+    if (dp.tailMergeTrigger(prev, { text: 'あ'.repeat(12), duration: 3, start: 4.3 }, { smartCut: true }) !== '') {
+      throw new Error('12 字 / 3 秒不算短段，不该并');
+    }
+    // ② 隔太久 → 那句话已经结束了，后面这条是新的
+    if (dp.tailMergeTrigger(prev, { text: 'あ', duration: 0.4, start: 9 }, { smartCut: true }) !== '') {
+      throw new Error('隔了 4.8 秒不该并');
+    }
+    // ③ 没有上一句
+    if (dp.tailMergeTrigger(null, { text: 'あ', duration: 0.4, start: 1 }, { smartCut: true }) !== '') {
+      throw new Error('没有上一句时不该并');
+    }
+    // ④ 空文本
+    if (dp.tailMergeTrigger(prev, { text: '  ', duration: 0.4, start: 4.3 }, { smartCut: true }) !== '') {
+      throw new Error('空文本不该并');
+    }
+  });
+
+  check('合并文本：和累积器拼分片用同一条规则（空格分隔），空的一侧不留下多余空格', () => {
+    if (dp.mergeTailText('あい', 'うえ') !== 'あい うえ') throw new Error(dp.mergeTailText('あい', 'うえ'));
+    if (dp.mergeTailText('', 'うえ') !== 'うえ') throw new Error('空的前一段');
+    if (dp.mergeTailText('あい', '') !== 'あい') throw new Error('空的后一段');
+    if (dp.mergeTailText(null, null) !== '') throw new Error('都是空应当返回空串');
+  });
 }
 
 check('ASR_PROVIDERS 均有对应实现模块', () => {
