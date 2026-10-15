@@ -1009,8 +1009,14 @@ function noteAsrLatency(ev) {
  *
  * 一次说话中间 Deepgram 会吐很多个 is_final，每个都上屏的话长句会变成一串碎片。
  * 判定逻辑在 lib/utterance.js（有单测），这里只负责接线。
+ *
+ * ⚠️ `maxSpanSec` 原来是 **15**，实测在口语速率下一条字幕能到 **89~127 字** ✗
+ *    （探针驱动真源码：60 秒连续说话、分片每 1.5 秒一个 → 每条 89 字）。
+ *    收到 **10** 秒 → 一条最多约 54~85 字 ✓。
+ * ⚠️ `maxChars` 是**另一条独立上限**：有些服务不给时间戳，那时 `spanSec` 恒为 0，
+ *    `maxSpanSec` 永远不命中（实测能攒成 359 字）✗ —— 所以两条都要给。见 lib/utterance.js。
  */
-const utterances = new UtteranceAccumulator({ maxSpanSec: 15, watchdogMs: 3000 });
+const utterances = new UtteranceAccumulator({ maxSpanSec: 10, maxChars: 60, watchdogMs: 3000 });
 
 /**
  * 一整句到齐了：**只排期，不立刻翻译**。

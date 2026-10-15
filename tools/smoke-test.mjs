@@ -1964,6 +1964,100 @@ check('整句累积：默认参数不能太激进（否则又回到碎片化 / �
   if (b.watchdogMs < 500) throw new Error('watchdogMs 缺少下限保护');
 });
 
+/**
+ * ⚠️ 这一组盯的是一个**静默失效**的兜底：
+ *    `spanSec` 要求 start/end 都非 null，而**有服务不给时间戳** → 它恒为 0
+ *    → `maxSpanSec` 那条**永远不命中** → 实测 60 秒能攒成**一条 359 字** ✗
+ *    光看代码发现不了（每条语句都对），只有喂"没有时间戳"的数据才暴露。
+ */
+check('整句累积：没有时间戳时靠字数上限兜底（秒数上限那时恒为 0，等于没有）', () => {
+  const a = new utt.UtteranceAccumulator({ maxSpanSec: 10, maxChars: 60, watchdogMs: 3000 });
+  const outs = [];
+  let now = Date.now();
+  for (let i = 0; i < 60; i++) {
+    // ⚠️ 每片文本必须**不同** —— addFinal 有"和上一片相同就不累积"的去重，
+    //    用同一个字符串会让它只累积一段，看起来像"有上限"，其实是**没测到** ✗
+    const out = a.addFinal({ text: `${i}`.padStart(2, '0') + 'あ'.repeat(5) }, (now += 1000));
+    if (out) outs.push(out);
+  }
+  if (!outs.length) throw new Error('没有时间戳时累积器一次都不吐 —— 会攒成一条 359 字');
+  if (outs.some((o) => o.reason !== 'max-chars')) throw new Error(`reason 不对：${outs.map((o) => o.reason).join(',')}`);
+  // ⚠️ 判据是"到就吐"，所以真正的不变量是「上限 + 最后一个分片」，**不是**"≤ 上限" ✗
+  const worst = Math.max(...outs.map((o) => o.text.length));
+  if (worst > 60 + 8) throw new Error(`最长 ${worst} 字，超过"上限 + 一个分片"`);
+  // ⚠️ 结束时**本来就该**还剩一段没到上限的（那不是 bug）—— 要验的是"剩下这段在上限之下" ✓
+  if (a.text.length >= 60) throw new Error(`结束时手上还剩 ${a.text.length} 字，说明没在上限处吐`);
+});
+
+check('整句累积：默认就有字数上限，而且不激进', () => {
+  const a = new utt.UtteranceAccumulator();
+  if (!(a.maxChars >= 40 && a.maxChars <= 120)) throw new Error(`默认字数上限 ${a.maxChars} 不合理`);
+  // ⚠️ 必须喂 1~19 之间的值才会碰到下限保护 —— 喂 0 会走 `|| 60` 那条，
+  //    那样这条断言看着在测下限，其实什么都没测 ✗（设计变异时发现的）
+  const b = new utt.UtteranceAccumulator({ maxChars: 5 });
+  if (b.maxChars < 20) throw new Error(`maxChars=${b.maxChars} 缺少下限保护`);
+});
+
+check('整句累积：字数上限不吃掉正常长度的一句话', () => {
+  const a = new utt.UtteranceAccumulator({ maxSpanSec: 10, maxChars: 60 });
+  a.addFinal({ text: 'x'.repeat(20), start: 0, duration: 1 });
+  if (a.addFinal({ text: 'y'.repeat(20), start: 1, duration: 1 }) !== null) throw new Error('40 字就被切断了');
+  if (a.text.length < 40) throw new Error(`文本丢了：${a.text.length}`);
+});
+
+/**
+ * ⚠️ 接线检查：**不匹配源码字面**（那样加个字段就误报，这个项目刚栽过 ✗），
+ *    而是把 `maxSpanSec:` 后面那个**数字**解析出来判范围 —— 顺序、字段增删都不影响。
+ */
+check('接线：累积器的秒数上限是收过的值（15 秒在口语下能到 81~127 字）', () => {
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const m = /new\s+UtteranceAccumulator\s*\(\s*\{([^}]*)\}/.exec(src);
+  if (!m) throw new Error('没找到 UtteranceAccumulator 的接线处');
+  const span = /maxSpanSec\s*:\s*([0-9.]+)/.exec(m[1]);
+  if (!span) throw new Error('接线处没给 maxSpanSec');
+  const v = Number(span[1]);
+  if (!(v >= 2 && v <= 10)) throw new Error(`maxSpanSec=${v} 超出收过的范围（2~10）`);
+  const mc = /maxChars\s*:\s*([0-9.]+)/.exec(m[1]);
+  if (!mc) throw new Error('接线处没给 maxChars —— 没有时间戳时就没有上限了');
+  if (!(Number(mc[1]) >= 20 && Number(mc[1]) <= 120)) throw new Error(`maxChars=${mc[1]} 不合理`);
+});
+
+/**
+ * ⚠️ 合并的**上界**：`maxGapSec` 那道守卫是 `Number.isFinite(gap) && gap > maxGapSec`，
+ *    而 `prev.end` 缺失时 gap 是 NaN → **整道守卫被跳过**（不是"放行一个略超的间隔"）
+ *    → 实测**并 500 次都没停 = 3030 字** ✗（对照组有 end 时并 3 次就自然停，48 字 ✓）
+ */
+check('短段合并：没有时间戳时也不能无界（原来能并 500 次 = 3030 字）', () => {
+  const prev = { original: 'う'.repeat(20), cut: 'max-length', tailMerged: 0, end: undefined };
+  let merged = 0;
+  for (let i = 0; i < 500; i++) {
+    const tail = { text: 'え'.repeat(5), reason: 'watchdog', start: undefined, duration: undefined };
+    if (!dp.tailMergeTrigger(prev, tail, { smartCut: true })) break;
+    prev.original = dp.mergeTailText(prev.original, tail.text);
+    prev.tailMerged += 1;
+    merged += 1;
+    if (merged > 500) throw new Error('无界');
+  }
+  if (merged > dp.TAIL_MERGE_MAX_MERGES) throw new Error(`并了 ${merged} 次，超过上限 ${dp.TAIL_MERGE_MAX_MERGES}`);
+  if (prev.original.length > dp.TAIL_MERGE_MAX_TOTAL_CHARS) throw new Error(`并后 ${prev.original.length} 字，超过上限`);
+});
+
+check('短段合并：并后总字数超上限就不并（但没超的仍然要并）', () => {
+  const tail = { text: 'え'.repeat(6), reason: 'watchdog', start: undefined, duration: undefined };
+  const tooLong = { original: 'う'.repeat(55), cut: 'max-length', tailMerged: 0, end: undefined };
+  if (dp.tailMergeTrigger(tooLong, tail, { smartCut: true })) throw new Error('55+6 超过 60 还并了');
+  const fits = { original: 'う'.repeat(40), cut: 'max-length', tailMerged: 0, end: undefined };
+  if (!dp.tailMergeTrigger(fits, tail, { smartCut: true })) throw new Error('40+6 没超上限却不并 —— 拦过头了');
+});
+
+check('短段合并：有时间戳时，隔太久仍然不并', () => {
+  const prev = { original: 'お', cut: 'max-length', tailMerged: 0, end: 10 };
+  const far = { text: 'か', reason: 'max-length', start: 20, duration: 0.5 };
+  if (dp.tailMergeTrigger(prev, far, { smartCut: true })) throw new Error('隔了 10 秒还并');
+  const near = { text: 'か', reason: 'max-length', start: 10.5, duration: 0.5 };
+  if (!dp.tailMergeTrigger(prev, near, { smartCut: true })) throw new Error('相邻的短尾巴应当并');
+});
+
 check('字幕排期：译文没到手时扣住不上屏（否则会先显示原文，看起来像"没翻译"）', () => {
   const s = new dp.SubtitleSchedule();
   const t0 = 1_700_000_000_000;
