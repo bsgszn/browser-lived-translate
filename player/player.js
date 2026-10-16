@@ -1794,7 +1794,12 @@ function diagLate(item, now) {
     if (rec) rec.shown = shown;
     // 识别那条已经被环形缓冲挤掉 → 补一条并**如实标出缺的那半边**，
     // 别让导出的记录看起来像"这句没有识别文本"（那是另一回事）。
-    else subLog.push({ t: performance.now(), id: item.id, asr: '(未记录)', shown });
+    else {
+      subLog.push({ t: performance.now(), id: item.id, asr: '(未记录)', shown });
+      // ⚠️ 这条兜底 push 也必须配对裁剪 —— 否则 subLog 会超过 SUBLOG_KEEP，
+      //    让导出那句"缓冲区已满、更早的句被挤掉了"变得不准。
+      if (subLog.length > SUBLOG_KEEP) subLog.shift();
+    }
   }
   diag(
     `字幕上屏 · 比排期晚 ${(lateMs / 1000).toFixed(2)}s · 这句说了 ${(saidMs / 1000).toFixed(1)}s${inside ? ' · 仍在句内' : ''}`,
