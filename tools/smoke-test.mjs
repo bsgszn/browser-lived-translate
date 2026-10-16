@@ -4305,6 +4305,132 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
     if (!/认得太稀/.test(v.vadLevelLine(st))) throw new Error('那行没说明原因');
   });
 
+  /**
+   * ⚠️ 这一条是**那个坑的回归**：`Number(null)` 是 `0`，而 `0` 是有限数 ——
+   * 于是"没传 exitThreshold"会被当成"低线 = 0"，**任何一帧都算继续说** ⇒
+   * 最长连续帧直接变成窗口长度（80），`sparse` 永远不响 ✗。
+   * 文件里本来就有这条注释（状态机构造函数那处），而抽函数时**又踩了一次** ——
+   * 被上面那条 `sparse` 断言当场抓到 ✓。所以这里把默认值钉死。
+   */
+  check('VAD 迟滞：没传 exitThreshold 时，低线是 threshold×0.7，**不是 0**', () => {
+    if (gateMod.resolveExitThreshold(0.5, null) !== 0.35) {
+      throw new Error(`默认低线应为 0.35，实际 ${gateMod.resolveExitThreshold(0.5, null)}`);
+    }
+    if (gateMod.resolveExitThreshold(0.5, undefined) !== 0.35) throw new Error('undefined 也应按默认处理');
+    if (gateMod.resolveExitThreshold(0.5, 0.4) !== 0.4) throw new Error('显式传值应原样用');
+    const g = new gateMod.VadGate({ threshold: 0.5 });
+    if (g.exitThreshold !== 0.35) throw new Error(`状态机也要用同一份默认规则，实际 ${g.exitThreshold}`);
+  });
+
+  /**
+   * ⭐ 入口侧迟滞的**决定性回归**：同一串概率，
+   *   旧口径（低线 = 高线，即"单帧跌破就清零"）开口不了，新口径能开口 ✓。
+   *
+   * 形态取自实测那几段：**概率峰值够高（0.9 级），而中间有跌破 0.5、
+   * 但没跌破 0.35 的回落** —— 于是旧口径最长连续远小于 7 帧 ✗。
+   */
+  check('VAD 迟滞：入口侧允许小幅回落 —— 旧口径开口不了，新口径能开口', () => {
+    const seq = [0.9, 0.85, 0.4, 0.9, 0.88, 0.42, 0.9, 0.86, 0.41, 0.9];
+    const strict = gateMod.longestSpeechRun(seq, { threshold: 0.5, hysteresis: false });
+    const hyst = gateMod.longestSpeechRun(seq, { threshold: 0.5 });
+    if (strict >= 7) throw new Error(`这组数据在旧口径下就该开口不了（实际 ${strict} 帧）`);
+    if (hyst < 7) throw new Error(`迟滞口径下应够 7 帧（实际 ${hyst} 帧）`);
+
+    const run = (opts) => {
+      const g = new gateMod.VadGate({ threshold: 0.5, minSpeechMs: 250, frameMs: 40, ...opts });
+      let opened = false;
+      for (const p of seq) {
+        const r = g.push(p);
+        if (r && r.type === 'start') opened = true;
+      }
+      return opened;
+    };
+    if (run({ exitThreshold: 0.5 })) throw new Error('旧口径（低线=高线）不该开口 —— 那说明这条没在测入口迟滞');
+    if (!run({})) throw new Error('新口径应当开口 —— 这正是"差一帧整句丢掉"那个 bug');
+  });
+
+  /**
+   * ⚠️ 迟滞只能**把已经在跑的连下去**，不能凭空起头 ✗。
+   * 否则稳态噪音（概率一直在 0.36~0.49 之间抖、从没到过高线）会被认成语音。
+   */
+  check('VAD 迟滞：不能凭空起头 —— 从没到过高线的稳态噪音不许开口', () => {
+    const g = new gateMod.VadGate({ threshold: 0.5, minSpeechMs: 250, frameMs: 40 });
+    for (let i = 0; i < 80; i += 1) {
+      const r = g.push(i % 2 ? 0.49 : 0.36);
+      if (r && r.type === 'start') throw new Error('从没到过 0.5 的稳态噪音开口了');
+    }
+    const noise = Array.from({ length: 80 }, (_, i) => (i % 2 ? 0.49 : 0.36));
+    if (gateMod.longestSpeechRun(noise, { threshold: 0.5 }) !== 0) {
+      throw new Error('稳态噪音的最长连续帧应为 0');
+    }
+  });
+
+  /**
+   * ⭐ 心跳那栏要**同时**印两个口径 —— 否则读日志的人分不清
+   * "那几句是靠迟滞救回来的"还是"本来就够" ✗。
+   */
+  check('VAD 诊断：那一栏同时印迟滞与严格两个连续帧数', () => {
+    const seq = [0.9, 0.85, 0.4, 0.9, 0.88, 0.42, 0.9, 0.86, 0.41, 0.9];
+    const recent = MKR(REP(80, { rms: SPEECH_RMS, p: 0.01 }).map((x, i) => ({ ...x, p: seq[i % seq.length] })));
+    const base = MKR([...REP(72, QUIET_RMS), ...REP(168, SPEECH_RMS)]);
+    const st = v.vadLevelStats({ recent, baseline: base }, GATE_OPTS);
+    const wantStrict = gateMod.longestSpeechRun(recent.map((x) => x.p), { threshold: 0.5, hysteresis: false });
+    if (st.maxRunStrict !== wantStrict) throw new Error('严格口径那个数必须来自同一个判据函数');
+    const line = v.vadLevelLine(st, { seconds: 3 });
+    if (!new RegExp(`连续 ${st.maxRun} 帧（严格 ${st.maxRunStrict}）`).test(line)) {
+      throw new Error(`没同时印两个口径（应出现 连续 ${st.maxRun} 帧（严格 ${st.maxRunStrict}））：${line}`);
+    }
+  });
+
+  /**
+   * ⚠️ `sparse` 必须跟**迟滞**口径走 —— 否则会出现
+   * "状态机已经开口了、而读数说它凑不满"的自相矛盾 ✗。
+   */
+  check('VAD 诊断：sparse 跟迟滞口径走（状态机能开口时就不报稀疏）', () => {
+    const seq = [0.9, 0.85, 0.4, 0.9, 0.88, 0.42, 0.9, 0.86, 0.41, 0.9];
+    const recent = MKR(REP(80, { rms: SPEECH_RMS, p: 0.01 }).map((x, i) => ({ ...x, p: seq[i % seq.length] })));
+    const base = MKR([...REP(72, QUIET_RMS), ...REP(168, SPEECH_RMS)]);
+    const st = v.vadLevelStats({ recent, baseline: base }, GATE_OPTS);
+    if (st.maxRun < st.need) throw new Error('这组数据在迟滞口径下应当够开口（否则这条没在测那件事）');
+    if (st.sparse) throw new Error('迟滞口径已经够开口了，不该再报"凑不满一次开口"');
+  });
+
+  /**
+   * ⭐ **不变量：迟滞口径只会"更宽"，绝不会更窄** ✓
+   *
+   * 低线 ≤ 高线 ⇒ 旧口径里能连下去的那些帧，新口径一定也能 ⇒
+   * `longestSpeechRun(迟滞) >= longestSpeechRun(严格)` **恒成立**。
+   *
+   * ⚠️ 为什么值得单独钉住：用户那边的证据只有**每 3 秒一个采样点**（10 个），
+   * **还原不出逐帧序列** ✗ —— 所以"这个改动能不能救回那几句"没法直接证明。
+   * 但"它不可能让任何原本能开口的句子变得开不了口"是**可证的** ✓，
+   * 而那正是"改行为"最需要的那条安全保证。
+   */
+  check('VAD 迟滞：只会更宽不会更窄 —— 迟滞连续帧数恒 ≥ 严格连续帧数', () => {
+    let seed = 20261016;
+    const rnd = () => {
+      // 确定性 LCG，别用 Math.random（否则失败不可复现）
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    let checked = 0;
+    for (let trial = 0; trial < 300; trial += 1) {
+      const n = 1 + Math.floor(rnd() * 80);
+      const seq = Array.from({ length: n }, () => {
+        const r = rnd();
+        // 特意混入大量落在 [exitThreshold, threshold) 之间的值 —— 那正是迟滞起作用的地带
+        if (r < 0.25) return 0.35 + rnd() * 0.14; // 0.35~0.49
+        if (r < 0.6) return rnd() * 0.35; // 0~0.35 以下
+        return 0.5 + rnd() * 0.5; // 0.5~1.0
+      });
+      const strict = gateMod.longestSpeechRun(seq, { threshold: 0.5, hysteresis: false });
+      const hyst = gateMod.longestSpeechRun(seq, { threshold: 0.5 });
+      if (hyst < strict) throw new Error(`迟滞口径反而更窄了（严格 ${strict} → 迟滞 ${hyst}）：${seq.join(',')}`);
+      checked += 1;
+    }
+    if (checked !== 300) throw new Error('没跑满 300 组');
+  });
+
   check('VAD 诊断：「有声」那栏带参照物（常态/开口需几帧），缺值印 ?', () => {
     const f = MKR(REP(80, { rms: SPEECH_RMS, p: 0.9 }));
     const st = v.vadLevelStats({ recent: f, baseline: f }, GATE_OPTS);
