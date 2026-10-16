@@ -4166,21 +4166,96 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
   });
 
   /**
-   * ⚠️ 「人声量级」的阈值**全项目只有一份**。
-   * 回看若另造一个数，迟早出现「VAD 说这是语音、回看说这是低谷」的自相矛盾。
+   * ⚠️ 回看的门槛是**相对这一段自己的电平**，所以有一条**定义性行为**:
+   * **同一段音频整体缩放，结果必须一样** ✗ —— 绝对门槛下不成立。
+   *
+   * ⚠️ 为什么这条比"查源码里有没有 `loudRms = HUMAN_LEVEL_RMS`"强:
+   * 那条验的是**源码那一行长什么样**，判据一改它必红，而**它红了不代表功能坏了** ✗
+   * （这一轮为此栽过两次）。而缩放不变性验的是**行为**，改回绝对门槛它会真的红 ✓
+   *
+   * 实测背景（那份真素材，20 秒 16kHz 单声道）:
+   *   · 有内容的流整体 RMS **0.012**，逐帧只有 **4%** 超过 0.03
+   *   → 而旧的绝对门槛（0.03）落在这个电平**之上** ⇒ 这类流上"处处都低于门槛"
+   *     ⇒ 到处都被当成换气 ⇒ 切点会在没换气的地方也挪 ✗
    */
-  check('合理断句复用人声量级那一个阈值（不许另造一个 0.03）', () => {
+  check('合理断句：回看门槛是相对的 —— 同一段音频整体缩放，切点不变', () => {
     if (!(v.HUMAN_LEVEL_RMS > 0)) throw new Error('HUMAN_LEVEL_RMS 没导出或不是正数');
     const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
     const hits = src.match(/0\.03/g) || [];
     if (hits.length > 1) throw new Error(`vad.js 里 "0.03" 出现了 ${hits.length} 次 —— 阈值被复制成了两份`);
-    if (!/loudRms\s*=\s*HUMAN_LEVEL_RMS/.test(src)) throw new Error('findLullCut 的 loudRms 默认值不是 HUMAN_LEVEL_RMS');
+
+    if (typeof v.findLullCut !== 'function') throw new Error('vad.js 没有导出 findLullCut');
+    const scale = (pcm, k) => Int16Array.from(pcm, (x) => Math.round(x * k));
+    const base = mkAudio({ seconds: 5, amp: 0.1, lullAtSec: 4.2, lullMs: 300 });
+    const ref = v.findLullCut(base, RATE);
+    if (!(ref > 0)) throw new Error(`基准那段（有真换气）却返回 ${ref} —— 那等于没生效`);
+    for (const k of [0.2, 0.4, 2.5]) {
+      const got = v.findLullCut(scale(base, k), RATE);
+      /**
+       * ⚠️ 允许 ±1 个采样的差 —— 缩放后 `Int16Array` 取整会让包络差一点点 ✗
+       * 但不允许"差一大截"或"一个挪一个不挪"：那正是绝对门槛的形态 ✓
+       */
+      if (Math.abs(got - ref) > 1) {
+        throw new Error(`整体缩放 ×${k} 后切点从 ${ref} 变成 ${got} —— 门槛还是绝对的 ✗`);
+      }
+    }
+  });
+
+  /**
+   * ⚠️ 而"相对"必须**真的能认出错电平的流里的换气** —— 缩放不变性只证明口径一致，
+   * 不证明它在这类流上还找得到换气 ✗
+   *
+   * 数值取实测那种流：整体 RMS **0.012**（`amp 0.02` 的正弦 RMS ≈ 0.014 ✓）
+   */
+  check('合理断句：低电平的流（实测那种 RMS 0.012）里，真换气仍然认得出来', () => {
+    const back = v.findLullCut(mkAudio({ seconds: 5, amp: 0.02, lullAtSec: 4.2, lullMs: 300 }), RATE);
+    if (!(back > 0)) throw new Error(`低电平的流里有 300ms 真换气，却返回 ${back} ✗`);
+    const cutAt = 5 - back / RATE;
+    if (cutAt < 4.14 || cutAt > 4.56) throw new Error(`切在 ${cutAt.toFixed(3)}s，没落在换气段里`);
+  });
+
+  /**
+   * ⚠️ **整段本来就接近无声**（低于 `SILENT_LEVEL_RMS`）时**不许挪** ✗
+   *
+   * 那种流里"任何微小起伏"都会低于"这一段自己的常态 × 一半"——
+   * 于是会到处都被当成换气。这道**绝对地板**就是为它留的 ✓
+   * （变异测试发现的：把这道地板去掉，原来的断言一条都不红 ✗）
+   */
+  check('合理断句：整段接近无声的流 → 不许挪（绝对地板那一条）', () => {
     /**
-     * ⚠️ 这里原来还有一条 `/lastInputRms\s*>\s*HUMAN_LEVEL_RMS/` —— 已删 ✗
-     * 它验的是**源码那一行长什么样**，而不是**行为对不对**：
-     * 判据一改它必红，而它红了不代表功能坏了（这一轮为此栽过两次）。
-     * 下面这批改成驱动真模块的**行为断言** ✓
+     * ⚠️ `amp` 的可用窗口很窄，是**算出来的**（我前两版都取错，变异测试照出来了 ✗）：
+     *
+     *   `mkAudio` 的洞是**恒定 0.0008**（DC 偏移，不是 0 ✗）⇒ 洞里包络 ≈ 0.00079
+     *   ① 要"整段接近无声" ⇒ `ceil = amp × 0.707 < SILENT_LEVEL_RMS 0.003` ⇒ `amp < 0.0042`
+     *   ② 又要"洞里真的算低谷" ⇒ `0.00079 < ceil × 0.5 = amp × 0.354` ⇒ `amp > 0.0022`
+     *   ⇒ **0.0022 < amp < 0.0042** —— 取 **0.003**（ceil ≈ 0.0021 ✓，洞是它的 3.7 成 ✓）
+     *
+     *   ⚠️ 取 0.001 / 0.002 时洞里**根本不算低谷** ⇒ 断言会**因为错的原因**通过 ✗
+     *      —— 这正是"看起来验证了"那一族，而变异测试把它照出来了 ✓
      */
+    const back = v.findLullCut(mkAudio({ seconds: 5, amp: 0.003, lullAtSec: 4.2, lullMs: 300 }), RATE);
+    if (back !== 0) throw new Error(`整段接近无声（amp 0.003）却挪了 ${back} —— 那是最低点当换气 ✗`);
+    if (!(v.SILENT_LEVEL_RMS > 0)) throw new Error('SILENT_LEVEL_RMS 没导出或不是正数');
+    if (!(v.SILENT_LEVEL_RMS < v.HUMAN_LEVEL_RMS)) {
+      throw new Error('SILENT_LEVEL_RMS 应当**低于** HUMAN_LEVEL_RMS（它是"接近无声"的地板）✗');
+    }
+  });
+
+  /**
+   * ⚠️ 参照物必须是**高分位**，不能是中位 ✗
+   *
+   * 因为一次换气能占掉回看窗口的**一大半** —— 那时中位会被低谷本身拉到 0，
+   * 于是"低谷线 = 中位 × 一半"也变成 0，**什么都算不上低谷** ✗
+   * （变异测试发现的：把高分位换成中位，原来的断言一条都不红 ✗）
+   *
+   * 构造：5 秒音频，回看范围是 3.5~4.7s（末尾 300ms 不看），让其中 **0.8s 是洞**（占 67% ✗），
+   * 剩下 0.4s 是正常电平 → 正确答案是**挪**（那里确实有一次长换气 ✓）
+   */
+  check('合理断句：回看范围里换气占一大半时，参照物不能被它拉低（高分位那一条）', () => {
+    const back = v.findLullCut(mkAudio({ seconds: 5, amp: 0.25, lullAtSec: 3.5, lullMs: 800 }), RATE);
+    if (!(back > 0)) throw new Error('回看范围里 67% 是换气，却返回 0 —— 参照物被低谷拉低了 ✗');
+    const cutAt = 5 - back / RATE;
+    if (cutAt < 3.44 || cutAt > 4.36) throw new Error(`切在 ${cutAt.toFixed(3)}s，没落在换气段 3.5~4.3s 里`);
   });
 
   /**
