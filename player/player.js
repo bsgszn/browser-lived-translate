@@ -1078,7 +1078,17 @@ function handleAsrEvent(ev) {
       diag(`分片 · ${ev.detail}`, false);
     }
     // VAD 的读数心跳 —— 只是读数，不能算进「识别请求回来了几次」
-    else if (ev.status === 'vad' && ev.detail) diag(`VAD · ${ev.detail}`, false);
+    //
+    // ⚠️ 但「丢弃一段识别结果」走的**也是** `status: 'vad'`，而它和心跳完全不是一回事：
+    // 心跳是每秒约 3 行的正常读数，而丢弃记录是**质量闸门真的扔了一段**。
+    // 混在同一个 `VAD ·` 前缀里 → 在导出的 .log 里根本分不出来，
+    // 于是"这句是漏听了、还是被闸门扔了"永远判不了（实测踩过：用户丢了三句，
+    // 从导出里完全看不出原因）。
+    // 所以给它一个**独立、可 grep** 的前缀，并提升到 warn 级（进控制台）。
+    else if (ev.status === 'vad' && ev.detail) {
+      if (ev.detail.startsWith('丢弃一段识别结果')) diag(`⚠ 闸门丢弃 · ${ev.detail}`, true);
+      else diag(`VAD · ${ev.detail}`, false);
+    }
     // 分片送去识别（每个分片发一次请求）
     else if (ev.status === 'recognizing') asrRequestsSent += 1;
     return;
