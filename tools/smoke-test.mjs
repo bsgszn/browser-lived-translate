@@ -7460,5 +7460,60 @@ console.log('\n[8] 按锚点改文件的守卫');
     !/字幕上屏[^`]*\$\{shown\}/.test(src) && !/字幕上屏[^`]*\$\{item\.(translation|original)\}/.test(src));
 }
 
+// ——————————————————————————————————————————————————————————————
+// 变异残留：变异脚本"故意改坏一处看断言会不会红"，但用完必须自己清理。
+// 曾经有一处 `// MUTATED: 去掉记录` 活到了被提交 —— 而 MUTATED 在这个项目里是**有含义的信号**，
+// 下一个读代码的人可能真以为那行是故意改坏的，于是不去动它。
+// ——————————————————————————————————————————————————————————————
+check('不许有变异残留（MUTATED 之类标记）', () => {
+  // ⚠️ 与别处相反：这条**要抓的就是注释里的**标记，所以**不能** stripComments。
+  //    也因此必须**排除本文件**（下面这个正则字面量就写在这一切），
+  //    并靠"只扫源码扩展名"把 markdown 文档挡在外面（README 会举例提到这个词）。
+  const roots = ['lib', 'player', 'offscreen', 'background', 'options', 'popup', 'content', 'tools'];
+  const exts = ['.js', '.mjs', '.html'];
+  const hit = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name !== 'node_modules' && e.name !== 'vendor') walk(p);
+        continue;
+      }
+      if (!exts.some((x) => e.name.endsWith(x))) continue;
+      const rel = path.relative(process.cwd(), p).split(path.sep).join('/');
+      if (rel === 'tools/smoke-test.mjs') continue; // 本文件里就有这个词
+      if (/\bMUTATED\b/.test(fs.readFileSync(p, 'utf8'))) hit.push(rel);
+    }
+  };
+  for (const r of roots) {
+    const p = path.join(process.cwd(), r);
+    if (fs.existsSync(p)) walk(p);
+  }
+  if (hit.length) {
+    throw new Error(`这些文件里有变异残留：${hit.join('、')} —— 变异脚本用完要自己清理`);
+  }
+  // 守卫：roots 全部不存在时上面什么也没扫 —— 那种情况下这条断言是空的
+  if (!fs.existsSync(path.join(process.cwd(), 'player', 'player.js'))) {
+    throw new Error('扫描根目录不存在，这条断言实际上什么都没验');
+  }
+});
+
+// ——————————————————————————————————————————————————————————————
+// subLog 的 push 与裁剪必须成对：曾经有一处兜底 push 没有配对裁剪，
+// subLog 会超过 SUBLOG_KEEP 上限（导出里那句"缓冲区已满"就不再准确）。
+// ——————————————————————————————————————————————————————————————
+check('subLog：每一处 push 都有配对的裁剪', () => {
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const pushes = (src.match(/subLog\.push\(/g) || []).length;
+  const shifts = (src.match(/if \(subLog\.length > SUBLOG_KEEP\) subLog\.shift\(\);/g) || []).length;
+  // ⚠️ 守卫：正则一旦匹配不到东西，下面的相等判断会**恒真** —— 这一轮的老毛病
+  if (pushes < 1) {
+    throw new Error(`没匹配到任何 subLog.push —— 判据本身失效了（pushes=${pushes}）`);
+  }
+  if (pushes !== shifts) {
+    throw new Error(`subLog.push ${pushes} 处，配对裁剪只有 ${shifts} 处 —— 会超过 SUBLOG_KEEP 上限`);
+  }
+});
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
