@@ -1055,8 +1055,8 @@ browser-lived-translate/
 │   └── delayed-playback.md        设计笔记：延迟播放（已实现）与前读路线（未实现）
 ├── tools/                         开发期自检脚本（不参与扩展运行）
 │   ├── README.md                  测试说明
-│   ├── manifest-check.mjs         93 项：manifest / 路径 / DOM id / 硬约束 静态完整性
-│   ├── smoke-test.mjs             415 项：模块加载 / 滤波器与 AGC / 断句状态机 / 预设 / 术语表 / 签名 / 防复发
+│   ├── manifest-check.mjs         94 项：manifest / 路径 / DOM id / 硬约束 静态完整性
+│   ├── smoke-test.mjs             432 项：模块加载 / 滤波器与 AGC / 断句状态机 / 预设 / 术语表 / 签名 / 防复发
 │   ├── pipeline-test.mjs          126 项：音频引擎全链路（桩对象驱动）
 │   ├── worker-test.mjs            60 项：service worker 状态机与消息路由（含竞态回归）
 │   ├── bump-version.mjs           改版本号、同步文档、**自动存历史快照**
@@ -1652,7 +1652,7 @@ A：字幕样式改 `content/content.js` 里的 `CSS` 常量；新增识别服�
   node tools/pipeline-test.mjs   # 音频引擎全链路，桩对象驱动
   node tools/worker-test.mjs     # service worker 状态机与消息路由
   ```
-  四套一共 **694 项断言**（93 + 415 + 126 + 60）。
+  四套一共 **712 项断言**（94 + 432 + 126 + 60）。
   `pipeline-test` 会桩掉 `AudioContext` / `AudioWorkletNode` / `WebSocket` / `fetch` / `performance.now`，
   真实走完「启动 → 分析支路 → PCM → 重采样 → ASR 事件 → 翻译（含上下文）→ 下发字幕 → 停止 → 重启」，
   覆盖字幕行复用、译文与原文错配、AGC 收敛与回落、识别滞后夹取、**翻译请求背压与定稿抢占**、缓存命中、去重、资源回收等不变量。

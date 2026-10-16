@@ -8,6 +8,8 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 // 纯函数，不碰 chrome —— 所以可以静态导入（在下面那个 chrome 桩之前求值也没问题）。
 import { pushDiagPair, diagWindow } from '../lib/diag-window.js';
+// 「按锚点改文件」的共用守卫 —— 判断逻辑是纯函数，所以这里能真调它断言。
+import { planReplace } from '../lib/anchor-edit.js';
 
 /**
  * 剥掉注释再拿去做正则检查。
@@ -7346,6 +7348,78 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
     check('播放页的窗口切片走 diagWindow（边界 >= 只在 lib 里定义一次）', usesWin,
       '需要在 player.js 里看到 diagWindow(diagTimes, cutMs)');
   }
+}
+
+// —— [8] 按锚点改文件的守卫 ——
+//
+// ⚠️ 为什么单独测它：这个守卫存在的理由，就是"同一类事故出现过三次"
+// （替换的目标字符串不存在 → 什么都没改 → 脚本却认为成功了）。
+// 而这一轮反复出现的形态恰恰是「一个不会守的守卫」—— 所以守卫自己必须被测。
+console.log('\n[8] 按锚点改文件的守卫');
+{
+  const t = '甲。乙。丙。';
+
+  // 出现 1 次 → 正常替换
+  const ok1 = planReplace(t, [{ find: '乙', replace: 'B' }]);
+  check('锚点出现 1 次 → 替换成功', ok1.ok === true && ok1.out === '甲。B。丙。', `out=${JSON.stringify(ok1.out)}`);
+
+  // 出现 0 次 → 必须失败（这就是那三次事故的形状）
+  const miss = planReplace(t, [{ find: '丁', replace: 'D' }]);
+  check('锚点出现 0 次 → 必须失败（不能静默跳过）', miss.ok === false && miss.errors.length === 1,
+    `ok=${miss.ok} errors=${JSON.stringify(miss.errors)}`);
+  check('锚点 0 次时，错误里说清了"出现 0 次"和锚点本身',
+    miss.errors[0] && miss.errors[0].count === 0 && miss.errors[0].find === '丁',
+    JSON.stringify(miss.errors[0]));
+  check('锚点 0 次时输出等于原文（绝不半改）', miss.out === t);
+
+  // 出现 2 次 → 必须失败（歧义）
+  const dup = planReplace(t, [{ find: '。', replace: '!' }]);
+  check('锚点出现 2 次以上 → 必须失败（歧义）', dup.ok === false && dup.errors[0].count === 3,
+    JSON.stringify(dup.errors[0]));
+
+  // ⭐ 一批里有一个不满足 → 整批都不写
+  const batch = planReplace(t, [
+    { find: '甲', replace: 'A', label: '好的那个' },
+    { find: '丁', replace: 'D', label: '坏的那个' },
+  ]);
+  check('⭐ 一批里有一个锚点不满足 → 整批失败，且输出仍是原文',
+    batch.ok === false && batch.out === t && batch.errors.length === 1,
+    `ok=${batch.ok} out=${JSON.stringify(batch.out)}`);
+  check('整批失败时，错误里指出是哪个 label', batch.errors[0].label === '坏的那个');
+
+  // expect 参数
+  const exp = planReplace(t, [{ find: '。', replace: '!', expect: 3 }]);
+  check('expect 能给别的值（3 次 → 通过）', exp.ok === true && exp.out === '甲!乙!丙!', `out=${JSON.stringify(exp.out)}`);
+  const expBad = planReplace(t, [{ find: '。', replace: '!', expect: 2 }]);
+  check('expect 与实际不符 → 失败', expBad.ok === false && expBad.errors[0].expect === 2);
+
+  // 中文锚点（那三次事故都是中文/符号混排的锚点）
+  const zh = planReplace('manifest-check.mjs   # 91 项', [{ find: '# 91 项', replace: '# 93 项' }]);
+  check('中文 + # 符号混排的锚点能匹配（就是踩过的那个坑）',
+    zh.ok === true && zh.out === 'manifest-check.mjs   # 93 项', `out=${JSON.stringify(zh.out)}`);
+  const zhMiss = planReplace('manifest-check.mjs   # 91 项', [{ find: 'manifest-check.mjs         91 项', replace: 'x' }]);
+  check('那个坑的"错锚点"（漏了 #）→ 必须失败', zhMiss.ok === false && zhMiss.errors[0].count === 0);
+
+  // 空锚点 / 空列表
+  const empty = planReplace(t, [{ find: '', replace: 'x' }]);
+  check('空字符串锚点 → 失败（否则 replace 会插到开头）', empty.ok === false && empty.errors[0].count === -1);
+  const none = planReplace(t, []);
+  check('空替换列表 → 成功但什么都不做', none.ok === true && none.out === t);
+
+  // 脏输入不抛
+  let threw = false;
+  try { planReplace(undefined, [{ find: 'a', replace: 'b' }]); } catch { threw = true; }
+  check('原文本是 undefined → 不抛（当空串处理）', threw === false);
+  let threw2 = false;
+  try { planReplace(t, null); } catch { threw2 = true; }
+  check('替换列表是 null → 不抛', threw2 === false);
+
+  // ⚠️ 替换串里的 $ 系列必须按**字面**处理（String.replace 会把 $& 当特殊语法）
+  const dollar = planReplace('X', [{ find: 'X', replace: '成本 $& 元' }]);
+  check('替换串里的 $& 按字面写入，不被当成"整个匹配"',
+    dollar.ok === true && dollar.out === '成本 $& 元', `out=${JSON.stringify(dollar.out)}`);
+  const dollar1 = planReplace('X', [{ find: 'X', replace: '$1' }]);
+  check('替换串里的 $1 按字面写入', dollar1.ok === true && dollar1.out === '$1', `out=${JSON.stringify(dollar1.out)}`);
 }
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);

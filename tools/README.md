@@ -7,8 +7,8 @@
 在扩展根目录（有 `package.json` 的那一层）：
 
 ```bash
-node tools/manifest-check.mjs   # 93 项：manifest / 路径 / DOM id / 硬约束 静态完整性
-node tools/smoke-test.mjs       # 415 项：模块加载 / 音频前端数值 / 断句状态机 / 预设 / 术语表 / 签名
+node tools/manifest-check.mjs   # 94 项：manifest / 路径 / DOM id / 硬约束 静态完整性
+node tools/smoke-test.mjs       # 432 项：模块加载 / 音频前端数值 / 断句状态机 / 预设 / 术语表 / 签名
 node tools/pipeline-test.mjs    # 126 项：音频引擎全链路（桩对象驱动）
 node tools/worker-test.mjs      # 60 项：service worker 状态机与消息路由
 ```
@@ -19,7 +19,7 @@ node tools/worker-test.mjs      # 60 项：service worker 状态机与消息路�
 npm test
 ```
 
-不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **694 项断言**。
+不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **712 项断言**。
 
 ### `manifest-check.mjs`
 
@@ -286,6 +286,60 @@ PowerShell 会把内联 `node -e "…${var}…"` 里的 `${}` 当成自己的变
 
 **所以稍复杂一点的脚本，写成 `.cjs` 文件再 `node xxx.cjs` 跑**，不要硬扛内联字符串。
 （`.mjs` 里没有 `require`，要用 `import`；这类小脚本用 `.cjs` 最省事。）
+
+## ⚠️ 按锚点改文件：一律走 `lib/anchor-edit.js`，不要自己写 `replace`
+
+**这个坑的形状是：替换的目标字符串**不存在** → 什么也没改 → 但脚本认为成功了 → 继续往下走。**
+
+它出现过三次，而且每次都是**中文/符号混排的锚点**：
+
+```
+① 给 tools/README.md 那行「脚本名 + # + 项数」改数字时，正则漏了中间的 `#`  → 没改成
+② 同一处又来一次，锚点少写了那个 `#`（差了十几个空格就对不上）              → 没改成
+   ⚠️ 而这次更糟：在 manifest-check **还是红**的时候就提交并升了版本
+③ 变异脚本的锚点是一个"我以为存在、但没先读一眼"的字符串                    → 空跑
+
+⚠️ 所以下面这段说明里**故意不写那个真实行文** —— 写了会被 manifest-check 的数字检查
+   当成真的声明（这个假阳性是写这一节时当场撞出来的）。
+```
+
+**而变异测试脚本里早就有这个守卫**（先数锚点出现次数），只是**没有推广到别处** ——
+所以同一类操作两套脚本、一套有防备一套没有。现在它被抽出来了。
+
+```js
+// 仓库内的脚本
+import { applyReplace, planReplace, checkReplace } from '../lib/anchor-edit.js';
+
+// ⚠️ 仓库外的一次性脚本（浏览器测试台那些）用绝对路径 require：
+const { applyReplace, planReplace } = require('C:/Users/.../browser-live-translate/lib/anchor-edit.js');
+```
+
+**三层接口，按需要选：**
+
+| | 用途 |
+|---|---|
+| `planReplace(text, pairs)` | **纯函数**，不碰文件系统 —— 给断言用（smoke-test 的 `[8]` 就是它在测） |
+| `checkReplace(file, pairs)` | 只校验不写 —— "先 dry-run 一遍" |
+| `applyReplace(file, pairs)` | 校验 + 写入；**要么全改，要么一个字节都不动** |
+
+**几条硬规矩（都写进断言了，别绕过）：**
+
+- **`expect` 默认 1** —— 锚点必须**恰好**出现一次。出现 0 次（写错了）或 ≥2 次（有歧义）都直接抛错，
+  **错误信息里会说清是哪个文件、哪个锚点、出现了几次、期望几次**。
+- **一批锚点里任何一个不满足 → 整批不写** —— 绝不留下"改了一半"的状态。
+- **求值顺序是"先全部校验、再逐个施加"** —— 所以不会出现"前面改了、后面才发现锚点错"。
+- **绝不抛在脏输入上**（`undefined` / `null` / 空锚点）—— 判断逻辑当空处理。
+  ⚠️ 空字符串锚点算**失败**，否则 `split('')` 会把替换插到每个字符之间。
+
+**⚠️ 实现上用的是 `split/join` 而不是 `String.replace`**，两个原因都不是洁癖：
+
+```
+① replace 只替换**第一处** —— 而 expect > 1 时要替换全部（这个 bug 是断言抓出来的）
+② replace 会把替换串里的 $& / $1 当特殊语法 —— split/join 一律按字面处理
+```
+
+**这条也是这一轮的通用教训：** 一个"看起来对"的辅助动作，自己没有被检查过，而且**不报错** ——
+所以它现在有自己的断言（`smoke-test.mjs` 的 `[8]`，17 条，覆盖 0 次 / 多次 / 中文锚点 / 整批不写 / `$&` 字面）。
 
 ## 改版本号
 
