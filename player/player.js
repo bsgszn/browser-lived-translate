@@ -413,14 +413,21 @@ async function saveAudioAndLog() {
   // ⚠️ 单独成段,不混进上面的诊断行:那些是**过程**（谁在什么时候做了什么），
   //    这一段是**结果**（这句最后识别成了什么、屏幕上显示成了什么）。
   //    配上同一次导出的 WAV，"识别不对 / 翻译不对"才有得对照。
-  const subRows = subLog.filter((r) => r.t >= cutMs);
+  // ⚠️ 筛选基准:**识别时间或显示时间任一落在窗口内**。
+  //    只按识别时间筛,会**稳定地**丢掉窗口开头那几句 —— 它们识别在窗口之前、
+  //    显示落在窗口之内,而"显示比识别晚"是常态(排期 + 翻译要几百毫秒到几秒)。
+  //    实测证据:某份导出里第一行是「字幕上屏」,而窗口内没有对应的「整句上屏」。
+  const subRows = subLog.filter((r) => r.t >= cutMs || (r.dt != null && r.dt >= cutMs));
+  // ⚠️ whisper 返回的文本里可能带换行(它把相邻的小段合成一句)。
+  //    原样打印会把导出的版式打断、缩进丢掉,读的人会以为那是另外几句 ✗
+  const flat = (s) => String(s == null ? '' : s).replace(/\s*\n\s*/g, ' / ').trim();
   const subBody = subRows
     .map((r) => {
       const at = `[+${((r.t - DIAG_T0) / 1000).toFixed(3)}s]`;
       // ⚠️「还没显示」和「未记录」是两回事:前者是译文没赶上（字幕会等），
       //    后者是识别那条已被环形缓冲挤掉（`asr` 里已经写着「(未记录)」）。
-      const shown = r.shown === null ? '（还没显示）' : r.shown || '（空）';
-      return `${at} 识别  ${r.asr || '（空）'}\n${' '.repeat(at.length)} 显示  ${shown}`;
+      const shown = r.shown === null ? '（还没显示）' : flat(r.shown) || '（空）';
+      return `${at} 识别  ${flat(r.asr) || '（空）'}\n${' '.repeat(at.length)} 显示  ${shown}`;
     })
     .join('\n');
   const subNote =
@@ -1790,12 +1797,18 @@ function diagLate(item, now) {
   //    所以要记的是真正显示出去的那一版，不是"本该显示什么"。
   {
     const shown = String(item.translation || item.original || '');
+    // ⚠️ `dt` = 这一句**真的上屏**的时刻。导出筛选要用它:
+    //    只按识别时间筛会丢掉"识别在窗口外、显示在窗口内"的那几句（窗口开头最常见）。
+    const shownAt = performance.now();
     const rec = subLog.find((r) => r.id === item.id);
-    if (rec) rec.shown = shown;
+    if (rec) {
+      rec.shown = shown;
+      rec.dt = shownAt;
+    }
     // 识别那条已经被环形缓冲挤掉 → 补一条并**如实标出缺的那半边**，
     // 别让导出的记录看起来像"这句没有识别文本"（那是另一回事）。
     else {
-      subLog.push({ t: performance.now(), id: item.id, asr: '(未记录)', shown });
+      subLog.push({ t: shownAt, dt: shownAt, id: item.id, asr: '(未记录)', shown });
       // ⚠️ 这条兜底 push 也必须配对裁剪 —— 否则 subLog 会超过 SUBLOG_KEEP，
       //    让导出那句"缓冲区已满、更早的句被挤掉了"变得不准。
       if (subLog.length > SUBLOG_KEEP) subLog.shift();
