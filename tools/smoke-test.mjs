@@ -7735,5 +7735,114 @@ check('时间窗秒数：README 那一节里的秒数和常量一致', () => {
   if (bad.length) throw new Error(`那一节里有 ${bad.join('、')} 秒，常量是 ${sec} 秒`);
 });
 
+// ---------------------------------------------------------------------------
+// [11] 防复发：四处「靠约定耦合」的改动
+//
+// 这一轮反复出现的形态是：同一个事实被记在两个地方，而**没有任何东西盯着它们是否一致**。
+// 外面那份「先提交修复、再改版本号」的约定也是这么失效的 —— 它假设了 commit 会成功。
+//
+// ⚠️ 这四条优先验**行为**（哈希不变 / exit≠0），而不是「代码里有没有那个词」——
+//    因为「查字符串」这一轮骗过我们很多次（拼错的属性名、只改第一处的 replace、
+//    断言命中自己的注释）。
+// ---------------------------------------------------------------------------
+{
+  const rd = (rel) => stripComments(fs.readFileSync(path.join(process.cwd(), rel), 'utf8'));
+
+  // ① vad.js 那句 detail 的**开头**是和播放页耦合的约定（那边用 startsWith 判断）。
+  //    哪天有人改句话或加个标点 → startsWith 静默失配 → 丢弃记录又混回每秒约 3 行的
+  //    VAD 心跳里，而用户导出时**看起来完全正常**，只是要找的那行又不见了。
+  check('闸门丢弃：vad.js 里那条 detail 以「丢弃一段识别结果 · 」开头', () => {
+    const src = rd(path.join('lib', 'asr', 'vad.js'));
+    const all = src.match(/detail:\s*`[^`]*`/g);
+    if (!all) throw new Error('vad.js 里找不到任何 detail 模板串 —— 判据失效');
+    if (!all.some((s) => /`丢弃一段识别结果 · /.test(s))) {
+      throw new Error(
+        'vad.js 里没有以「丢弃一段识别结果 · 」开头的 detail —— ' +
+          'player.js 的 startsWith 会**静默失配**，丢弃记录会混回 VAD 心跳里',
+      );
+    }
+    return true;
+  });
+
+  // ② 播放页那个分支必须**同时**有「丢弃」和「非丢弃」两条路径。
+  //    有人可能把它简化回一条 diag() 调用 —— 那样独立前缀就没了。
+  check("闸门丢弃：player.js 的 status==='vad' 分支有「丢弃」与「非丢弃」两条路径", () => {
+    const src = rd(path.join('player', 'player.js'));
+    const i = src.indexOf("ev.status === 'vad'");
+    if (i < 0) throw new Error("player.js 里找不到 ev.status === 'vad' —— 判据失效");
+    // 切到下一个 else if 为止（不用固定长度 —— 那个陷阱这一轮踩过）
+    const rest = src.slice(i);
+    const end = rest.search(/\n\s*else if\b/);
+    const seg = end > 0 ? rest.slice(0, end) : rest.slice(0, 800);
+    if (!/startsWith\(\s*'丢弃一段识别结果'\s*\)/.test(seg)) {
+      throw new Error("分支里没有 startsWith('丢弃一段识别结果') 的判断");
+    }
+    if (!/闸门丢弃/.test(seg)) throw new Error('分支里没有独立前缀「闸门丢弃」');
+    if (!/VAD · \$\{ev\.detail\}/.test(seg)) {
+      throw new Error('分支里没有那条「非丢弃」路径（VAD 心跳前缀）—— 说明被简化成一条了');
+    }
+    return true;
+  });
+
+  // ③ 导出窗口的筛选必须**同时**看识别时间和显示时间。
+  //    只看识别时间时，「识别在窗口外、显示在窗口内」的那几句会被稳定丢掉 ——
+  //    而显示比识别晚 0.03~3.9 秒是常态（日志铁证：`[+39.131s] 字幕上屏` 找不到对应的整句上屏）。
+  check('导出筛选：subRows 那一行同时引用 r.t 和 r.dt', () => {
+    const src = rd(path.join('player', 'player.js'));
+    const line = src.split('\n').find((l) => l.includes('subRows') && l.includes('filter'));
+    if (!line) throw new Error('找不到 subRows 的 filter 那一行 —— 判据失效');
+    if (!/\br\.t\b/.test(line)) throw new Error('那一行里没有 r.t');
+    if (!/\br\.dt\b/.test(line)) {
+      throw new Error('那一行里没有 r.dt —— 只看识别时间会把窗口开头那几句稳定丢掉');
+    }
+    return true;
+  });
+
+  // ④ bump-version 的脏工作区守卫。
+  //    先静态确认「检查在写文件之前」——脚本自己马上就会弄脏工作区，放后面等于白检查。
+  check('bump-version 守卫：检查在写 manifest.json 之前', () => {
+    const src = rd(path.join('tools', 'bump-version.mjs'));
+    const iDirty = src.indexOf('isDirty()');
+    const iWrite = src.indexOf('manifest.version = next');
+    if (iDirty < 0) throw new Error('找不到 isDirty() —— 守卫可能被删了');
+    if (iWrite < 0) throw new Error('找不到 manifest.version = next —— 判据失效');
+    if (iDirty > iWrite) throw new Error('守卫在写文件之后 —— 那等于白检查');
+    return true;
+  });
+
+  // 再**验行为**：脏工作区下必须 exit≠0，而且一个字节都不写。
+  // ⚠️ 造脏用「未跟踪的临时文件」，并在 finally 里删掉（不碰暂存区，不产生提交）。
+  await checkAsync('bump-version 守卫：脏工作区下 exit≠0，且 manifest.json 一个字节不写', async () => {
+    const { spawnSync } = await import('node:child_process');
+    const crypto = await import('node:crypto');
+    const mp = path.join(process.cwd(), 'manifest.json');
+    const hash = () => crypto.createHash('sha256').update(fs.readFileSync(mp)).digest('hex');
+    const before = hash();
+    const junk = path.join(process.cwd(), '.dirty-probe.tmp');
+    try {
+      fs.writeFileSync(junk, 'probe\n');
+      const r = spawnSync(process.execPath, [path.join('tools', 'bump-version.mjs'), 'patch'], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        timeout: 60000,
+      });
+      if (r.error) {
+        // ⚠️ 不装作通过 —— 这条**没验到**。受限沙箱会拒子进程管道（EPERM）。
+        throw new Error(
+          `跑不起 bump-version（${r.error.code || r.error.message}）—— **这条没验到，不是通过**`,
+        );
+      }
+      if (r.status === 0) throw new Error('脏工作区下居然 exit=0 —— 守卫没起作用');
+      if (hash() !== before) {
+        throw new Error('脏工作区下 manifest.json 被改了 —— 守卫应该一个字节都不写');
+      }
+    } finally {
+      try {
+        fs.rmSync(junk, { force: true });
+      } catch {}
+    }
+  });
+}
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
