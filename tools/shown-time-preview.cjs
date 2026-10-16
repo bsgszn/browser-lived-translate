@@ -81,6 +81,18 @@ function runOnce(offsetMs, utterance) {
      * ⚠️ 合并的行为**不在这里**验 —— 别把这个 stub 当成"合并被测过了"。
      */
     tryMergeTail: () => false,
+    /**
+     * ⚠️ `scheduleUtterance` 里还要把「识别文本 / 显示文本」记进 `subLog`（导出诊断用），
+     * 所以这个假作用域里必须有它和它的容量上限 —— 少了就是 `ReferenceError`，
+     * 而这正是那三条「整句上屏」断言跑的地方，它们会一起红。
+     *
+     * 这里给**真的数组和真的数字**，不写 stub：push / shift / length 都是真行为，
+     * 于是这个工具顺手也覆盖了"记录这一步不会抛"。
+     * ⚠️ 导出那一段（读 subLog 生成文本）**不在这里**验 —— 它不在被抽出的函数里。
+     */
+    subLog: [],
+    SUBLOG_KEEP: 120,
+    performance,
     Date,
     Math,
     Number,

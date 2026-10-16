@@ -7422,5 +7422,43 @@ console.log('\n[8] 按锚点改文件的守卫');
   check('替换串里的 $1 按字面写入', dollar1.ok === true && dollar1.out === '$1', `out=${JSON.stringify(dollar1.out)}`);
 }
 
+// ── 导出里的「识别文本 / 实际显示字幕」────────────────────────────────
+{
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+
+  // 两个文本发生在**不同时刻**（识别在收句、显示要等翻译+排期），
+  // 所以必须按同一个 id 先存识别、上屏时回填显示 —— 否则导出的是两堆对不上号的句子。
+  check('导出必须记录「识别文本」（收句那一刻 push 进 subLog）',
+    /subLog\.push\(\{ t: performance\.now\(\), id, asr: String\(text \|\| ''\)/.test(src));
+  check('显示文本必须**按 id 回填**同一条，而不是各记各的',
+    /subLog\.find\(\(r\) => r\.id === item\.id\)/.test(src));
+  check('回填取的必须是「真正显示出去的那一版」（译文没赶上时显示的是原文）',
+    /item\.translation \|\| item\.original/.test(src));
+
+  // ⚠️ 三种状态必须分得开，别都是空字符串：
+  //    （还没显示）= 译文没赶上、字幕在等；  (未记录) = 识别那条已被环形缓冲挤掉；  （空）= 真的空
+  check('「还没显示」与「(未记录)」必须是两种不同的表示（含义不同）',
+    src.includes('（还没显示）') && src.includes("'(未记录)'"));
+
+  // 缓冲区满时导出要**如实写明**，不能让记录看起来像"就是这些句子"
+  check('环形缓冲满时，导出必须如实说明「更早的句被挤掉了」',
+    src.includes('缓冲区已满') && src.includes('SUBLOG_KEEP'));
+
+  // 导出段要独立成段（过程 vs 结果分开），并带上锚点标题
+  check('导出里必须有独立的「识别与显示」段', src.includes('识别与显示'));
+
+  // ⭐ 最重要的一条:**屏幕上的行为零变化** —— 那两条 diag 行仍然只印长度、不印正文。
+  //    正文只该进导出的文件，不该刷屏（也避免把用户内容打进面板/剪贴板）。
+  //    ⚠️ 判据必须**只看那一行**：全文搜 `${text}` 会误伤 diag() 自己的去重逻辑
+  //       （`${text}（同一提示已出现 n 次…）`，那是提示去重，不是正文上屏）。
+  //       —— 这一轮"判据范围选错"已经出过几次（数顶层 vs 数递归、比当前源 vs 比历史）。
+  const diagLine = src.split('\n').find((l) => l.includes('整句上屏'));
+  check('「整句上屏」的诊断行仍然只印长度，不印正文（屏幕行为零变化）',
+    !!diagLine && diagLine.includes('${text.length}') && !/\$\{text\}/.test(diagLine),
+    `line=${JSON.stringify(diagLine)}`);
+  check('「字幕上屏」的诊断行仍然不印正文（屏幕行为零变化）',
+    !/字幕上屏[^`]*\$\{shown\}/.test(src) && !/字幕上屏[^`]*\$\{item\.(translation|original)\}/.test(src));
+}
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);

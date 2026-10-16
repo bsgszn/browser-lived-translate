@@ -186,6 +186,19 @@ const diagTimes = [];
 /** 日志时间戳的零点。页面重开就换一个，不需要跨页面对齐。 */
 const DIAG_T0 = performance.now();
 
+/**
+ * 每句的「识别文本」与「实际显示文本」—— **只进导出的文件，不进屏幕**。
+ *
+ * ⚠️ 这两个文本发生在**不同时刻**：识别在收句那一刻就有，显示要等翻译完、排期到点。
+ *    所以按 `id` 先存识别、上屏时再回填显示 —— 是**一条记录的两个字段**，
+ *    不是两条各说各的日志（那样对不上号）。
+ *
+ * ⚠️ 为什么要它：配上导出的 WAV，就能回答"当时识别成了什么 / 显示成了什么"。
+ *    面板上的诊断行**仍然只印长度、不印正文**（那是故意的，正文不该刷屏）。
+ */
+const SUBLOG_KEEP = 120; // 条数。30 秒通常 10~30 句，留足余量；挤掉时导出会如实写明
+const subLog = [];
+
 function diag(line, toConsole) {
   const text = String(line);
   if (toConsole) {
@@ -396,6 +409,25 @@ async function saveAudioAndLog() {
   const times = diagTimes.slice(win.from);
   const body = lines.map((t, i) => `[+${((times[i] - DIAG_T0) / 1000).toFixed(3)}s] ${t}`).join('\n');
 
+  // —— 识别与显示:同一时间窗内每句的「识别文本 / 实际显示文本」 ——
+  // ⚠️ 单独成段,不混进上面的诊断行:那些是**过程**（谁在什么时候做了什么），
+  //    这一段是**结果**（这句最后识别成了什么、屏幕上显示成了什么）。
+  //    配上同一次导出的 WAV，"识别不对 / 翻译不对"才有得对照。
+  const subRows = subLog.filter((r) => r.t >= cutMs);
+  const subBody = subRows
+    .map((r) => {
+      const at = `[+${((r.t - DIAG_T0) / 1000).toFixed(3)}s]`;
+      // ⚠️「还没显示」和「未记录」是两回事:前者是译文没赶上（字幕会等），
+      //    后者是识别那条已被环形缓冲挤掉（`asr` 里已经写着「(未记录)」）。
+      const shown = r.shown === null ? '（还没显示）' : r.shown || '（空）';
+      return `${at} 识别  ${r.asr || '（空）'}\n${' '.repeat(at.length)} 显示  ${shown}`;
+    })
+    .join('\n');
+  const subNote =
+    subRows.length === 0
+      ? '(这一窗口内没有记录)'
+      : `共 ${subRows.length} 句` + (subLog.length >= SUBLOG_KEEP ? '，缓冲区已满、更早的句被挤掉了' : '');
+
   const logText =
     `livedtranslate 诊断导出 · v${chrome.runtime.getManifest().version}\n` +
     `导出时刻 ${new Date().toISOString()}\n` +
@@ -404,6 +436,7 @@ async function saveAudioAndLog() {
     (lines.length ? '' : '(这一窗口内没有日志行 —— 缓冲区最早只有 ' +
       `${win.oldestMs !== null ? ((performance.now() - win.oldestMs) / 1000).toFixed(1) : '0'}s 前的记录)\n`) +
     `---\n${body || '(空)'}\n` +
+    `\n=== 识别与显示 · ${subNote} ===\n${subBody || '(空)'}\n` +
     `${snapshotLine('导出时')}\n`;
 
   const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
@@ -1236,6 +1269,16 @@ function scheduleUtterance(u) {
     v === null || v === undefined || !Number.isFinite(Number(v))
       ? `?${suffix}`
       : `${Number(v).toFixed(digits)}${suffix}`;
+  // 记下这一句的识别文本；显示文本等它真的上屏时再回填（见 diagLate）。
+  // ⚠️ 用上面刚生成的局部 `id`，不要用 `item.id` —— L1193 判过 `if (item)`，
+  //    也就是说 `item` 可能是 undefined（排期没接住这个条目），而 `id` 一定在。
+  // MUTATED: 去掉记录
+  if (subLog.length > SUBLOG_KEEP) subLog.shift();
+  // 记下这一句的识别文本；显示文本等它真的上屏时再回填（见 diagLate）。
+  // ⚠️ 用上面刚生成的局部 `id`，不要用 `item.id` —— L1193 判过 `if (item)`，
+  //    也就是说 `item` 可能是 undefined（排期没接住这个条目），而 `id` 一定在。
+  subLog.push({ t: performance.now(), id, asr: String(text || ''), shown: null });
+  if (subLog.length > SUBLOG_KEEP) subLog.shift();
   diag(
     `整句上屏 · ${whenText} · ${text.length} 字 · ${u.reason}` +
       ` · 累积 ${fmtNum(u.parts, 0, ' 片')} · 跨度 ${fmtNum(u.duration, 1, 's')}` +
@@ -1747,6 +1790,17 @@ function diagLate(item, now) {
   const saidMs = Number.isFinite(item.start) && Number.isFinite(item.end) ? (item.end - item.start) * 1000 : 0;
   // 画面把这句说完的时刻 ≈ at + 句长（at 已经含了延迟），所以这句还在放 = lateMs <= saidMs
   const inside = saidMs > 0 && lateMs <= saidMs;
+  // 回填"这一句实际显示的是什么"。
+  // ⚠️ 取 `translation || original` —— 译文没赶上时字幕显示的是**原文**，
+  //    所以要记的是真正显示出去的那一版，不是"本该显示什么"。
+  {
+    const shown = String(item.translation || item.original || '');
+    const rec = subLog.find((r) => r.id === item.id);
+    if (rec) rec.shown = shown;
+    // 识别那条已经被环形缓冲挤掉 → 补一条并**如实标出缺的那半边**，
+    // 别让导出的记录看起来像"这句没有识别文本"（那是另一回事）。
+    else subLog.push({ t: performance.now(), id: item.id, asr: '(未记录)', shown });
+  }
   diag(
     `字幕上屏 · 比排期晚 ${(lateMs / 1000).toFixed(2)}s · 这句说了 ${(saidMs / 1000).toFixed(1)}s${inside ? ' · 仍在句内' : ''}`,
     // 晚得还在句内 = 观感可接受，不用报警
