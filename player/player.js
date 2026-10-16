@@ -18,7 +18,7 @@ import { createAsrSession } from '../lib/asr/index.js';
 import { translate, isTranslateEnabled } from '../lib/translate/index.js';
 import { Resampler, float32ToInt16, rms, noteDue } from '../lib/util.js';
 import { UtteranceAccumulator } from '../lib/utterance.js';
-import { PcmRing } from '../lib/pcm-ring.js';
+import { PcmRing, encodeWav } from '../lib/pcm-ring.js';
 import { createRefiner } from '../lib/asr/refine.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
 import {
@@ -170,6 +170,18 @@ const DIAG_KEEP = 400; // 留在内存里的行数
 const DIAG_SHOW = 60; // 面板上显示的行数（超出靠滚动看）
 
 const diagLines = [];
+/**
+ * 与 `diagLines` 一一对应的**单调**时间戳（`performance.now()`）。
+ *
+ * ⚠️ 只用 `performance.now()`，**不要 `Date.now()`** —— 后者会被系统对时改掉，
+ * 切出来的「那 20 秒」就会错位。基准是 `DIAG_T0`（本模块加载那一刻）。
+ *
+ * ⚠️ 面板和「复制日志」**不显示**时间戳（保持原来的可读性），
+ * 只有**导出的 .log 文件**里会带上 —— 那里才需要和音频对齐。
+ */
+const diagTimes = [];
+/** 日志时间戳的零点。页面重开就换一个，不需要跨页面对齐。 */
+const DIAG_T0 = performance.now();
 
 function diag(line, toConsole) {
   const text = String(line);
@@ -183,7 +195,12 @@ function diag(line, toConsole) {
   // 连续重复的行不再刷屏，但计数器要让位给下一条真实日志
   if (diagLines[diagLines.length - 1] === text) return;
   diagLines.push(text);
-  if (diagLines.length > DIAG_KEEP) diagLines.splice(0, diagLines.length - DIAG_KEEP);
+  diagTimes.push(performance.now());
+  if (diagLines.length > DIAG_KEEP) {
+    const drop = diagLines.length - DIAG_KEEP;
+    diagLines.splice(0, drop);
+    diagTimes.splice(0, drop);
+  }
   renderDiag();
 }
 
@@ -320,6 +337,83 @@ async function copyDiag() {
   } catch (e) {
     diag(`复制失败 · ${e?.message || e}`, true);
   }
+}
+
+/**
+ * 导出「最近 N 秒的音频 + 同一时间窗的日志」，各存一个文件。
+ *
+ * ⚠️ 为什么要有它:排查「识别结果不对」这类问题时，日志只能说**发生过什么**，
+ * 而真正缺的是**当时那段音频** —— 有了它，开发者可以在本地把同一段音频重跑一遍，
+ * 确定性地复现。
+ *
+ * ⚠️ 导出的音频是 **ASR 实际吃到的那一份**（16kHz 单声道 int16），不是采集流。
+ * 只有这样才能保证重放逐字节相同、结果可复现。它同时也是识别校正用的那份缓冲
+ * （`pcmRing`，90 秒），所以这里不需要另建缓冲 —— 切最后 20 秒即可。
+ *
+ * ⚠️ **隐私:必须是用户主动点。** 这个扩展的卖点是「音频不出本机」，
+ * 所以绝不自动存、不在后台存、不在出错时自动存。存下来的文件在用户自己机器上，
+ * 发不发由他决定。
+ *
+ * ⚠️ 任何一步失败都不许抛 —— 打日志/导出绝不能把播放搞挂。
+ */
+const SAVE_WINDOW_SEC = 20;
+
+function downloadBlob(blob, filename) {
+  if (!blob) return;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function saveAudioAndLog() {
+  const cutMs = performance.now() - SAVE_WINDOW_SEC * 1000;
+
+  // —— 音频:从已有的 90 秒环形缓冲里切最后 20 秒 ——
+  let wavBlob = null;
+  let audioNote = '';
+  try {
+    const have = pcmRing ? pcmRing.bufferedSeconds : 0;
+    const take = Math.min(SAVE_WINDOW_SEC, have);
+    if (!pcmRing || take <= 0.1) {
+      audioNote = '没有音频可导出(采集还没开始,或刚开始)';
+    } else {
+      const endSec = pcmRing.writeIndex / pcmRing.sampleRate;
+      const pcm = pcmRing.sliceBySeconds(endSec - take, endSec);
+      wavBlob = new Blob([encodeWav(pcm, pcmRing.sampleRate)], { type: 'audio/wav' });
+      audioNote =
+        `音频 ${take.toFixed(1)}s(${pcm.length} 样本 @ ${pcmRing.sampleRate}Hz` +
+        `${take < SAVE_WINDOW_SEC ? '，不足 20s:采集开始不久' : ''})`;
+    }
+  } catch (e) {
+    audioNote = `音频导出失败 · ${e?.message || e}`;
+  }
+
+  // —— 日志:按时间戳切同一个窗口 ——
+  let from = diagTimes.findIndex((t) => t >= cutMs);
+  if (from < 0) from = diagLines.length;
+  const lines = diagLines.slice(from);
+  const times = diagTimes.slice(from);
+  const body = lines.map((t, i) => `[+${((times[i] - DIAG_T0) / 1000).toFixed(3)}s] ${t}`).join('\n');
+
+  const logText =
+    `livedtranslate 诊断导出 · v${chrome.runtime.getManifest().version}\n` +
+    `导出时刻 ${new Date().toISOString()}\n` +
+    `窗口:最近 ${SAVE_WINDOW_SEC} 秒(音频与日志同一基准 performance.now())\n` +
+    `${audioNote}\n` +
+    (lines.length ? '' : '(这一窗口内没有日志行 —— 缓冲区最早只有 ' +
+      `${diagLines.length ? ((performance.now() - diagTimes[0]) / 1000).toFixed(1) : '0'}s 前的记录)\n`) +
+    `---\n${body || '(空)'}\n` +
+    `${snapshotLine('导出时')}\n`;
+
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-');
+  downloadBlob(wavBlob, `livedtranslate-${stamp}.wav`);
+  downloadBlob(new Blob([logText], { type: 'text/plain;charset=utf-8' }), `livedtranslate-${stamp}.log`);
+  diag(`已导出最近 ${SAVE_WINDOW_SEC}s · ${audioNote} · ${lines.length} 行日志`, true);
 }
 
 // ═══════════════════════════ 启动 ═══════════════════════════
@@ -1941,6 +2035,7 @@ function bindUi() {
     if (e.target.checked) renderDiag();
   });
   $('btnCopyDiag').addEventListener('click', () => void copyDiag());
+  $('btnSaveAudio').addEventListener('click', () => void saveAudioAndLog());
   $('btnFull').addEventListener('click', async () => {
     try {
       if (document.fullscreenElement) await document.exitFullscreen();

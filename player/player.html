@@ -83,6 +83,7 @@
         <span>诊断面板</span>
       </label>
       <button class="btn tiny" id="btnCopyDiag" title="复制完整日志（含面板没显示的部分），方便贴出来排查">复制日志</button>
+      <button class="btn tiny" id="btnSaveAudio" title="把最近 20 秒的音频（识别实际收到的那一份，16kHz 单声道 WAV）和同一时间窗的日志各存一个文件 —— 用来排查，或让开发者拿同一段音频重跑复现。⚠️ 只在你主动点时才会存，不会自动存">存音频+日志(20s)</button>
       <span class="hint" id="hint"></span>
     </footer>
 
