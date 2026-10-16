@@ -7515,5 +7515,56 @@ check('subLog：每一处 push 都有配对的裁剪', () => {
   }
 });
 
+// ——————————————————————————————————————————————————————————————
+// 时间窗秒数只有一个来源：player.js 的 SAVE_WINDOW_SEC。
+// player.html 的按钮文案 / title、README 那一节，都是**独立文本** ——
+// 靠"记得一起改"防不住（同类问题已经第三次：四处断言数 / 两份 provider 清单 / 这里）。
+//
+// ⚠️ 钉的是「**一致**」，不是钉死某个数字：
+//    常量改成 60、三处文案一起改，**仍然应该绿**。
+// ——————————————————————————————————————————————————————————————
+function windowSecFromSource() {
+  const js = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const m = js.match(/const SAVE_WINDOW_SEC = (\d+);/);
+  if (!m) throw new Error('没找到 SAVE_WINDOW_SEC 定义 —— 判据本身失效了');
+  const sec = Number(m[1]);
+  if (!Number.isFinite(sec) || sec <= 0) throw new Error(`SAVE_WINDOW_SEC 的值不合理：${m[1]}`);
+  return { sec, js };
+}
+
+check('时间窗秒数：player.js 自己的文案不许写死秒数', () => {
+  const { js } = windowSecFromSource();
+  const hard = js.match(/不足 \d+s/);
+  if (hard) throw new Error(`player.js 里写死了秒数「${hard[0]}」—— 应该引用 SAVE_WINDOW_SEC`);
+});
+
+check('时间窗秒数：player.html 的按钮文案与 title 和常量一致', () => {
+  const { sec } = windowSecFromSource();
+  const html = fs.readFileSync(path.join(process.cwd(), 'player', 'player.html'), 'utf8');
+  const btn = html.match(/存音频\+日志\((\d+)s\)/);
+  if (!btn) throw new Error('player.html 里没找到「存音频+日志(NNs)」—— 判据失效');
+  if (Number(btn[1]) !== sec) throw new Error(`按钮文案是 ${btn[1]}s，常量是 ${sec}s`);
+  const ttl = html.match(/把最近 (\d+) 秒的音频/);
+  if (!ttl) throw new Error('player.html title 里没找到「把最近 NN 秒的音频」—— 判据失效');
+  if (Number(ttl[1]) !== sec) throw new Error(`title 说 ${ttl[1]} 秒，常量是 ${sec} 秒`);
+});
+
+check('时间窗秒数：README 那一节里的秒数和常量一致', () => {
+  const { sec } = windowSecFromSource();
+  const lines = fs.readFileSync(path.join(process.cwd(), 'README.md'), 'utf8').split('\n');
+  const start = lines.findIndex((l) => l.startsWith('### 存下「最近'));
+  if (start < 0) throw new Error('README 里没找到那一节的标题 —— 判据失效');
+  let end = lines.findIndex((l, i) => i > start && l.startsWith('### '));
+  if (end < 0) end = lines.length;
+  const seg = lines.slice(start, end).join('\n');
+  const found = [...seg.matchAll(/(\d+)\s*秒|\((\d+)s\)/g)].map((mm) => Number(mm[1] ?? mm[2]));
+  // ⚠️ 守卫：正则一旦匹配不到东西，下面的比较会**恒真**
+  if (found.length < 5) {
+    throw new Error(`那一节里只匹配到 ${found.length} 处秒数（预期 ≥5）—— 判据可能失效`);
+  }
+  const bad = [...new Set(found.filter((n) => n !== sec))];
+  if (bad.length) throw new Error(`那一节里有 ${bad.join('、')} 秒，常量是 ${sec} 秒`);
+});
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);

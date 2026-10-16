@@ -396,7 +396,7 @@ async function saveAudioAndLog() {
       wavBlob = new Blob([encodeWav(pcm, pcmRing.sampleRate)], { type: 'audio/wav' });
       audioNote =
         `音频 ${take.toFixed(1)}s(${pcm.length} 样本 @ ${pcmRing.sampleRate}Hz` +
-        `${take < SAVE_WINDOW_SEC ? '，不足 30s:采集开始不久' : ''})`;
+        `${take < SAVE_WINDOW_SEC ? `，不足 ${SAVE_WINDOW_SEC}s:采集开始不久` : ''})`;
     }
   } catch (e) {
     audioNote = `音频导出失败 · ${e?.message || e}`;
