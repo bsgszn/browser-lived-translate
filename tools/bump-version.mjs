@@ -47,6 +47,59 @@ if (!/^\d+(\.\d+){1,3}$/.test(next)) {
   process.exit(1);
 }
 
+/**
+ * ⚠️ 工作区不干净就**拒绝运行** —— 而且必须在**动任何文件之前**检查。
+ *
+ * 这条守卫补的是一个真实发生过的洞。`tools/README.md` 里那条约定是
+ * 「先提交修复（带详细消息）→ 再 bump-version」，但那个约定**假设了 commit 会成功**：
+ *
+ *   ① 有人用 `node -e` 写中文提交信息 → PowerShell 吃掉引号 → **commit 失败** ✗
+ *   ② 而他脚本的下一行照样跑了 bump-version
+ *   ③ 失败之前那句 `git add -A` **已经把修复暂存了**
+ *   ④ 本脚本末尾的 `commitAll` 又 `git add -A` 一次 → **把修复一起卷进了版本提交** ✗
+ *   → 结果：一条消息只有 `v2.66.52` 的提交里藏着真实改动，
+ *     `git log` 读起来像"这条只改了版本号"，而实际改动在里头。
+ *
+ * 所以这里检查的不是"有没有改动"，而是"**上一步是不是失败了**" ——
+ * **干净的工作区才是"上一步成功"的唯一证据**。
+ *
+ * 检查放在这里（写 manifest.json 之前），因为本脚本自己马上就会弄脏工作区，
+ * 放到后面再检查等于白检查。
+ *
+ * ⚠️ `isDirty` 用的是 `git status --porcelain`，它把**已暂存 / 未暂存 / 未跟踪**三类都算进来 ——
+ * 这正是我们要的：末尾那个 `commitAll` 的 `git add -A` 三类都会卷走。
+ *
+ * ⚠️ `isDirty` 返回 `null` 表示"问不出来"（没装 git / 不是仓库）。
+ * 那种情况本脚本末尾本来就会跳过提交，所以**放行**，不要在这里拦。
+ */
+const dirty = isDirty();
+if (dirty === true) {
+  if (process.env.LIVEDUB_ALLOW_DIRTY) {
+    console.log(
+      '\n⚠️ 工作区不干净，但你设了 LIVEDUB_ALLOW_DIRTY —— 照常升版本。\n' +
+        '   注意：本脚本末尾那次提交会把下面这些改动**一起**提交进去。',
+    );
+  } else {
+    console.error(
+      '\n✗ 工作区不干净，拒绝升版本。\n' +
+        '\n' +
+        '  这条守卫拦的是「上一步的 commit 失败了，但脚本继续往下跑」——\n' +
+        '  那种情况下，本脚本末尾的提交会把你的改动一起卷进那条只有版本号的提交里。\n' +
+        '\n' +
+        '  先看看有什么：\n' +
+        '    git status\n' +
+        '    git diff --cached --stat    # 已暂存的（最可疑：commit 失败时会留下这个）\n' +
+        '\n' +
+        '  如果是你的修复还没提交 —— 那正是本项目的约定：**先提交修复，再升版本**。\n' +
+        '    git commit -F <提交信息文件>\n' +
+        '\n' +
+        '  确实要在脏工作区下升版本（不推荐）：\n' +
+        `    LIVEDUB_ALLOW_DIRTY=1 node tools/bump-version.mjs ${arg}`,
+    );
+    process.exit(1);
+  }
+}
+
 manifest.version = next;
 fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
 
