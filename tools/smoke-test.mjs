@@ -4175,7 +4175,101 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
     const hits = src.match(/0\.03/g) || [];
     if (hits.length > 1) throw new Error(`vad.js 里 "0.03" 出现了 ${hits.length} 次 —— 阈值被复制成了两份`);
     if (!/loudRms\s*=\s*HUMAN_LEVEL_RMS/.test(src)) throw new Error('findLullCut 的 loudRms 默认值不是 HUMAN_LEVEL_RMS');
-    if (!/lastInputRms\s*>\s*HUMAN_LEVEL_RMS/.test(src)) throw new Error('"疑似 VAD 失效"那处没有用 HUMAN_LEVEL_RMS');
+    /**
+     * ⚠️ 这里原来还有一条 `/lastInputRms\s*>\s*HUMAN_LEVEL_RMS/` —— 已删 ✗
+     * 它验的是**源码那一行长什么样**，而不是**行为对不对**：
+     * 判据一改它必红，而它红了不代表功能坏了（这一轮为此栽过两次）。
+     * 下面这批改成驱动真模块的**行为断言** ✓
+     */
+  });
+
+  /**
+   * ⚠️ VAD 心跳那两处诊断的回归。全部驱动**真模块**，不查源码形状 ✓
+   *
+   * 数值全部来自实测（那份真素材，20 秒 16kHz 单声道）:
+   *   · 有内容的流整体 RMS **0.012**，逐帧只有 **4%** 超过 0.03
+   *   · 同一段流里**真的安静**的片段 **0.0009~0.0012**
+   *   · 离线喂 640 窗:>0.5 的帧占 **13.6%** ⇒ 凑不满连续 7 帧
+   */
+  const REP = (n, x) => Array.from({ length: n }, () => x);
+  const MKR = (spec) => spec.map((x) => (typeof x === 'object' ? x : { rms: x, p: 0.01 }));
+  const QUIET_RMS = 0.0011;
+  const SPEECH_RMS = 0.012;
+  const GATE_OPTS = { threshold: 0.5, minSpeechMs: 250, frameMs: 40 }; // ⇒ 开口需要 7 帧
+
+  check('VAD 诊断：电平正常而 VAD 一直不认时，警告会响（旧判据在实测那种流上永远不响）', () => {
+    const base = MKR([...REP(72, QUIET_RMS), ...REP(168, SPEECH_RMS)]);
+    const recent = MKR([...REP(78, { rms: SPEECH_RMS, p: 0.01 }), { rms: 0.04, p: 0.02 }, { rms: 0.04, p: 0.02 }]);
+    const loudPct = recent.filter((x) => x.rms > v.HUMAN_LEVEL_RMS).length / recent.length;
+    if (loudPct >= 0.3) throw new Error('测试数据没复刻出实测那种流（旧口径应当够不着）');
+    const st = v.vadLevelStats({ recent, baseline: base }, GATE_OPTS);
+    if (!st.deaf) throw new Error('电平正常而 VAD 一直不认，deaf 却没响');
+    if (!/疑似 VAD 失效/.test(v.vadLevelLine(st))) throw new Error('那行没带上警告');
+  });
+
+  check('VAD 诊断：整条流接近无声时不许误报', () => {
+    const f = MKR(REP(80, { rms: QUIET_RMS, p: 0.0002 }));
+    const st = v.vadLevelStats({ recent: f, baseline: MKR(REP(240, QUIET_RMS)) }, GATE_OPTS);
+    if (st.deaf || st.sparse) throw new Error('接近无声的流报了 VAD 失效');
+  });
+
+  check('VAD 诊断：人停下来（电平掉回底噪）不许误报', () => {
+    const base = MKR([...REP(160, SPEECH_RMS), ...REP(80, QUIET_RMS)]);
+    const recent = MKR(REP(80, { rms: QUIET_RMS, p: 0.001 }));
+    const st = v.vadLevelStats({ recent, baseline: base }, GATE_OPTS);
+    if (st.deaf || st.sparse) throw new Error('人停下来时报了 VAD 失效');
+  });
+
+  check('VAD 诊断：认得太稀（凑不满一次开口）会单独报出来', () => {
+    const base = MKR([...REP(72, QUIET_RMS), ...REP(168, SPEECH_RMS)]);
+    const recent = REP(80, { rms: SPEECH_RMS, p: 0.01 }).map((x, i) => ({ ...x, p: i % 8 === 0 ? 0.9 : 0.01 }));
+    const st = v.vadLevelStats({ recent, baseline: base }, GATE_OPTS);
+    if (st.maxRun >= st.need) throw new Error('测试数据没复刻出"稀疏"');
+    if (!st.sparse) throw new Error('认得太稀却没报出来');
+    if (st.deaf) throw new Error('偶尔认得出，不该报"一直不认"');
+    if (!/认得太稀/.test(v.vadLevelLine(st))) throw new Error('那行没说明原因');
+  });
+
+  check('VAD 诊断：「有声」那栏带参照物（常态/开口需几帧），缺值印 ?', () => {
+    const f = MKR(REP(80, { rms: SPEECH_RMS, p: 0.9 }));
+    const st = v.vadLevelStats({ recent: f, baseline: f }, GATE_OPTS);
+    const line = v.vadLevelLine(st, { seconds: 3 });
+    /**
+     * ⚠️ 这里**必须验值**，不能验标签在不在 ✗
+     * 第一版写的是 `/常态/.test(line)` —— 于是把值换成 `--` 它照样绿（变异 M6 抓到）✗
+     * 那正是"验了符号存在、没验它起作用"。
+     */
+    if (!new RegExp(`常态 ${st.quietFloor.toFixed(4)}`).test(line)) {
+      throw new Error(`没印该流的常态电平（应出现 常态 ${st.quietFloor.toFixed(4)}）：${line}`);
+    }
+    if (!new RegExp(`开口需 ${st.need} 帧`).test(line)) throw new Error(`没印开口需要几帧（应出现 开口需 ${st.need} 帧）`);
+    if (!new RegExp(`连续 ${st.maxRun} 帧`).test(line)) throw new Error(`没印最长连续多少帧（应出现 连续 ${st.maxRun} 帧）`);
+    if (!/有声/.test(line)) throw new Error('那栏的名字没了');
+    const emptyLine = v.vadLevelLine(v.vadLevelStats({ recent: [], baseline: [] }, GATE_OPTS));
+    if (/undefined|NaN/.test(emptyLine)) throw new Error(`空输入印出了 undefined/NaN：${emptyLine}`);
+    /**
+     * ⚠️ 同理:光验"这一行里有 ?"是不够的 ✗ —— 百分比和秒数那两处各自就会印 `?`，
+     * 所以把 `num` 改成不印 `?` 之后它照样绿（变异 M7 抓到）✗
+     * 必须**指名道姓**地验那两个由 `num` 产生的格子 ✓
+     */
+    if (!/常态 \?/.test(emptyLine)) throw new Error(`空输入时"常态"那格该印 ?：${emptyLine}`);
+    if (!/概率峰值 \?/.test(emptyLine)) throw new Error(`空输入时"概率峰值"那格该印 ?：${emptyLine}`);
+  });
+
+  /**
+   * ⚠️ 这一条钉的是**那一栏的尺度**：它必须相对该流自己的底噪。
+   * 实测那种流上，按绝对门槛（HUMAN_LEVEL_RMS）算只有约 4%，
+   * 读起来就是"没人说话" ✗ —— 而那正是"把读日志的人带偏"的原因。
+   */
+  check('VAD 诊断：「有声」占比用相对底噪的口径（按绝对门槛会恒在个位数）', () => {
+    const base = MKR([...REP(72, QUIET_RMS), ...REP(168, SPEECH_RMS)]);
+    const recent = MKR(REP(80, { rms: SPEECH_RMS, p: 0.01 }));
+    const absPct = recent.filter((x) => x.rms > v.HUMAN_LEVEL_RMS).length / recent.length;
+    if (absPct > 0.2) throw new Error('测试数据没复刻出实测那种流（绝对口径应当只有个位数）');
+    const st = v.vadLevelStats({ recent, baseline: base }, GATE_OPTS);
+    if (!(st.activeRatio > 0.8)) {
+      throw new Error(`相对口径下"有声"只有 ${(st.activeRatio * 100).toFixed(0)}%，应当接近满 —— 口径没改成相对的`);
+    }
   });
 
   /**
