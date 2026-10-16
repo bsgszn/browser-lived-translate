@@ -6,6 +6,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+// 纯函数，不碰 chrome —— 所以可以静态导入（在下面那个 chrome 桩之前求值也没问题）。
+import { pushDiagPair, diagWindow } from '../lib/diag-window.js';
 
 /**
  * 剥掉注释再拿去做正则检查。
@@ -7220,6 +7222,130 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
       `且 tools/snapshot-preview.cjs 的 fakeTrack 里也有这三项。` +
       ` 实际: 快照没读=${JSON.stringify(reads)} 预览缺=${JSON.stringify(pvMissing)}`,
   );
+}
+
+/**
+ * 诊断日志的窗口切片（`lib/diag-window.js`）。
+ *
+ * 为什么要有这一组：那两处行为住在 `player/player.js`（页面脚本，这里加载不了），
+ * 所以把算法搬进 lib 才测得到 —— 而它们各有一条**不能靠肉眼发现**的错法：
+ *   ① 两个数组（日志 / 时间戳）只改一处 → 日志和音频对不上，极难查
+ *   ② 窗口边界把 `>=` 写成 `>` → 少一行，没人看得出来
+ */
+{
+  // —— pushDiagPair：成对写入 + 成对裁剪 ——
+  {
+    const L = [];
+    const T = [];
+    const wrote = pushDiagPair(L, T, 'a', 100, 3);
+    check('诊断日志 pushDiagPair 真的写入并返回 true', wrote === true && L.length === 1 && T[0] === 100,
+      `实际 wrote=${wrote} L=${JSON.stringify(L)} T=${JSON.stringify(T)}`);
+
+    const dup = pushDiagPair(L, T, 'a', 200, 3);
+    check('诊断日志 连续重复行被跳过（且不写时间戳）',
+      dup === false && L.length === 1 && T.length === 1,
+      `实际 dup=${dup} L=${JSON.stringify(L)} T=${JSON.stringify(T)}`);
+
+    pushDiagPair(L, T, 'b', 300, 3);
+    pushDiagPair(L, T, 'c', 400, 3);
+    pushDiagPair(L, T, 'd', 500, 3);
+    check('诊断日志 超过 keep 时从头丢，保留最后 keep 行',
+      L.join(',') === 'b,c,d' && T.join(',') === '300,400,500',
+      `实际 L=${JSON.stringify(L)} T=${JSON.stringify(T)}（期望 b,c,d / 300,400,500）`);
+    check('诊断日志 裁剪后两个数组仍然等长（成对裁剪）', L.length === T.length && L.length === 3,
+      `实际 L=${L.length} T=${T.length}`);
+
+    // 脏时间戳不该写进 times 破坏"等长 + 可比较"
+    const L2 = [];
+    const T2 = [];
+    pushDiagPair(L2, T2, 'x', NaN, 10);
+    pushDiagPair(L2, T2, 'y', undefined, 10);
+    check('诊断日志 脏时间戳落成有限值（不会让后续比较全变 false）',
+      T2.length === 2 && T2.every((v) => Number.isFinite(v)),
+      `实际 T2=${JSON.stringify(T2)}`);
+  }
+
+  // —— diagWindow：窗口切片 ——
+  {
+    const times = [1000, 2000, 3000, 4000, 5000];
+
+    const w1 = diagWindow(times, 2500);
+    check('diagWindow 切出窗口内的行（从第一个 >= cutMs 开始）',
+      w1.from === 2 && !w1.empty && w1.oldestMs === 1000,
+      `实际 ${JSON.stringify(w1)}（期望 from=2）`);
+
+    // ⚠️ 边界：正好等于 cutMs 的那一行必须算进来
+    const w2 = diagWindow(times, 3000);
+    check('diagWindow 边界取 >=：正好等于 cutMs 的那行算进来', w2.from === 2 && !w2.empty,
+      `实际 ${JSON.stringify(w2)}（期望 from=2，不是 3 —— 那是 > 的行为）`);
+
+    const w3 = diagWindow(times, 5000);
+    check('diagWindow 只剩最后一行时 from 落在最后一项', w3.from === 4 && !w3.empty,
+      `实际 ${JSON.stringify(w3)}`);
+
+    const w4 = diagWindow(times, 99999);
+    check('diagWindow 所有行都比窗口旧 → 空窗口，from 落在末尾',
+      w4.from === times.length && w4.empty === true && w4.oldestMs === 1000,
+      `实际 ${JSON.stringify(w4)}（期望 from=5 empty=true oldestMs=1000）`);
+
+    const w5 = diagWindow(times, 0);
+    check('diagWindow 窗口覆盖全部（cutMs 很小）→ from=0', w5.from === 0 && !w5.empty,
+      `实际 ${JSON.stringify(w5)}`);
+
+    // —— 脏值一律"空窗口"，绝不抛 ——
+    const dirty = [
+      ['空数组', [], 1000, 0],
+      ['cutMs = NaN', times, NaN, times.length],
+      ['cutMs = undefined', times, undefined, times.length],
+      ['cutMs = Infinity', times, Infinity, times.length],
+      ['times 全是脏值', [NaN, undefined, -Infinity], 0, 3],
+    ];
+    let dirtyOk = true;
+    const dirtyFail = [];
+    for (const [name, tt, cut, wantFrom] of dirty) {
+      try {
+        const w = diagWindow(tt, cut);
+        if (w.empty !== true || w.from !== wantFrom) {
+          dirtyOk = false;
+          dirtyFail.push(`${name}: ${JSON.stringify(w)}（期望 from=${wantFrom} empty=true）`);
+        }
+      } catch (e) {
+        dirtyOk = false;
+        dirtyFail.push(`${name}: 抛了 ${e?.message || e}`);
+      }
+    }
+    check('diagWindow 脏值一律当空窗口、绝不抛（这个功能是在出问题时用的，它自己不能成为新的出错点）',
+      dirtyOk, dirtyFail.join(' | '));
+
+    check('diagWindow 空数组时 oldestMs 为 null（调用方据此显式写出"0s 前的记录"）',
+      diagWindow([], 0).oldestMs === null, `实际 ${JSON.stringify(diagWindow([], 0))}`);
+
+    // 脏时间戳在中间：`>=` 对脏值天然为假，所以起点会跳过它
+    const w6 = diagWindow([NaN, 5000, 6000], 1000);
+    check('diagWindow 跳过脏时间戳找到第一个有效且 >= cutMs 的项', w6.from === 1 && !w6.empty,
+      `实际 ${JSON.stringify(w6)}（期望 from=1）`);
+  }
+
+  // —— 跨文件核对：播放页必须走这两个函数，不许自己 push/splice ——
+  {
+    const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+    const usesPair = /pushDiagPair\s*\(\s*diagLines\s*,\s*diagTimes\s*,/.test(pj);
+    const usesWin = /diagWindow\s*\(\s*diagTimes\s*,/.test(pj);
+    check('播放页的日志写入走 pushDiagPair（成对 push / 成对裁剪收在一处）', usesPair,
+      '需要在 player.js 里看到 pushDiagPair(diagLines, diagTimes, …)');
+
+    const stray = [
+      ['diagLines.push(', /diagLines\.push\s*\(/],
+      ['diagTimes.push(', /diagTimes\.push\s*\(/],
+      ['diagLines.splice(', /diagLines\.splice\s*\(/],
+      ['diagTimes.splice(', /diagTimes\.splice\s*\(/],
+    ].filter(([, re]) => re.test(pj)).map(([n]) => n);
+    check('播放页里没有绕开 pushDiagPair 的裸 push/splice（只改一处就会让两个数组错位）',
+      stray.length === 0, `发现: ${JSON.stringify(stray)}`);
+
+    check('播放页的窗口切片走 diagWindow（边界 >= 只在 lib 里定义一次）', usesWin,
+      '需要在 player.js 里看到 diagWindow(diagTimes, cutMs)');
+  }
 }
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);

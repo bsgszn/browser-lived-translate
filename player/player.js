@@ -20,6 +20,9 @@ import { Resampler, float32ToInt16, rms, noteDue } from '../lib/util.js';
 import { UtteranceAccumulator } from '../lib/utterance.js';
 import { PcmRing, encodeWav } from '../lib/pcm-ring.js';
 import { createRefiner } from '../lib/asr/refine.js';
+// 诊断日志的追加与窗口切片收在 lib/diag-window.js —— 页面脚本在 smoke-test 里加载不了，
+// 而「两个数组必须等长」和「窗口边界取 >=」这两条行为需要断言守住。
+import { pushDiagPair, diagWindow } from '../lib/diag-window.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
 import {
   DelayedPlayback,
@@ -193,15 +196,8 @@ function diag(line, toConsole) {
     }
   }
   // 连续重复的行不再刷屏，但计数器要让位给下一条真实日志
-  if (diagLines[diagLines.length - 1] === text) return;
-  diagLines.push(text);
-  diagTimes.push(performance.now());
-  if (diagLines.length > DIAG_KEEP) {
-    const drop = diagLines.length - DIAG_KEEP;
-    diagLines.splice(0, drop);
-    diagTimes.splice(0, drop);
-  }
-  renderDiag();
+  // （成对 push + 成对裁剪收在 pushDiagPair 里，免得两个数组哪天只改了一处）
+  if (pushDiagPair(diagLines, diagTimes, text, performance.now(), DIAG_KEEP)) renderDiag();
 }
 
 function renderDiag() {
@@ -394,10 +390,10 @@ async function saveAudioAndLog() {
   }
 
   // —— 日志:按时间戳切同一个窗口 ——
-  let from = diagTimes.findIndex((t) => t >= cutMs);
-  if (from < 0) from = diagLines.length;
-  const lines = diagLines.slice(from);
-  const times = diagTimes.slice(from);
+  // 起点算法收在 lib/diag-window.js（边界取 >=，正好等于 cutMs 的那行算进来）
+  const win = diagWindow(diagTimes, cutMs);
+  const lines = diagLines.slice(win.from);
+  const times = diagTimes.slice(win.from);
   const body = lines.map((t, i) => `[+${((times[i] - DIAG_T0) / 1000).toFixed(3)}s] ${t}`).join('\n');
 
   const logText =
@@ -406,7 +402,7 @@ async function saveAudioAndLog() {
     `窗口:最近 ${SAVE_WINDOW_SEC} 秒(音频与日志同一基准 performance.now())\n` +
     `${audioNote}\n` +
     (lines.length ? '' : '(这一窗口内没有日志行 —— 缓冲区最早只有 ' +
-      `${diagLines.length ? ((performance.now() - diagTimes[0]) / 1000).toFixed(1) : '0'}s 前的记录)\n`) +
+      `${win.oldestMs !== null ? ((performance.now() - win.oldestMs) / 1000).toFixed(1) : '0'}s 前的记录)\n`) +
     `---\n${body || '(空)'}\n` +
     `${snapshotLine('导出时')}\n`;
 
