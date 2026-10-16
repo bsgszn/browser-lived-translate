@@ -1272,11 +1272,6 @@ function scheduleUtterance(u) {
   // 记下这一句的识别文本；显示文本等它真的上屏时再回填（见 diagLate）。
   // ⚠️ 用上面刚生成的局部 `id`，不要用 `item.id` —— L1193 判过 `if (item)`，
   //    也就是说 `item` 可能是 undefined（排期没接住这个条目），而 `id` 一定在。
-  // MUTATED: 去掉记录
-  if (subLog.length > SUBLOG_KEEP) subLog.shift();
-  // 记下这一句的识别文本；显示文本等它真的上屏时再回填（见 diagLate）。
-  // ⚠️ 用上面刚生成的局部 `id`，不要用 `item.id` —— L1193 判过 `if (item)`，
-  //    也就是说 `item` 可能是 undefined（排期没接住这个条目），而 `id` 一定在。
   subLog.push({ t: performance.now(), id, asr: String(text || ''), shown: null });
   if (subLog.length > SUBLOG_KEEP) subLog.shift();
   diag(
