@@ -177,7 +177,7 @@ const diagLines = [];
  * 与 `diagLines` 一一对应的**单调**时间戳（`performance.now()`）。
  *
  * ⚠️ 只用 `performance.now()`，**不要 `Date.now()`** —— 后者会被系统对时改掉，
- * 切出来的「那 20 秒」就会错位。基准是 `DIAG_T0`（本模块加载那一刻）。
+ * 切出来的「那 30 秒」就会错位。基准是 `DIAG_T0`（本模块加载那一刻）。
  *
  * ⚠️ 面板和「复制日志」**不显示**时间戳（保持原来的可读性），
  * 只有**导出的 .log 文件**里会带上 —— 那里才需要和音频对齐。
@@ -344,7 +344,7 @@ async function copyDiag() {
  *
  * ⚠️ 导出的音频是 **ASR 实际吃到的那一份**（16kHz 单声道 int16），不是采集流。
  * 只有这样才能保证重放逐字节相同、结果可复现。它同时也是识别校正用的那份缓冲
- * （`pcmRing`，90 秒），所以这里不需要另建缓冲 —— 切最后 20 秒即可。
+ * （`pcmRing`，90 秒），所以这里不需要另建缓冲 —— 切最后 30 秒即可。
  *
  * ⚠️ **隐私:必须是用户主动点。** 这个扩展的卖点是「音频不出本机」，
  * 所以绝不自动存、不在后台存、不在出错时自动存。存下来的文件在用户自己机器上，
@@ -352,7 +352,7 @@ async function copyDiag() {
  *
  * ⚠️ 任何一步失败都不许抛 —— 打日志/导出绝不能把播放搞挂。
  */
-const SAVE_WINDOW_SEC = 20;
+const SAVE_WINDOW_SEC = 30;
 
 function downloadBlob(blob, filename) {
   if (!blob) return;
@@ -369,7 +369,7 @@ function downloadBlob(blob, filename) {
 async function saveAudioAndLog() {
   const cutMs = performance.now() - SAVE_WINDOW_SEC * 1000;
 
-  // —— 音频:从已有的 90 秒环形缓冲里切最后 20 秒 ——
+  // —— 音频:从已有的 90 秒环形缓冲里切最后 30 秒 ——
   let wavBlob = null;
   let audioNote = '';
   try {
@@ -383,7 +383,7 @@ async function saveAudioAndLog() {
       wavBlob = new Blob([encodeWav(pcm, pcmRing.sampleRate)], { type: 'audio/wav' });
       audioNote =
         `音频 ${take.toFixed(1)}s(${pcm.length} 样本 @ ${pcmRing.sampleRate}Hz` +
-        `${take < SAVE_WINDOW_SEC ? '，不足 20s:采集开始不久' : ''})`;
+        `${take < SAVE_WINDOW_SEC ? '，不足 30s:采集开始不久' : ''})`;
     }
   } catch (e) {
     audioNote = `音频导出失败 · ${e?.message || e}`;
