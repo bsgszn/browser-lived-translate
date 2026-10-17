@@ -22,7 +22,7 @@ import { PcmRing, encodeWav } from '../lib/pcm-ring.js';
 import { createRefiner } from '../lib/asr/refine.js';
 // 诊断日志的追加与窗口切片收在 lib/diag-window.js —— 页面脚本在 smoke-test 里加载不了，
 // 而「两个数组必须等长」和「窗口边界取 >=」这两条行为需要断言守住。
-import { pushDiagPair, diagWindow } from '../lib/diag-window.js';
+import { pushDiagPair, diagWindow, formatAlignNote } from '../lib/diag-window.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
 import {
   DelayedPlayback,
@@ -386,9 +386,12 @@ async function saveAudioAndLog() {
   // —— 音频:从已有的 90 秒环形缓冲里切最后 SAVE_WINDOW_SEC 秒 ——
   let wavBlob = null;
   let audioNote = '';
+  /** ⭐ 实际切出来的音频秒数 —— ⑤ 的时间对齐要用它（`take` 在 try 块里，出不来 ✗） */
+  let audioTakeSec = 0;
   try {
     const have = pcmRing ? pcmRing.bufferedSeconds : 0;
     const take = Math.min(SAVE_WINDOW_SEC, have);
+    audioTakeSec = take;
     if (!pcmRing || take <= 0.1) {
       audioNote = '没有音频可导出(采集还没开始,或刚开始)';
     } else {
@@ -452,12 +455,61 @@ async function saveAudioAndLog() {
       ? '(这一窗口内没有记录)'
       : `共 ${subRows.length} 句` + (subLog.length >= SUBLOG_KEEP ? '，缓冲区已满、更早的句被挤掉了' : '');
 
+  /**
+   * ⭐ ⑤ 音频与日志的**时间对齐** —— 原来只能假设"音频起点 = 日志第一行" ✗
+   *
+   * 算法收在 `lib/diag-window.js` 的 `formatAlignNote` 里 ✓ —— 页面脚本在 smoke-test
+   * 里加载不了，凡是需要被断言的行为都得落在 `lib/`（这个模块存在的理由，见它文件头）。
+   */
+  const alignNote = formatAlignNote({
+    audioTakeSec,
+    nowMs,
+    logFromMs: times.length ? times[0] : NaN,
+    logToMs: times.length ? times[times.length - 1] : NaN,
+    lineCount: lines.length,
+    t0: DIAG_T0,
+  });
+
+  /**
+   * ⭐ ④ 配置快照 —— 原来导出头只有 `录制格式` / `视频码率` / `VAD 自检` ✗
+   *
+   * "这句为什么被切成 3.8 秒""那个百分比为什么读不了"这类问题,
+   * 一半的答案在**设置页里** ✗ —— 而日志里没有,只能反过来问用户 ✗。
+   * ⚠️ 取不到就印 `?`,但**不许整行省略**（省略会被读成"这一项不存在" ✗）
+   */
+  const cfg = (get) => {
+    try {
+      const v = typeof get === 'function' ? get() : get;
+      return v === undefined || v === null || v === '' ? '?' : String(v);
+    } catch {
+      return '?';
+    }
+  };
+  const sv = () => settings || {};
+  const configNote =
+    `配置快照(导出时实际生效的值;? = 读不到):\n` +
+    `  识别 ${cfg(() => sv()?.asr?.provider)} · 翻译 ${cfg(() => sv()?.translation?.provider)}` +
+    ` · 目标延迟 ${cfg(() => sv()?.capture?.delaySec)}s` +
+    ` · 帧率上限 ${cfg(() => sv()?.capture?.maxFrameRate)}\n` +
+    `  VAD 阈值 ${cfg(() => sv()?.asr?.vad?.vadThreshold)}` +
+    ` · 静音确认 ${cfg(() => sv()?.asr?.vad?.vadMinSilenceMs)}ms` +
+    ` · 收句静音 ${cfg(() => sv()?.asr?.vad?.vadUtteranceEndMs)}ms` +
+    ` · 单句上限 ${cfg(() => sv()?.asr?.vad?.vadMaxSpeechSec)}s` +
+    ` · 前后留白 ${cfg(() => sv()?.asr?.vad?.vadPadMs)}ms\n` +
+    `  合理断句 ${cfg(() => (sv()?.asr?.vad?.vadSmartCut === false ? '关' : '开'))}` +
+    /** ⚠️ 这一项**目前不参与丢弃判定**（见 lib/asr/vad.js 的注释）—— 但照样印出来，
+     *  否则读日志的人会按它去解释"这句为什么被丢了" ✗ */
+    ` · 最短话段 ${cfg(() => sv()?.asr?.vad?.vadMinUtteranceMs)}ms(⚠ 目前不参与丢弃判定)` +
+    ` · 延迟画面高度上限 ${cfg(() => sv()?.capture?.delayMaxHeight)}\n`;
+
   const logText =
     `livedtranslate 诊断导出 · v${chrome.runtime.getManifest().version}\n` +
     `导出时刻 ${new Date().toISOString()}\n` +
     `窗口:最近 ${SAVE_WINDOW_SEC} 秒(音频与日志同一基准 performance.now())\n` +
     `${audioNote}\n` +
     logCoverNote +
+    alignNote +
+    configNote +
     `---\n${body || '(空)'}\n` +
     `\n=== 识别与显示 · ${subNote} ===\n${subBody || '(空)'}\n` +
     `${snapshotLine('导出时')}\n`;

@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 // 纯函数，不碰 chrome —— 所以可以静态导入（在下面那个 chrome 桩之前求值也没问题）。
-import { pushDiagPair, diagWindow } from '../lib/diag-window.js';
+import { pushDiagPair, diagWindow, formatAlignNote } from '../lib/diag-window.js';
 // 「按锚点改文件」的共用守卫 —— 判断逻辑是纯函数，所以这里能真调它断言。
 import { planReplace } from '../lib/anchor-edit.js';
 
@@ -8908,6 +8908,70 @@ check('时间窗秒数：README 那一节里的秒数和常量一致', () => {
         fs.rmSync(junk, { force: true });
       } catch {}
     }
+  });
+}
+
+console.log('\n[3f] 导出头的「时间对齐」与「电平分布」—— 都是纯函数，直接喂数字');
+{
+  const dw = { formatAlignNote };
+  const vm = loaded['lib/asr/vad.js'];
+  if (typeof dw.formatAlignNote !== 'function') throw new Error('diag-window.js 没有导出 formatAlignNote');
+  if (typeof vm.vadLevelDistLine !== 'function') throw new Error('vad.js 没有导出 vadLevelDistLine');
+
+  const NOW = 160000;
+  const base = { audioTakeSec: 60, nowMs: NOW, logToMs: 159000, lineCount: 180, t0: 0 };
+
+  /**
+   * ⚠️ 可用窗口要说清:警告阈值是 500ms，所以
+   *   · 晚 4000ms 时**必须**警告 ✓
+   *   · 晚 200ms 时**必须不**警告 ✓
+   * 两边都验 —— 否则「一律警告」和「一律不警告」都能让单边断言通过 ✗
+   */
+  check('时间对齐：日志比音频晚 4s → 必须警告（含实际差值 + 那句"别推出没发生"）', () => {
+    const s = dw.formatAlignNote({ ...base, logFromMs: NOW - 56000 });
+    if (!s.includes('音频窗口')) throw new Error('没有音频窗口那一行');
+    if (!s.includes('+100.000s') || !s.includes('+160.000s')) throw new Error('音频窗口起止不对');
+    if (!/日志起点比音频起点晚 4\.0s/.test(s)) throw new Error(`差值没印对：\n${s}`);
+    if (!s.includes('别按"日志里没有"推出"没发生"')) throw new Error('没有那句最重要的话');
+  });
+
+  check('时间对齐：日志只晚 0.2s → **不许**警告（否则这条断言对单边改法无效）', () => {
+    const s = dw.formatAlignNote({ ...base, logFromMs: NOW - 59800 });
+    if (s.includes('日志起点比音频起点晚')) throw new Error(`差 200ms 也警告了（阈值 500ms）：\n${s}`);
+    if (!s.includes('日志首末')) throw new Error('正常情况也要印日志首末');
+  });
+
+  check('时间对齐：窗口内没有日志行 → 明说，而不是印一个 0', () => {
+    const s = dw.formatAlignNote({ audioTakeSec: 12.5, nowMs: NOW, logFromMs: NaN, logToMs: NaN, lineCount: 0, t0: 0 });
+    if (!s.includes('(这一窗口内没有日志行)')) throw new Error(`没有明说：\n${s}`);
+    if (!s.includes('12.5s')) throw new Error('实际音频长度没印');
+  });
+
+  /**
+   * ⚠️ 这一栏存在的理由:心跳那行的 `输入电平` 是**一帧**的值 ✗，
+   * 而判断"这几秒是不是比平时小"要的是**分布** ✓
+   */
+  const dist = vm.vadLevelDistLine(
+    { levelP10: 0.0016, levelP50: 0.0031, levelP90: 0.0122, quietFloor: 0.0011 },
+    { seconds: 30, unopened: 3, beats: 10 },
+  );
+  check('电平分布：p10/p50/p90 三个分位都印出来，且带"常态"参照物', () => {
+    if (!dist.includes('p10 0.0016')) throw new Error(`p10 不对：${dist}`);
+    if (!dist.includes('p50 0.0031')) throw new Error(`p50 不对：${dist}`);
+    if (!dist.includes('p90 0.0122')) throw new Error(`p90 不对：${dist}`);
+    if (!dist.includes('常态 0.0011')) throw new Error(`常态没印：${dist}`);
+  });
+
+  check('电平分布：未开口次数印出来（sparse 只说成不成立，说不出发生几次）', () => {
+    if (!dist.includes('未开口 3 次')) throw new Error(`未开口计数不对：${dist}`);
+    if (!dist.includes('10 次心跳内')) throw new Error('没说明统计了多久');
+  });
+
+  /** ⚠️ 缺值必须是 `?`：印成 `undefined` / `NaN` 会让人以为那个值**存在但坏了** ✗ */
+  check('电平分布：缺值印 ?（不是 undefined / NaN / Infinity）', () => {
+    const s = vm.vadLevelDistLine({}, { seconds: 30, unopened: 0 });
+    if (!s.includes('p10 ?')) throw new Error(`缺值没印 ?：${s}`);
+    if (/undefined|NaN|Infinity/.test(s)) throw new Error(`出现了坏字面量：${s}`);
   });
 }
 
