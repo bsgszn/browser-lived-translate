@@ -2653,6 +2653,36 @@ check('识别热词：拼装规则（去重 / 限词数 / 限总长 / 不动用�
     if (typeof r.text !== 'string') throw new Error(`脏值应当回空串，实际 ${JSON.stringify(r)}`);
   }
 });
+
+/**
+ * 「文本和音频时长对不上」= 幻听（v2.66.65）。
+ *
+ * ⭐ 实测：0.7s 的分片、静音占 480ms（真正语音 ~220ms），Whisper 吐出 9 个字
+ * 「横のボタンを押して」—— 每秒 40 字。真人最快 10~12 字/秒，这只能是编的。
+ */
+check('幻听判据：文本字数 ÷ VAD 语音秒数，太快就当编的', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const F = v.looksTooFastForAudio;
+  if (typeof F !== 'function') throw new Error('vad.js 没有导出 looksTooFastForAudio');
+  // ★ 实测那次：9 字 / 220ms ≈ 41 字/秒 → 必须判为幻听
+  if (!F('横のボタンを押して', 220)) throw new Error('那次 41 字/秒的结果没被拦住');
+  // 正常语速：20 字 / 3 秒 ≈ 6.7 字/秒 → 不许误伤
+  if (F('これはとても長い日本語の文章です', 3000)) throw new Error('正常语速被误判');
+  // 很快但可能：20 字 / 1.5 秒 ≈ 13 字/秒 → 仍在阈值内（20）不判
+  if (F('あ'.repeat(20), 1500)) throw new Error('13 字/秒不该判成幻听');
+  // 再快就不行了：31 字 / 1.5 秒 ≈ 20.7 字/秒
+  if (!F('あ'.repeat(31), 1500)) throw new Error('20.7 字/秒应当判为幻听');
+  // 短应答不判（「はい」这类本来就短）
+  if (F('はい', 100)) throw new Error('短应答不该被这条判据拦');
+  // 拿不到语音时长 → 不判（宁可放过，也别把好句子当幻觉）
+  for (const bad of [NaN, 0, -1, undefined, null, 'x']) {
+    if (F('あ'.repeat(30), bad)) throw new Error(`语音时长非法（${bad}）时不该下结论`);
+  }
+  // 纯标点/空白 → 字数为 0，不判
+  if (F('、、。', 100)) throw new Error('纯标点不该判');
+  // 脏文本不抛
+  if (F(null, 200) || F(undefined, 200)) throw new Error('空文本不该抛，也不该判');
+});
 await checkAsync('识别校正：拿不到置信度时 refine 必须报 ok=false', async () => {
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
   s.asr.provider = 'whisper-chunked';
