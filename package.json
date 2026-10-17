@@ -1,6 +1,6 @@
 {
   "name": "livedub-browser-lived-translate",
-  "version": "2.66.74",
+  "version": "2.66.75",
   "private": true,
   "type": "module",
   "description": "livedtranslate 浏览器同声传译扩展（开发期元数据，扩展运行不读取本文件）",
