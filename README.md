@@ -1,6 +1,6 @@
 # livedtranslate · 浏览器同声传译
 
-![version](https://img.shields.io/badge/version-2.66.70-blue)
+![version](https://img.shields.io/badge/version-2.66.71-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![manifest](https://img.shields.io/badge/Manifest-V3-orange)
 
@@ -559,7 +559,7 @@ VAD · 丢弃一段识别结果 · 命中幻听套话 · 原文「ご視聴あ�
 > 句末统计里单独记成 `空文本接力 N` —— 它**不是**「已拦掉」，恰恰是被救回来的。
 > 只往前带 8 秒（`CARRY_MAX_MS`），且不会越过缓冲区里还剩的音频。
 
-> ⚠️ **「太短的音频配太长的文本」现在只记录、不拦截（v2.66.65 记录，v2.66.70 退回记录）**：
+> ⚠️ **「太短的音频配太长的文本」现在只记录、不拦截（v2.66.65 记录，v2.66.71 退回记录）**：
 > 一句 0.7 秒的分片（静音占 480ms、真正语音只有 ~220ms），Whisper 却能给出 9~14 个字
 > （「横のボタンを押して」「どうもありがとうございました」），等于**每秒 40~60 个字**
 > （真人上限 10~12）—— 那只能是编的。
@@ -1476,7 +1476,7 @@ Deepgram 官方文档（[Smart Formatting](https://developers.deepgram.com/docs/
 **默认开着**，不用勾任何东西。只要开始同传，**字幕上方**就会出现一个面板，第一行是版本号：
 
 ```
-livedtranslate v2.66.70 · 字幕层就绪
+livedtranslate v2.66.71 · 字幕层就绪
 识别 0.4s · 翻译 0.25s
 翻译完成 · 312ms · google-free
 ```
