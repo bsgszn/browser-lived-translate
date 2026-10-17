@@ -2666,6 +2666,10 @@ check('幻听判据：文本字数 ÷ VAD 语音秒数，太快就当编的', ()
   if (typeof F !== 'function') throw new Error('vad.js 没有导出 looksTooFastForAudio');
   // ★ 实测那次：9 字 / 220ms ≈ 41 字/秒 → 必须判为幻听
   if (!F('横のボタンを押して', 220)) throw new Error('那次 41 字/秒的结果没被拦住');
+  // ★★ v2.66.66 的两次漏网（0.7s 分片、静音 480ms → 真正语音 220ms）：
+  //    都是 14 个字 —— 按 0.7s 算正好 20.0 字/秒卡在阈值上，按 0.22s 算 63 字/秒
+  if (!F('横のボタンを押してください', 220)) throw new Error('「横のボタンを押してください」没被拦住');
+  if (!F('どうもありがとうございました', 220)) throw new Error('「どうもありがとうございました」没被拦住');
   // 正常语速：20 字 / 3 秒 ≈ 6.7 字/秒 → 不许误伤
   if (F('これはとても長い日本語の文章です', 3000)) throw new Error('正常语速被误判');
   // 很快但可能：20 字 / 1.5 秒 ≈ 13 字/秒 → 仍在阈值内（20）不判
@@ -2682,6 +2686,29 @@ check('幻听判据：文本字数 ÷ VAD 语音秒数，太快就当编的', ()
   if (F('、、。', 100)) throw new Error('纯标点不该判');
   // 脏文本不抛
   if (F(null, 200) || F(undefined, 200)) throw new Error('空文本不该抛，也不该判');
+});
+
+/**
+ * 「说话时长」的取法（v2.66.67）。
+ *
+ * ⚠️ gate 的 `speechFrames` 在语音态里**每帧都自增**（含没到静音门槛的尾巴），
+ * 所以它约等于**分片总长**。用它算语速，0.7s/14 字正好 20.0 字/秒卡在阈值上 ——
+ * 两次幻听就是这么漏过去的。
+ */
+check('说话时长 = 分片 − 静音（不能用 gate 的 speechFrames）', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const E = v.effectiveSpeechMs;
+  if (typeof E !== 'function') throw new Error('vad.js 没有导出 effectiveSpeechMs');
+  // ① 实测那种：0.7s 分片、静音 480ms → 220ms
+  if (E({ durationMs: 700, silenceMs: 480, vadSpeechMs: 700 }) !== 220) throw new Error('没扣掉静音');
+  // ② 正常句：3.4s、静音 480ms → 2920ms
+  if (E({ durationMs: 3400, silenceMs: 480, vadSpeechMs: 3400 }) !== 2920) throw new Error('正常句算错');
+  // ③ 取小的更保守：gate 报的比实际还小就用它
+  if (E({ durationMs: 3400, silenceMs: 480, vadSpeechMs: 1200 }) !== 1200) throw new Error('应当取更小值');
+  // ④ 静音比总长还长（异常）→ 退回 gate 的值，别给出负数
+  if (E({ durationMs: 500, silenceMs: 900, vadSpeechMs: 500 }) !== 500) throw new Error('负数时长不该出现');
+  // ⑤ 拿不到可信时长 → 原样返回（判据会自己放过）
+  if (!Number.isNaN(E({ durationMs: NaN, silenceMs: 100, vadSpeechMs: NaN }))) throw new Error('脏值应当回 NaN');
 });
 /**
  * 「切得太碎」的提醒（v2.66.66）。
