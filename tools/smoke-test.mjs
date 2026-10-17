@@ -7121,6 +7121,20 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
     '四种状态必须分得开，尤其③（健康启动）绝不能被报成 cannot-append。',
   );
   check(
+    '薄缓冲分类：只有初始化段（几十字节、0 个可播区间）必须单独成一类',
+    // ★ 实测（v2.66.57，静止标签页，4K45）：30 秒只有 36 字节 / 1 片 / 0 个可播区间。
+    //   旧分类会报「缓冲里有数据但画面起不来，卡在采集/编码侧」—— 把用户引向编码器，
+    //   而真正的原因是**源标签页静止**（tabCapture 只在画面有变化时给帧）。
+    T({ elapsedMs: 20000, bytes: 36, ranges: 0, locked: false, delayMs }) === 'no-frames' &&
+      // 但**不能太早**判：起播时限内，36 字节也可能是健康启动的第一片
+      T({ elapsedMs: 5000, bytes: 36, ranges: 0, locked: false, delayMs }) === 'warming' &&
+      // 字节数正常却没有可播区间 → 仍是 never-started（不是"没帧"，是解不出）
+      T({ elapsedMs: 20000, bytes: 57900000, ranges: 0, locked: false, delayMs }) === 'never-started' &&
+      // 有可播区间时哪怕字节少也不算 no-frames（低码率小分片）
+      T({ elapsedMs: 20000, bytes: 36, ranges: 1, locked: false, delayMs }) === 'never-started',
+    '只有初始化段必须报 no-frames（并且要过起播时限才判），别把它当成"进不了 SourceBuffer"。',
+  );
+  check(
     '薄缓冲分类：脏值一律按「不报警」处理（宁可不说，也别引错方向）',
     [
       undefined,
@@ -7546,9 +7560,12 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
     const chain = dp.mimeCandidates({ width: 2560, height: 1440 });
     const modeOf = (m) => plan[chain.indexOf(m)] || 'throw';
     class FakeSB {
-      constructor() {
+      constructor(initOnly = false) {
         this.mode = 'segments';
         this._l = {};
+        // 'tiny' 模式只写初始化段 —— 可播区间必须恒为 0（见下面的 buffered）
+        this._initOnly = initOnly;
+        this._appended = 0;
       }
       addEventListener(t, f) {
         (this._l[t] ||= []).push(f);
@@ -7557,10 +7574,19 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
         this._l[t] = (this._l[t] || []).filter((x) => x !== f);
       }
       appendBuffer() {
+        this._appended += 1;
         for (const f of this._l.updateend || []) f();
       }
       remove() {
         this.appendBuffer();
+      }
+      /**
+       * 可播区间 —— `_hasMediaOutput()` 靠它判"编码器是不是真的出过画面"。
+       * 'tiny'（只有初始化段）恒 0；其它模式压过一次就算 1 段。
+       */
+      get buffered() {
+        const n = !this._initOnly && this._appended > 0 ? 1 : 0;
+        return { length: n, start: () => 0, end: () => (n ? 1 : 0) };
       }
     }
     class FakeMS {
@@ -7580,9 +7606,10 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
       }
       addSourceBuffer(m) {
         if (!m) throw new Error('空 mime');
+        const mode = modeOf(m);
         // 'sbthrow' → 这个候选在"建缓冲"这一步就失败（MSE 不认这个容器）
-        if (modeOf(m) === 'sbthrow') throw new Error('This SourceBuffer type is not supported.');
-        return new FakeSB();
+        if (mode === 'sbthrow') throw new Error('This SourceBuffer type is not supported.');
+        return new FakeSB(mode === 'tiny');
       }
       endOfStream() {
         this.readyState = 'ended';
@@ -7621,6 +7648,9 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
             });
           } else if (mode === 'ok' && this.ondataavailable) {
             this.ondataavailable({ data: { size: 4096, arrayBuffer: async () => new ArrayBuffer(4096) } });
+          } else if (mode === 'tiny' && this.ondataavailable) {
+            // 只写初始化段（实测 36 字节），之后既不出帧也不报错 —— 静止标签页的形态
+            this.ondataavailable({ data: { size: 36, arrayBuffer: async () => new ArrayBuffer(36) } });
           }
         }, 3);
       }
@@ -7832,6 +7862,38 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
       if (last && !(last.fallbacks || []).some((x) => /迟到的 EncodingError/.test(x))) {
         problems.push(`迟到的失败没被记进回落记录: ${JSON.stringify(last.fallbacks)}`);
       }
+      r.pb.stop();
+    }
+
+    /**
+     * ⑨ 只写了一个**初始化段**（36 字节）之后才报错 —— 仍然必须回落。
+     *
+     * ⚠️ 这条是 v2.66.57 的真机日志逼出来的：静止标签页 30 秒只有 36 字节 / 1 片 / 0 个可播区间。
+     * 按 `bytes > 0` 判"已经起来"的话，这种"只吐文件头就停住"的候选会被当成健康，
+     * 迟到的失败永远走不到回落链 ✗ —— 而那 36 字节是 fMP4 的 `ftyp`，放不出任何东西。
+     */
+    {
+      const r = await once(['tiny', 'ok']);
+      if (r.ret !== true) problems.push(`只有初始化段时应当先放行（返回 true），实际 ${r.ret}`);
+      if (r.pb.bytes > 1024) problems.push(`假初始化段不该被当成成片，实际 ${r.pb.bytes} 字节`);
+      if (r.pb._hasMediaOutput()) problems.push('只有 36 字节 + 0 个可播区间时不该判"已出片"');
+      const rec = r.env.made[0];
+      if (rec && rec.onerror) {
+        rec.onerror({
+          error: {
+            name: 'EncodingError',
+            message: 'The given encoder configuration is not supported by the encoder.',
+          },
+        });
+      } else {
+        problems.push('假录制器没有 onerror —— 没法复现"只吐文件头就失败"');
+      }
+      await new Promise((res) => setTimeout(res, 80));
+      if (r.env.calls.length !== 2) {
+        problems.push(`只有初始化段时收到报错，应当换到第 2 个候选，实际试了 ${r.env.calls.length} 个`);
+      }
+      const last = r.statuses.filter((s) => s.phase === 'recording').pop();
+      if (!last || !last.retried) problems.push('只有初始化段之后的回落没带 retried');
       r.pb.stop();
     }
   } finally {

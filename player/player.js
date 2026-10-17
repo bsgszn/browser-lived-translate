@@ -1808,10 +1808,25 @@ function pumpSubtitles() {
        * （前方缓冲被播放头吃光 → 落到"数据进不了 SourceBuffer"，而真正断的是采集）。
        */
       const recorderInactive = playback.recorder?.state === 'inactive' && playback.stopped !== true;
+      /**
+       * ⚠️ 「只有初始化段」要靠**可播区间数**来判，不能只看字节数。
+       * 实测（v2.66.57，静止标签页，4K45）: 记录器 30 秒只输出 **36 字节 / 1 片**，
+       * SourceBuffer 里 **0 个区间** —— 那是 fMP4 的文件头，不是画面。
+       * 当时日志报的是「缓冲里有数据但画面起不来，卡在采集/编码侧」，把用户引向了编码器，
+       * 而真正的原因是**源标签页静止**（tabCapture 只在画面有变化时给帧）。
+       */
+      const sbRanges = (() => {
+        try {
+          return playback.sourceBuffer?.buffered?.length ?? 0;
+        } catch {
+          return 0;
+        }
+      })();
       const thinKind = thin
         ? classifyThinBuffer({
             elapsedMs: recElapsedMs,
             bytes,
+            ranges: sbRanges,
             locked: playback.locked === true,
             delayMs: currentDelayMs(),
             recorderInactive,
@@ -1823,13 +1838,15 @@ function pumpSubtitles() {
           ? ` ⚠ 录制器已经停了（不是我们停的）：采集断了，画面和声音都会停 —— 看上面那条「录制器停了」`
           : thinKind === 'no-output'
             ? ` ⚠ 录制器还没输出任何数据（已 ${Math.round(recElapsedMs / 1000)} 秒）：可能是录制/编码层面没产出`
-            : thinKind === 'never-started'
-              ? ` ⚠ 一直没能起播（已 ${Math.round(recElapsedMs / 1000)} 秒）：缓冲里有数据但画面起不来，卡在采集/编码侧`
-              : thinKind === 'cannot-append'
-                ? ' ⚠ 录制器在输出但缓冲填不上：数据进不了 SourceBuffer'
-                : bytes === 0
-                  ? ' · 录制器还没开始输出（启动初期属正常）'
-                  : ' · 缓冲还在攒（启动初期属正常）';
+            : thinKind === 'no-frames'
+              ? ` ⚠ 只收到一个初始化段（${bytes} 字节、0 个可播区间，已 ${Math.round(recElapsedMs / 1000)} 秒）：编码器一帧画面都没拿到 —— 源标签页可能静止（tabCapture 只在画面有变化时给帧；暂停的视频、纯静态页面都会这样）`
+              : thinKind === 'never-started'
+                ? ` ⚠ 一直没能起播（已 ${Math.round(recElapsedMs / 1000)} 秒）：缓冲里有数据但画面起不来，卡在采集/编码侧`
+                : thinKind === 'cannot-append'
+                  ? ' ⚠ 录制器在输出但缓冲填不上：数据进不了 SourceBuffer'
+                  : bytes === 0
+                    ? ' · 录制器还没开始输出（启动初期属正常）'
+                    : ' · 缓冲还在攒（启动初期属正常）';
       // 缓冲满却还在掉帧 → 卡在解码/编码侧（CPU/GPU 被抢），不是网络
       /**
        * 掉帧改**按比例**判 —— 原来只看绝对条数，于是
@@ -1846,6 +1863,7 @@ function pumpSubtitles() {
        */
       const realFault =
         thinKind === 'no-output' ||
+        thinKind === 'no-frames' ||
         thinKind === 'never-started' ||
         thinKind === 'cannot-append' ||
         thinKind === 'recorder-stopped';
