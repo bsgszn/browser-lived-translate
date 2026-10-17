@@ -3364,9 +3364,6 @@ check('延迟画面可以降分辨率（可选，不是默认）', () => {
   if (!/v >= 2 \? v - \(v % 2\) : 0/.test(src)) throw new Error('evenFloor 没有正确取偶');
   if (!/const w = evenFloor\(/.test(src)) throw new Error('降分辨率的宽度没取偶');
   if (!/const h = evenFloor\(maxHeight\)/.test(src)) throw new Error('降分辨率的高度没取偶');
-  // ⚠️ 采集侧**不该**再有取偶了（v2.66.31 删掉）—— 防止它被无意中加回来
-  if (/evenW|evenH/.test(src)) throw new Error('采集侧的取偶已经删掉了，不该再出现 evenW/evenH');
-  if (/宽高取偶/.test(src)) throw new Error('采集侧取偶的诊断文案已经删掉了，不该再出现');
   if (!/applyConstraints\(\{ width: w, height: h \}\)/.test(src)) throw new Error('没有按高度等比缩放');
   if (!/await playback\.start\(recordStream\)/.test(src)) throw new Error('录音用的还是原始流，缩放没生效');
   // 缩放失败必须退回原样，不能整个起不来
@@ -3378,40 +3375,109 @@ check('延迟画面可以降分辨率（可选，不是默认）', () => {
 });
 
 /**
- * ⚠️ **这里原来有一条"采集侧也要取偶"的断言 —— v2.66.31 删掉了。**
+ * 采集侧的奇数取偶 —— **v2.66.31 删过，v2.66.56 恢复**。
  *
- * 它验的是采集到原始轨之后 `applyConstraints` 取偶那条路。那条路被删了，理由是
- * **收益为零、而代价未知**（详见 `player.js` 里 `startCapture` 那段说明）:
- *   · 收益零 —— "奇数让编码器产不出数据"已被两次实测推翻
- *   · 代价未知 —— `applyConstraints` 在原始 tab-capture 轨上会不会触发逐帧缩放，没测过
+ * ⚠️ 这条断言的历史值得留着，因为它是"两次实测结论下得太早"的标本:
+ *   删的理由写的是"收益为零（两次实测推翻）、代价未知"。而那两次测试
+ *   （canvas 直喂编码器 / 真实采集录出 26.6 MB）**都没有落在**
+ *   `MediaRecorder + avc1+mp4a + 2561×1441@30` 这个确切组合上 ✗
+ *   —— 编码器拒绝的是"**配置**"（codecs + 尺寸 + 帧率 + 码率的组合），换一个维度就不是同一个配置。
  *
- * ⚠️ 它里面关于 `evenFloor` 函数本身的两条断言**没有丢** —— 挪进了上面那条
- * 「延迟画面可以降分辨率」里（那是这个工具现在**唯一**的调用点）。
+ * 真实复现（v2.66.40 用户导出日志）:
+ *     已取得流 · 视频 2561×1441@30
+ *     录制格式 · video/mp4;codecs="avc1.42E01E,mp4a.40.2"
+ *     ⚠ 录制器报错 · EncodingError: The given encoder configuration is not supported by the encoder.
+ *     ⚠ 录制器停了 · 已输出 0 字节／0 片、跑了 0 秒
+ *   → 而字幕照常 → 用户看到「只有字幕，没有画面和声音」✗
+ */
+check('采集侧奇数尺寸要取偶（编码器可能直接拒绝奇数配置，有真实复现）', () => {
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const cap = src.slice(src.indexOf('async function startCapture'), src.indexOf('// —— 延迟画面用的流'));
+  // 必须在拿到视频轨之后、读尺寸算码率之前就取偶
+  const iTrack = cap.indexOf('stream.getVideoTracks()');
+  const iEven = cap.indexOf('evenFloor');
+  const iSize = cap.indexOf('const vs = vtrack.getSettings()');
+  if (iEven < 0) throw new Error('采集侧没有取偶');
+  if (!(iTrack < iEven)) throw new Error('取偶必须在拿到视频轨之后');
+  if (!(iEven < iSize)) throw new Error('取偶必须在读尺寸（算码率）之前 —— 否则码率还是按旧尺寸估的');
+  if (!/applyConstraints\(\{ width: w1, height: h1 \}\)/.test(cap)) throw new Error('取偶没有真的 applyConstraints');
+  // ⚠️ 只有真的是奇数才动 —— 偶数本来就是对的，碰它没有收益
+  if (!/w1 !== w0 \|\| h1 !== h0/.test(cap)) throw new Error('应当只对奇数尺寸动手');
+  /**
+   * ⚠️ 失败必须按原样继续 —— `applyConstraints` 在原始 tab-capture 轨上到底行不行**没实测过**。
+   *
+   * ⚠️ 这里要查的是 **`catch` 里真的赋了 `evenFail`**，不能只查"`evenFail` 这个名字出现过":
+   * 光有 `let evenFail = ''` 也算出现 ✗ —— 变异测试里把 catch 改成 `throw e` 竟然全绿，
+   * 说明那样写等于没验（"验了符号存在、没验它起作用"）。
+   */
+  if (!/evenFail\s*=\s*\(e/.test(cap)) throw new Error('取偶失败没有把原因记下来（异常会冒出去，采集整个坏掉）');
+  if (!/按原样继续/.test(cap)) throw new Error('取偶失败要说明"按原样继续"');
+  /**
+   * 到底改没改、改成什么必须能一眼看到。
+   * ⚠️ 两个分支都要查:「取偶成功/被忽略」和「取偶失败」是**两条不同的文案**，
+   * 只查其中一条的话，改坏另一条不会红（变异测试验证过）。
+   */
+  if (!/奇数尺寸取偶 · \$\{evenNote\}/.test(cap)) throw new Error('诊断里没报取偶结果（成功那一路）');
+  if (!/浏览器没照做/.test(cap)) throw new Error('浏览器忽略取偶时要说明，不能假装改成功了');
+});
+
+/**
+ * ⚠️ **这里原来有一条"采集侧不该再有取偶"的反向断言（v2.66.31 加的）—— 现在删掉了。**
  *
- * ⚠️ 而上面那条里**新增**了两条反向断言（不许再出现 `evenW`/`evenH`/「宽高取偶」），
- * 防止这段被无意中加回来 —— 因为"删掉的东西悄悄长回来"是这个项目见过的形态。
+ * 那条反向断言本来是为了"防止被删掉的东西悄悄长回来"。而 v2.66.56 证明**当初删错了**
+ * （两次"实测推翻"都没落在真正出问题的那个组合上，详见上面那条断言的长注释）。
+ * 所以现在改成**正向**断言，钉住"取偶在、顺序对、失败有兜底" ✓
+ *
+ * ⚠️ 教训不是"反向断言没用"，而是:**反向断言锁住的是一个结论,而结论可能被推翻** ✗
+ *    —— 锁"行为"比锁"某个改动的存在与否"更持久。
  */
 
 check('录制格式必须 H.264 优先（VP9/VP8 多是软件编码，4K 下和本地识别抢 GPU）', () => {
   const dp = loaded['lib/delayed-player.js'];
-  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
-  const list = src.slice(src.indexOf('export function pickMimeType'), src.indexOf('export function isSupported'));
-  const mp4 = list.indexOf('avc1');
-  const vp9 = list.indexOf('vp9');
-  if (mp4 < 0) throw new Error('候选里没有 H.264/avc1');
-  if (!(mp4 < vp9)) throw new Error('H.264 必须排在 VP9 前面');
-  // ⚠️ 必须同时过 MediaRecorder 和 MediaSource ——
-  // 只过前者的话，addSourceBuffer 会失败，整个延迟播放起不来
-  if (!/MediaRecorder\.isTypeSupported\(c\)/.test(list)) throw new Error('没查 MediaRecorder 支持');
-  if (!/MediaSource\.isTypeSupported\(c\)/.test(list)) throw new Error('没查 MediaSource 支持');
   if (typeof dp.pickMimeType !== 'function') throw new Error('没有导出 pickMimeType');
   // 无浏览器环境下应当安全返回空串，而不是抛
   if (dp.pickMimeType() !== '') throw new Error('没有浏览器支持时应当返回空串');
+
+  /**
+   * ⚠️ 这一段原来是**查源码里候选字符串的先后**（`src.slice(indexOf('export function pickMimeType'), …)`
+   * 然后比 `indexOf('avc1')` 和 `indexOf('vp9')`）—— 那是"验源码形状"。
+   * 把候选表提成模块级常量就当场变红，而**代码其实完全正确** ✗（这个项目栽过两次）。
+   * 现在改成**行为式**:假装浏览器全支持，看它真的挑哪个、回落链什么顺序 ✓
+   */
+  const g = globalThis;
+  const savedR = g.MediaRecorder;
+  const savedS = g.MediaSource;
+  try {
+    g.MediaRecorder = { isTypeSupported: () => true };
+    g.MediaSource = { isTypeSupported: () => true };
+    const first = dp.pickMimeType();
+    if (!/avc1|h264/i.test(first)) throw new Error(`全都支持时应当挑 H.264，实际挑了 ${first}`);
+    const chain = dp.mimeFallbacks();
+    const iAvc = chain.findIndex((c) => /avc1|h264/i.test(c));
+    const iVp9 = chain.findIndex((c) => /vp9/i.test(c));
+    const iVp8 = chain.findIndex((c) => /vp8/i.test(c));
+    if (iAvc < 0 || iVp9 < 0 || iVp8 < 0) throw new Error('回落链必须同时含 H.264 / VP9 / VP8');
+    if (!(iAvc < iVp9 && iVp9 < iVp8)) {
+      throw new Error(`回落顺序必须 H.264 → VP9 → VP8，实际下标 ${iAvc}/${iVp9}/${iVp8}`);
+    }
+    // ⚠️ 两个门槛都要查：只过 MediaRecorder 的话 addSourceBuffer 会失败，整个延迟播放起不来
+    g.MediaSource = { isTypeSupported: () => false };
+    if (dp.pickMimeType() !== '') throw new Error('MediaSource 不支持时不该挑中任何格式');
+    if (dp.mimeFallbacks().length !== 0) throw new Error('MediaSource 不支持时回落链应当是空的');
+    g.MediaSource = { isTypeSupported: () => true };
+    g.MediaRecorder = { isTypeSupported: () => false };
+    if (dp.pickMimeType() !== '') throw new Error('MediaRecorder 不支持时不该挑中任何格式');
+  } finally {
+    g.MediaRecorder = savedR;
+    g.MediaSource = savedS;
+  }
 
   // 用了哪个格式必须报出来，否则没法判断是否走了硬件编码
   const player = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   if (!/录制格式 ·/.test(player)) throw new Error('诊断里没报录制格式');
   if (!/通常硬件编码/.test(player)) throw new Error('应当说明 H.264 通常是硬件编码');
+  // 回落过就必须说出来 —— 否则"最后用的是哪个、前面为什么没用"只能靠猜
+  if (!/个录制格式被编码器拒绝/.test(player)) throw new Error('诊断里没报回落过程');
 });
 
 check('「画面顿」必须能区分缓冲不够和算力不够', () => {
@@ -3434,7 +3500,18 @@ check('卡顿必须能抓到"现场"：冻住多久、当时缓冲多少、是�
   if (!/setInterval\(\(\) => this\._probe\(\), 100\)/.test(src)) {
     throw new Error('探测间隔必须比 _tick(400ms) 密得多，否则抓不到短卡顿');
   }
-  const fn = src.slice(src.indexOf('_probe()'), src.indexOf('_probe()') + 1600);
+  const m = /^\s*_probe\(\)\s*\{/m.exec(src);
+  if (!m) throw new Error('没有精细卡顿探测');
+  /**
+   * ⚠️ 这里原来写的是 `src.slice(src.indexOf('_probe()'), … + 1600)` —— **踩了"固定切片"那个坑** ✗
+   * `start()` 里也有一处 `this._probe()`（`setInterval` 那一行），它在**定义之前**，
+   * 于是 `indexOf` 定位到的是**调用点**而不是方法体，1600 个字符根本够不到判据。
+   * 改成:从**定义**（`_probe() {`）开始，切到下一个方法名之前 ✓
+   */
+  const from = src.indexOf('_probe() {');
+  const to = src.indexOf('_pumpChunks', from);
+  if (from < 0) throw new Error('没有精细卡顿探测');
+  const fn = src.slice(from, to > from ? to : from + 2400);
   if (!/dct >= dt \* 0\.5/.test(fn)) throw new Error('没有"播放头前进够不够"的判据');
   for (const k of ['frozenMs', 'aheadSec', 'readyState', 'dropped', 'correcting']) {
     if (!new RegExp(k).test(fn)) throw new Error(`现场状态里缺少 ${k} —— 少一项就分不清是哪类卡顿`);
@@ -7414,39 +7491,323 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
 }
 
 /**
- * 录制器**自己**出错 / 自己停下来时，必须有话说。
+ * 录制器**自己**出错 / 自己停下来时必须有话说；而"编码器拒绝这个格式"时要**自动换下一个**。
  *
  * ⚠️ 这两个事件原来**完全没有 handler** —— 于是故障只剩"字节不涨 / 缓冲填不上"这种
  * **结果**，日志里看不到**原因**。而排查那条"黑屏无声有字幕"最贵的一步，
  * 恰恰是分辨**哪一层**断的。
  *
- * ⚠️ `onstop` 必须用 `this.stopped` 区分"我们停的"和"它自己停的"——
- * 否则每次正常收摊都会报一条"录制器停了" ✗。
+ * ⚠️ 而 v2.66.56 又多了一条要求，这条来自真实用户：
+ * `isTypeSupported` 说支持、`start()` 之后编码器却抛
+ * `EncodingError: The given encoder configuration is not supported by the encoder.`
+ * → **预筛根本拦不住**，只能真的试、不行就退 ✓（见 `mimeFallbacks` 的注释）
+ *
+ * ⚠️ 这一段原来是**查源码里有没有 `this.recorder.onerror =`** —— 纯形状断言 ✗。
+ * 改成**行为式**：装一套假 MediaRecorder/MediaSource 驱动真模块，看它真的怎么反应 ✓
+ * （顺带把"onstop 要用 this.stopped 守卫"也变成可执行的行为，而不是查字符串）
  */
-{
-  const dpSrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
-  const hasErr = /this\.recorder\.onerror\s*=/.test(dpSrc);
-  const hasStop = /this\.recorder\.onstop\s*=/.test(dpSrc);
-  // onstop 体内要有 this.stopped 的守卫
-  const stopBody = (() => {
-    const i = dpSrc.indexOf('this.recorder.onstop');
-    if (i < 0) return '';
-    const j = dpSrc.indexOf('};', i);
-    return j < 0 ? dpSrc.slice(i, i + 400) : dpSrc.slice(i, j + 2);
-  })();
-  const guarded = /this\.stopped/.test(stopBody);
-  // playe r.js 要真的消费这两个 phase（否则 handler 报了也没人看）
+await checkAsync('录制器报错/自己停了必须有话说，且编码器拒绝时能自动回落', async () => {
+  const dp = loaded['lib/delayed-player.js'];
+  const g = globalThis;
+  const saved = {
+    R: g.MediaRecorder,
+    S: g.MediaSource,
+    c: g.URL.createObjectURL,
+    r: g.URL.revokeObjectURL,
+  };
+
+  /**
+   * 装一套假环境。`plan[i]` 决定第 i+1 个候选的录制器怎么表现:
+   *   'ok'      正常吐分片
+   *   'throw'   `start()` 同步抛
+   *   'error'   `onerror` 异步报 EncodingError   ← 真实用户那条
+   *   'nothing' 既不分片也不报错
+   */
+  function install(plan) {
+    const calls = [];
+    const made = [];
+    let idx = 0;
+    class FakeSB {
+      constructor() {
+        this.mode = 'segments';
+        this._l = {};
+      }
+      addEventListener(t, f) {
+        (this._l[t] ||= []).push(f);
+      }
+      removeEventListener(t, f) {
+        this._l[t] = (this._l[t] || []).filter((x) => x !== f);
+      }
+      appendBuffer() {
+        for (const f of this._l.updateend || []) f();
+      }
+      remove() {
+        this.appendBuffer();
+      }
+    }
+    class FakeMS {
+      constructor() {
+        this.readyState = 'closed';
+        this._l = {};
+        setTimeout(() => {
+          this.readyState = 'open';
+          for (const f of this._l.sourceopen || []) f();
+        }, 0);
+      }
+      addEventListener(t, f) {
+        (this._l[t] ||= []).push(f);
+      }
+      removeEventListener(t, f) {
+        this._l[t] = (this._l[t] || []).filter((x) => x !== f);
+      }
+      addSourceBuffer(m) {
+        if (!m) throw new Error('空 mime');
+        // 'sbthrow' → 这个候选在"建缓冲"这一步就失败（MSE 不认这个容器）
+        const i = dp.MIME_CANDIDATES.indexOf(m);
+        if (i >= 0 && plan[i] === 'sbthrow') throw new Error('This SourceBuffer type is not supported.');
+        return new FakeSB();
+      }
+      endOfStream() {
+        this.readyState = 'ended';
+      }
+      static isTypeSupported() {
+        // ⚠️ 一律"宣称支持" —— 这正是要复现的谎报（真实用户那次它也说支持）
+        return true;
+      }
+    }
+    class FakeMR {
+      static isTypeSupported() {
+        return true;
+      }
+      constructor(_stream, opts) {
+        this.mimeType = opts.mimeType;
+        this.state = 'inactive';
+        this.ondataavailable = null;
+        this.onerror = null;
+        this.onstop = null;
+        this._i = idx++;
+        calls.push(this.mimeType);
+        made.push(this);
+      }
+      start() {
+        const mode = plan[this._i] || 'throw';
+        if (mode === 'throw') throw new Error('The given encoder configuration is not supported by the encoder.');
+        this.state = 'recording';
+        setTimeout(() => {
+          if (this.state !== 'recording') return;
+          if (mode === 'error' && this.onerror) {
+            this.onerror({
+              error: {
+                name: 'EncodingError',
+                message: 'The given encoder configuration is not supported by the encoder.',
+              },
+            });
+          } else if (mode === 'ok' && this.ondataavailable) {
+            this.ondataavailable({ data: { size: 4096, arrayBuffer: async () => new ArrayBuffer(4096) } });
+          }
+        }, 3);
+      }
+      stop() {
+        if (this.state === 'inactive') return;
+        this.state = 'inactive';
+        const f = this.onstop;
+        if (f) setTimeout(() => f(), 0);
+      }
+    }
+    g.MediaRecorder = FakeMR;
+    g.MediaSource = FakeMS;
+    g.URL.createObjectURL = () => 'blob:fake';
+    g.URL.revokeObjectURL = () => {};
+    idx = 0;
+    return { calls, made };
+  }
+  function restore() {
+    g.MediaRecorder = saved.R;
+    g.MediaSource = saved.S;
+    g.URL.createObjectURL = saved.c;
+    g.URL.revokeObjectURL = saved.r;
+  }
+  function fakeVideo() {
+    return {
+      src: '',
+      muted: true,
+      preservesPitch: false,
+      currentTime: 0,
+      paused: true,
+      readyState: 0,
+      playbackRate: 1,
+      buffered: { length: 0, start: () => 0, end: () => 0 },
+      removeAttribute() {
+        this.src = '';
+      },
+      load() {},
+      play: () => Promise.resolve(),
+      getVideoPlaybackQuality: () => ({ droppedVideoFrames: 0, totalVideoFrames: 0 }),
+    };
+  }
+  function fakeStream() {
+    return {
+      getVideoTracks: () => [{ getSettings: () => ({ width: 2560, height: 1440, frameRate: 30 }) }],
+      getAudioTracks: () => [{}],
+    };
+  }
+  /** 跑一次 start()，把状态都收下来 */
+  async function once(plan) {
+    const env = install(plan);
+    const statuses = [];
+    const pb = new dp.DelayedPlayback(fakeVideo(), { delaySec: 3, onStatus: (s) => statuses.push(s) });
+    let threw = null;
+    let ret;
+    try {
+      ret = await pb.start(fakeStream());
+    } catch (e) {
+      threw = e;
+    }
+    return { env, statuses, pb, ret, threw };
+  }
+
+  const problems = [];
+  try {
+    // ① 第一个候选就正常 —— 只试一次，不需要回落
+    {
+      const r = await once(['ok']);
+      r.pb.stop();
+      const rec = r.statuses.find((s) => s.phase === 'recording');
+      if (r.threw) problems.push(`正常时不该抛: ${r.threw.message}`);
+      if (r.ret !== true) problems.push(`正常时 start() 应当返回 true，实际 ${r.ret}`);
+      if (r.env.calls.length !== 1) problems.push(`正常时只该试 1 个格式，实际试了 ${r.env.calls.length} 个`);
+      if (!rec) problems.push('正常时没有 recording 状态');
+      else if ((rec.fallbacks || []).length !== 0) problems.push('正常时不该有回落记录');
+    }
+
+    // ② 第一个候选 `start()` 同步抛 → 必须退到下一个
+    {
+      const r = await once(['throw', 'ok']);
+      r.pb.stop();
+      const rec = r.statuses.find((s) => s.phase === 'recording');
+      if (r.threw) problems.push(`同步抛时不该让 start() 抛出来: ${r.threw.message}`);
+      if (r.ret !== true) problems.push(`同步抛时应当退到下一个并返回 true，实际 ${r.ret}`);
+      if (!rec) problems.push('同步抛时没有 recording 状态');
+      else {
+        if (!/avc1\.4D401E|h264/i.test(rec.mimeType || rec.mimeType === '' ? '' : ''))
+          ; // 只要求"不是第一个"，下面统一判
+        if ((rec.fallbacks || []).length !== 1) problems.push(`同步抛时应当记 1 条回落，实际 ${(rec.fallbacks || []).length}`);
+        else if (!/start\(\) 抛错/.test(rec.fallbacks[0])) problems.push(`回落原因没写清是 start() 抛的: ${rec.fallbacks[0]}`);
+      }
+    }
+
+    // ③ 第一个候选**异步**报 EncodingError（真实用户那条）→ 必须退到下一个
+    {
+      const r = await once(['error', 'ok']);
+      r.pb.stop();
+      const rec = r.statuses.find((s) => s.phase === 'recording');
+      if (r.threw) problems.push(`异步报错时不该让 start() 抛出来: ${r.threw.message}`);
+      if (r.ret !== true) problems.push(`异步报错时应当退到下一个并返回 true，实际 ${r.ret}`);
+      if (r.env.calls.length !== 2) problems.push(`异步报错时应当试 2 个格式，实际 ${r.env.calls.length}`);
+      if (!rec) problems.push('异步报错时没有 recording 状态');
+      else if (!(rec.fallbacks || []).some((x) => /EncodingError/.test(x))) {
+        problems.push('异步报错的成因没被记进回落记录（那条报错能解释整个故障，绝不能吞）');
+      }
+    }
+
+    // ④ 全部候选都失败 → **不许抛**，退化成"只报错不出画面"（字幕照常的前提）
+    {
+      const all = ['throw', 'error', 'throw', 'error', 'throw', 'error', 'throw', 'error', 'throw'];
+      const r = await once(all);
+      const failed = r.statuses.find((s) => s.phase === 'recorder-failed');
+      if (r.threw) problems.push(`全部失败时不该抛（抛了字幕也会一起没）: ${r.threw.message}`);
+      if (r.ret !== false) problems.push(`全部失败时 start() 应当返回 false，实际 ${r.ret}`);
+      if (!failed) problems.push('全部失败时没有 recorder-failed 状态');
+      else if (!Array.isArray(failed.tried) || failed.tried.length !== r.env.calls.length) {
+        problems.push(`recorder-failed 里应当带上每个候选的失败原因，实际 ${JSON.stringify(failed.tried)}`);
+      }
+      r.pb.stop();
+    }
+
+    // ⑤ 录制器**自己**停了 → recorder-stopped，且带上字节/分片数
+    {
+      const r = await once(['ok']);
+      const rec = r.env.made[r.env.made.length - 1];
+      if (rec && rec.onstop) rec.onstop();
+      const stopped = r.statuses.find((s) => s.phase === 'recorder-stopped');
+      if (!stopped) problems.push('它自己停了却没有 recorder-stopped 状态');
+      else {
+        if (!(Number(stopped.bytes) > 0)) problems.push(`recorder-stopped 里应当带已输出字节数，实际 ${stopped.bytes}`);
+        if (!(Number(stopped.chunks) > 0)) problems.push(`recorder-stopped 里应当带分片数，实际 ${stopped.chunks}`);
+      }
+      r.pb.stop();
+    }
+
+    // ⑥ **我们**主动停 → 不许报 recorder-stopped（否则每次正常收摊都报警）
+    {
+      const r = await once(['ok']);
+      r.pb.stop();
+      await new Promise((res) => setTimeout(res, 20));
+      if (r.statuses.some((s) => s.phase === 'recorder-stopped')) {
+        problems.push('我们自己停的时候也报了 recorder-stopped —— onstop 少了 this.stopped 守卫');
+      }
+    }
+
+    /**
+     * ⑦ 候选在"**建 SourceBuffer**"这一步就失败（MSE 不认这个容器，而不是编码器拒绝）——
+     * 也必须退到下一个，而且原因要能区分开。
+     *
+     * ⚠️ 这条是**变异测试**逼出来的:早先只覆盖了"`start()` 抛"和"`onerror` 报"两条路，
+     * 于是把 `start()` 外层那个 `catch` 改成 `throw e` 竟然**全绿** ✗ ——
+     * 说明"建立缓冲失败"这条真实存在的路**一条断言都没覆盖**。
+     */
+    {
+      // 第 1 个候选的 addSourceBuffer 抛 —— 走"建立失败"那条路
+      const plan = ['sbthrow', 'ok'];
+      // plan 按 MIME_CANDIDATES 的下标查，所以把 'sbthrow' 放到第 0 位
+      const r = await once(plan);
+      r.pb.stop();
+      const rec = r.statuses.find((s) => s.phase === 'recording');
+      if (r.threw) problems.push(`建立缓冲失败时不该让 start() 抛出来: ${r.threw.message}`);
+      if (!rec) problems.push('建立缓冲失败时没有退到下一个候选');
+      else if (!(rec.fallbacks || []).some((x) => /建立失败/.test(x))) {
+        problems.push(`"建立缓冲失败"没被记进回落记录: ${JSON.stringify(rec.fallbacks)}`);
+      }
+    }
+  } finally {
+    restore();
+  }
+
+  // player.js 必须真的消费这三个 phase（否则 handler 报了也没人看）
   const pj = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
-  const consumesErr = /s\.phase === 'recorder-error'/.test(pj);
-  const consumesStop = /s\.phase === 'recorder-stopped'/.test(pj);
-  check(
-    '录制器报错/自己停了必须有话说（原来这两个事件没有 handler，故障只剩结果没有原因）',
-    hasErr && hasStop && guarded && consumesErr && consumesStop,
-    `需要: delayed-player 里 recorder.onerror + recorder.onstop（且 onstop 用 this.stopped 守卫，` +
-      `否则正常收摊也报）+ player.js 里消费这两个 phase。` +
-      ` 实际: onerror=${hasErr} onstop=${hasStop} 守卫=${guarded} 消费错=${consumesErr} 消费停=${consumesStop}`,
-  );
-}
+  for (const ph of ['recorder-error', 'recorder-stopped', 'recorder-failed']) {
+    if (!new RegExp(`s\\.phase === '${ph}'`).test(pj)) problems.push(`player.js 没有消费 ${ph}`);
+  }
+  // start() 返回 false 时不能把"没建起来"说成"已建立"
+  if (!/recorderOk === false/.test(pj)) problems.push('player.js 没有分辨 start() 返回 false 的情况');
+
+  if (problems.length) throw new Error(problems.join(' ｜ '));
+});
+
+/**
+ * 回落的**先后顺序**必须是 H.264 → VP9 → VP8 —— 而且这条要验**行为**，不是源码里的字符串顺序。
+ * （顺序断言在「录制格式必须 H.264 优先」那条里已经覆盖，这里只保证 chain 完整且非空。）
+ */
+check('回落链里三个台阶都在（H.264 / VP9 / VP8），且都不为空', () => {
+  const dp = loaded['lib/delayed-player.js'];
+  const g = globalThis;
+  const savedR = g.MediaRecorder;
+  const savedS = g.MediaSource;
+  try {
+    g.MediaRecorder = { isTypeSupported: () => true };
+    g.MediaSource = { isTypeSupported: () => true };
+    const chain = dp.mimeFallbacks();
+    if (chain.length < 3) throw new Error(`回落链太短（${chain.length} 个），至少要有 H.264 / VP9 / VP8 三档`);
+    for (const c of chain) if (!/^(video|audio)\//.test(c)) throw new Error(`候选里混进了不是 MIME 的东西: ${c}`);
+    // 观察窗必须有界 —— 无界的话一个不报错的候选能把启动卡死
+    if (!(Number(dp.MIME_PROBE_MS) > 0 && Number(dp.MIME_PROBE_MS) <= 3000)) {
+      throw new Error(`MIME_PROBE_MS 必须是个有界的小值，实际 ${dp.MIME_PROBE_MS}`);
+    }
+  } finally {
+    g.MediaRecorder = savedR;
+    g.MediaSource = savedS;
+  }
+});
 
 /**
  * 「录制器停了」必须是一个**独立的分类**，不能被算成 `cannot-append`。

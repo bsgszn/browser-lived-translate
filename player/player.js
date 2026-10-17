@@ -552,24 +552,23 @@ async function waitForJob(timeoutMs = 12000) {
 /**
  * 向下取到偶数。
  *
- * ⚠️ **这是"规范化"，不是"修某个已确认的故障"。** 别把它当成黑屏的病因 —— 实测已推翻。
+ * ⚠️ 这个函数有两个调用点，而**它们的理由完全不同**，别混为一谈：
+ *   ① 采集侧（`startCapture` 里，给原始 tab-capture 轨做取偶）—— 理由见那段的长注释；
+ *   ② 延迟画面降分辨率那条路 —— 那里**本来就在缩放**，取偶不增加任何成本，
+ *      而它确实会产出奇数（`Math.round(2561 × 1440 / 1441)` = **2559**）。
+ *      所以那一处是"顺手规范化"，**不是在修什么** ✓
  *
- * 来历:反馈者的标签页是 **2561×1441**（两个都是奇数 —— 比标准的 2560×1440 各多 1 像素），
- * 而他的录制器一个字节都没产出。当时猜"奇数宽高让编码器产不出数据"，
- * 于是加了取偶（H.264 的 4:2:0 色度确实是每 2×2 采一次，
- * Chromium 自己的采集代码里也有"奇数缩到偶数"的处理 —— 推理不算离谱）。
- *
- * ⚠️ **但两次独立实测都推翻了这个猜测:**
+ * ⚠️ 而曾经有过一段**误判**，记在这里免得下次又删一遍：
+ * 反馈者的标签页是 **2561×1441**（两个都是奇数 —— 比标准的 2560×1440 各多 1 像素），
+ * 而他的录制器一个字节都没产出。当时猜"奇数宽高让编码器产不出数据"，于是加了取偶。
+ * 后来**两次"实测推翻"**了它：
  *   ① canvas 直喂编码器:`2561×1441`（奇数）产出 2,524,851 字节 ✓
- *      `1280×721`（奇数）产出 864,939 字节 ✓
  *   ② 真实标签页采集:窗口 2561×1441，正常录出 26.6 MB ✓
- *   → **奇数尺寸完全不影响编码。**
+ * → 于是 v2.66.31 把采集侧那处**删掉了**（"收益为零、代价未知"）。
  *
- * ⚠️ **v2.66.31 起，这里只服务于"延迟画面降分辨率"那一条路**（采集侧的取偶被删掉了，
- * 因为那是在原始 tab-capture 轨上做 `applyConstraints`，收益为零而代价未知 —— 见下面
- * `startCapture` 里那段说明）。降分辨率这条路**本来就在缩放**，取偶不增加任何成本，
- * 而它确实会产出奇数:`Math.round(2561 × 1440 / 1441)` = **2559**。
- * 所以这里保留是"顺手规范化"，同样**不是**在修什么。
+ * ⚠️⚠️ 而**删错了** —— 那两次测试都**没有落在** `MediaRecorder + avc1+mp4a + 2561×1441@30`
+ * 这个确切组合上 ✗。编码器拒绝的是"**配置**"（codecs + 尺寸 + 帧率 + 码率的组合），
+ * 换任何一个维度就不是同一个配置了。真实复现见 `startCapture` 里那段。
  *
  * 返回 0 表示"给的值没法用"（调用方决定退回原样）。
  */
@@ -671,24 +670,68 @@ async function startCapture() {
   vtrack.onended = () => stopAll('来源标签页的画面已结束');
 
   /**
-   * ⚠️ 这里**曾经**对采集到的原始轨做"奇数取偶"（`applyConstraints`），v2.66.31 删掉了。
+   * 奇数尺寸取偶 —— **v2.66.31 删过，这里恢复**，而这次的理由是对的。
    *
-   * 删的理由不是"它对性能有害" —— 那一条**没测成**（`applyConstraints` 在原始
-   * tab-capture 轨上究竟会失败被忽略、只改元数据、还是**触发逐帧缩放**，三种可能一种都没验证）。
-   * 理由是**它的收益是零、而代价未知**:
-   *   · 收益零 —— "奇数让编码器产不出数据"这个猜测已被两次实测推翻（见 `evenFloor` 的注释）
-   *   · 代价未知 —— 万一它触发逐帧缩放，那就是每帧一次额外重采样，而 CPU 正是这里的瓶颈
-   *   · 拿未知代价换零收益，不划算；而删掉的代价是**有界的**（见下面 `evenFloor` 的用法）
+   * ⭐ 真实复现（v2.66.40，反馈者的导出日志）：
+   *     已取得流 · 视频 **2561×1441@30**
+   *     录制格式 · video/mp4;codecs="avc1.42E01E,mp4a.40.2"（H.264，通常硬件编码）
+   *     ⚠ 录制器报错 · **EncodingError: The given encoder configuration is not supported by the encoder.**
+   *     ⚠ 录制器停了 · 已输出 **0 字节／0 片、跑了 0 秒**
+   *     → 而**字幕照常**（走独立音频管线）→ 用户看到的就是「只有字幕，没有画面和声音」✗
+   *   同一个用户**手动换成 VP8 就能录** ✓
    *
-   * ⚠️ 对绝大多数用户，"留"和"删"其实没区别 —— 1920×1080 / 2560×1440 / 3840×2160
-   * **全是偶数**，根本走不进那段。所以这不是一个紧急修复。
+   * ⚠️ 当初为什么删错了 —— 那两次"实测推翻"都没有落在
+   * `MediaRecorder + avc1+mp4a + 2561×1441@30` 这个确切组合上 ✗。
+   * 编码器拒绝的是"**配置**"（codecs + 尺寸 + 帧率 + 码率的组合），
+   * 换一个维度就不是同一个配置了。详见 `evenFloor` 的注释。
+   *
+   * ⚠️ 但**它不是唯一的嫌疑**：那条日志里尺寸是奇数，而容器里还带着 AAC ✗
+   * （Chrome 的 MediaRecorder 音频只有 Opus 一条路）。所以 `lib/delayed-player.js`
+   * 那边另配了一条**编码器回落链**（`isTypeSupported` 说支持也会被拒绝，只能真的试）。
+   * 两道防线**互不依赖** ✓ —— 这一道只负责"别把明显不规整的尺寸递下去"。
+   *
+   * ⚠️ `applyConstraints` 在原始 tab-capture 轨上究竟会不会真的改尺寸，**仍然没实测过** ✗
+   * —— 所以它失败时必须**按原样继续**，不能让采集整个坏掉。
    */
+  let evenNote = '';
+  let evenFail = '';
+  let evenIgnored = false;
+  try {
+    const s0 = vtrack.getSettings();
+    const w0 = Number(s0.width) || 0;
+    const h0 = Number(s0.height) || 0;
+    const w1 = evenFloor(w0);
+    const h1 = evenFloor(h0);
+    // 只有真的是奇数才动 —— 偶数本来就是对的，碰它没有收益
+    if (w1 && h1 && (w1 !== w0 || h1 !== h0)) {
+      await vtrack.applyConstraints({ width: w1, height: h1 });
+      const s1 = vtrack.getSettings();
+      const w2 = Number(s1.width) || 0;
+      const h2 = Number(s1.height) || 0;
+      evenNote = `${w0}×${h0} → ${w2 || '?'}×${h2 || '?'}`;
+      evenIgnored = w2 === w0 && h2 === h0;
+    }
+  } catch (e) {
+    evenFail = (e && (e.message || e.name)) || String(e);
+  }
+
   const vs = vtrack.getSettings();
   diag(
     `已取得流 · 视频 ${vs.width || '?'}×${vs.height || '?'}${vs.frameRate ? `@${Math.round(vs.frameRate)}` : ''}` +
       `${maxFrameRate ? `（上限 ${maxFrameRate}）` : ''}`,
     true,
   );
+  // 取偶的结果要能一眼看到 —— 否则"到底改没改、改成了什么"只能靠猜
+  if (evenNote) {
+    diag(
+      evenIgnored
+        ? `奇数尺寸取偶 · 请求了 ${evenNote}，但浏览器没照做（按原样继续）`
+        : `奇数尺寸取偶 · ${evenNote} —— 编码器对奇数分辨率可能直接拒绝`,
+      true,
+    );
+  } else if (evenFail) {
+    diag(`奇数尺寸取偶失败，按原样继续 · ${evenFail}`, true);
+  }
 
   // —— 延迟画面用的流：可以降分辨率 ——
   //
@@ -704,10 +747,14 @@ async function startCapture() {
       const st = scaled.getVideoTracks()[0];
       const s = st.getSettings();
       /**
-       * ⚠️ 两边都取偶 —— 但这是**规范化，不是修 bug**：
-       * `Math.round` 会产出奇数（实测 2561×1440/1441 → 2559）。
-       * 「奇数会让编码器产不出数据」这个猜测**已被两次实测推翻**（见 evenFloor 的注释），
-       * 所以取偶在这里同样只是让尺寸规整，别把它当病因。
+       * ⚠️ 两边都取偶。
+       *
+       * 在**这一条路**上它是纯粹规范化：`Math.round` 会产出奇数
+       * （实测 2561×1440/1441 → 2559），而这条本来就在缩放，取偶不增加成本 ✓
+       *
+       * ⚠️ 别把这里的理由和**采集侧**那处混起来 —— 采集侧那处的理由是
+       * "编码器可能直接拒绝奇数配置"（有真实复现，见 `startCapture` 里的长注释）。
+       * 两处都在用同一个 `evenFloor`，但**它们防的不是同一件事** ✗
        */
       const w = evenFloor(((s.width || 1920) * maxHeight) / (s.height || 1080)) || 2;
       const h = evenFloor(maxHeight) || 2;
@@ -733,8 +780,45 @@ async function startCapture() {
       if (s.phase === 'recording') {
         const hw = /avc1|h264/i.test(s.mimeType || '');
         diag(`录制格式 · ${s.mimeType || '默认'}${hw ? '（H.264，通常硬件编码）' : '（VP8/VP9，很可能是软件编码，4K 下吃紧）'}`, true);
+        /**
+         * ⚠️ 回落链有动作时**必须报**，否则"最后用的是哪个格式、前面为什么没用"只能靠猜 ✗
+         * 而这条恰恰是"`isTypeSupported` 说支持、编码器却拒绝"那个 bug 的**唯一证据**。
+         */
+        const fb = Array.isArray(s.fallbacks) ? s.fallbacks : [];
+        if (fb.length) {
+          diag(
+            `⚠ 前 ${fb.length} 个录制格式被编码器拒绝，已自动退到上面这个 · 第一个失败：${fb[0]}`,
+            true,
+          );
+        }
+        // 观察窗里既没分片也没报错 → 这个格式**没被证实**，坏了也不知道该怪谁
+        if (s.proven === false) {
+          diag(`${s.mimeType || '这个格式'} 还没被证实 —— 启动观察窗里既没拿到分片，也没收到报错`, true);
+        }
         // 码率直接决定运动画面糊不糊，必须能一眼看到
         if (s.bitrateNote) diag(`视频码率 · ${s.bitrateNote}`, true);
+      }
+      /**
+       * ⚠️ **所有候选都被编码器拒绝** —— 画面和声音都出不来，而字幕照常。
+       *
+       * 这正是反馈者那条「只有字幕，没有画面和声音」最可能的内核形态：
+       * `EncodingError: The given encoder configuration is not supported by the encoder.`
+       * 这里要做的不是让用户自己猜，而是**直接说结论 + 给出可试的两条路** ✗
+       */
+      if (s.phase === 'recorder-failed') {
+        const tried = Array.isArray(s.tried) ? s.tried : [];
+        diag(
+          `⚠ 没有任何录制格式能起来（试了 ${tried.length} 个）—— 画面和声音都出不来，字幕照常 · ` +
+            `第一个失败：${tried[0] || '?'}`,
+          true,
+        );
+        showOverlay(
+          '录制器起不来',
+          `浏览器拒绝了所有录制格式（试了 ${tried.length} 个），所以画面和声音出不来。` +
+            '字幕走独立的音频管线，照常工作。',
+          '这通常是分辨率或编码器的问题。可以试：① 把「延迟画面」的分辨率上限设成 1080p；' +
+            '② 把「采集帧率上限」改回 30。每个格式的失败原因都在诊断面板里。',
+        );
       }
       if (s.phase === 'append-error') {
         appendFails += 1;
@@ -753,7 +837,9 @@ async function startCapture() {
        */
       if (s.phase === 'recorder-error') {
         diag(
-          `⚠ 录制器报错 · ${s.message} —— 录制一断，画面和声音都会停（字幕走独立管线，照常）`,
+          `⚠ 录制器报错 · ${s.message} —— 录制一断，画面和声音都会停（字幕走独立管线，照常）` +
+            // 没被证实的格式崩了，说明"启动时没抓到"而已 —— 把这层因果说出来
+            (s.proven === false ? '（注：这个格式在启动观察窗里就没被证实）' : ''),
           true,
         );
       }
@@ -822,8 +908,13 @@ async function startCapture() {
     },
   });
   diag('正在建立媒体缓冲…', true);
-  await playback.start(recordStream);
-  diag('媒体缓冲已建立', true);
+  /**
+   * ⚠️ `start()` 现在会返回 `false` = **所有录制格式都被编码器拒绝**。
+   * 那种情况它**不抛异常**（抛了下面的识别就不会启动，字幕一起没 ✗），
+   * 所以这里要自己分辨，别把"没建起来"说成"已建立" ✗
+   */
+  const recorderOk = await playback.start(recordStream);
+  diag(recorderOk === false ? '⚠ 媒体缓冲没建起来（没有可用的录制格式）' : '媒体缓冲已建立', true);
 
   // —— 识别（用未延迟的原始音频）——
   await startAudioEngine(atrack);
