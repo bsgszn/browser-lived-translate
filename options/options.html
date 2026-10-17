@@ -394,6 +394,21 @@
                 <b>这一项以前在 VAD 模式下不起作用</b>（接线漏了，分片模式才会发）—— 现在两种模式都会发出去。
               </small>
             </label>
+            <label class="field wide">
+              <span>识别热词（可选，每行一个）</span>
+              <textarea id="wc-hotwords" rows="3" placeholder="配信&#10;スパチャ&#10;切り抜き&#10;凸"></textarea>
+              <small class="hint">
+                只放<b>反复听错</b>的词，别写句子。它们会拼在「提示词」后面一起发给 Whisper，
+                总长有上限（约 140 字符，超了只带前面的、后面的丢掉）。
+                <br />
+                ⚠️ 别贴整段术语表 —— 项目实测过，一堵英文术语会把识别<b>严重带偏</b>。
+                想用术语表里那几句专有名词，勾下面的开关。
+              </small>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="wc-glossaryHotwords" />
+              <span>把术语表里的源词也并入识别热词（默认关，会改变识别行为）</span>
+            </label>
           </div>
           <div class="checks">
             <label class="check"><input type="checkbox" id="wc-skipSilence" /> <span>跳过静音片段（省算力、避免幻听）</span></label>

@@ -79,6 +79,8 @@ const FIELDS = [
   // 「合理断句」：到单句上限时回看换气处，把切点从"时间到的那一刻"挪过去（见 vad.js 的 findLullCut）
   ['vd-smartCut', 'checkbox', 'asr.vad.vadSmartCut'],
   ['wc-prompt', 'text', 'asr.whisperChunked.prompt'],
+  ['wc-hotwords', 'text', 'asr.whisperChunked.hotwords'],
+  ['wc-glossaryHotwords', 'checkbox', 'asr.whisperChunked.glossaryHotwords'],
   ['wc-skipSilence', 'checkbox', 'asr.whisperChunked.skipSilence'],
   // AGC 档位：差麦克风场景下 gentle 常常比默认更稳（提升减半、收敛慢 4 倍、噪声门抬高）
   ['cp-agcProfile', 'text', 'capture.agcProfile'],

@@ -2598,6 +2598,61 @@ check('VAD 拒绝计数：接力**不是**"拦掉"', () => {
   if (S(1, 0, 0, 0) !== S(1, 0, 0)) throw new Error('carried=0 时输出应当和原来完全一致');
   if (S(0, 0, 0, 0) !== '') throw new Error('全零时应当为空串');
 });
+
+/**
+ * 本地 Whisper 的「识别热词」。
+ *
+ * 用户要的是"术语表那种东西"，但**不能把术语表整表塞进 prompt** ——
+ * 项目实测过：加一堵英文术语会把识别严重带偏（options.html 那段）。
+ * 所以做成"提示词（散文）+ 热词（词表）+ 可选并入术语表源词"，
+ * 由 `buildWhisperPrompt` 拼装，三条硬约束：去重、限词数、限总长。
+ */
+check('识别热词：拼装规则（去重 / 限词数 / 限总长 / 不动用户提示词）', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const B = v.buildWhisperPrompt;
+  if (typeof B !== 'function') throw new Error('vad.js 没有导出 buildWhisperPrompt');
+
+  // ① 全空 → 空串（别发出一个空 prompt）
+  const empty = B({});
+  if (empty.text !== '' || empty.hotwords !== 0 || empty.truncated !== false) {
+    throw new Error(`全空时应当什么都不发，实际 ${JSON.stringify(empty)}`);
+  }
+  // ② 只有提示词 → 原样
+  if (B({ prompt: '日语直播，说话快' }).text !== '日语直播，说话快') throw new Error('只有提示词时不该改动它');
+  // ③ 热词：换行/逗号/顿号都能分隔（用户不会读文档）
+  const mixed = B({ hotwords: '配信\nスパチャ,切り抜き、凸' });
+  if (mixed.text !== '配信, スパチャ, 切り抜き, 凸') throw new Error(`分隔符没都认：「${mixed.text}」`);
+  if (mixed.hotwords !== 4) throw new Error(`热词数不对：${mixed.hotwords}`);
+  // ④ 提示词在前、热词在后（Whisper 只用末尾 224 token，写长了前面会被截掉）
+  const both = B({ prompt: '日语直播', hotwords: 'スパチャ' });
+  if (!both.text.startsWith('日语直播') || !both.text.endsWith('スパチャ')) {
+    throw new Error(`顺序应当是「提示词 + 热词」：「${both.text}」`);
+  }
+  // ⑤ 去重（大小写不敏感），且用户手填的优先
+  const dup = B({ hotwords: 'SC\nsc\nスパチャ', glossary: ['sc', '配信'], includeGlossary: true });
+  if (dup.text !== 'SC, スパチャ, 配信') throw new Error(`去重不对：「${dup.text}」`);
+  // ⑥ 术语表默认**不并入**
+  if (B({ hotwords: 'SC', glossary: ['配信'], includeGlossary: false }).text.includes('配信')) {
+    throw new Error('没勾开关时术语表不该进来');
+  }
+  // ⑦ 超长词跳过（非 ASCII > 15 字），别让它把 prompt 带偏
+  if (B({ hotwords: 'あ'.repeat(20) }).text !== '') throw new Error('超长热词应当被跳过');
+  // ⑧ 限词数
+  const many = B({ hotwords: Array.from({ length: 30 }, (_, i) => `w${i}`).join('\n') });
+  if (many.hotwords !== 20) throw new Error(`词数上限应当是 20，实际 ${many.hotwords}`);
+  if (!many.truncated) throw new Error('被截断时要标出来');
+  // ⑨ 限总长 —— **从尾部丢词，绝不动用户写的提示词**
+  const base = '日'.repeat(133); // 再带一个 4 字热词就 139、第二个就超了
+  const capped = B({ prompt: base, hotwords: 'スパチャ\n配信' });
+  if (!capped.text.startsWith(base)) throw new Error('总长超限时不该截断用户提示词');
+  if (capped.hotwords !== 1) throw new Error(`总长超限后应当只剩能塞下的词，实际 ${capped.hotwords}`);
+  if (!capped.truncated) throw new Error('总长截断也要标出来');
+  // ⑩ 脏值不抛
+  for (const bad of [null, undefined, {}, { prompt: null, hotwords: null, glossary: null }]) {
+    const r = B(bad || {});
+    if (typeof r.text !== 'string') throw new Error(`脏值应当回空串，实际 ${JSON.stringify(r)}`);
+  }
+});
 await checkAsync('识别校正：拿不到置信度时 refine 必须报 ok=false', async () => {
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
   s.asr.provider = 'whisper-chunked';
