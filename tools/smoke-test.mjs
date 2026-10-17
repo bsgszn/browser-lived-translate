@@ -377,6 +377,94 @@ check('非法输入回落到 1', audioChain.agcTargetGain(NaN) === 1 && audioCha
   check('静音期间不改变增益上界行为（只增不减到 1 为止）', agc.gain <= frozen + 1e-9 || agc.gain >= 1);
 }
 
+console.log('\n[3d] 闸门末端的否决：VAD 说这一段是语音时，no_speech_prob 不许单独丢文本');
+const vadGateMod = loaded['lib/asr/vad-gate.js'];
+const vadMod = loaded['lib/asr/vad.js'];
+{
+  /**
+   * ⚠️ 这一节验的是**行为**，不是源码字面 ✗
+   *
+   * 判据 `applyNoSpeechVeto` / `noSpeechVetoed` 是**模块级纯函数**，所以能直接喂数值。
+   * 而 `speechFrames` 那一步要验"真 gate 会不会带出来"，就用**真 VadGate** 推一串概率。
+   * 两个都不需要 ONNX 推理，所以在 Node 里跑得动 ✓
+   */
+
+  // ---- ① 真 VadGate 的 end 事件必须带 speechFrames（行为，不是查源码有没有这个词）----
+  const g = new vadGateMod.VadGate({ threshold: 0.5, minSpeechMs: 250, minSilenceMs: 480, maxSpeechMs: 3500, frameSamples: 640 });
+  let endEv = null;
+  for (let i = 0; i < 90 && !endEv; i++) { const e = g.push(0.99); if (e && e.type === 'end') endEv = e; }
+  for (let i = 0; i < 20 && !endEv; i++) { const e = g.push(0.01); if (e && e.type === 'end') endEv = e; }
+  check('真 VadGate 的 end 事件带 speechFrames，且约等于语音时长', () => {
+    if (!endEv) throw new Error('没拿到 end 事件');
+    if (!Number.isFinite(endEv.speechFrames)) throw new Error(`speechFrames=${endEv.speechFrames}`);
+    const ms = endEv.speechFrames * g.frameMs;
+    if (ms < 2500) throw new Error(`只算出 ${Math.round(ms)}ms，说话推了 90 帧却这么小`);
+  });
+
+  const frameMs = g.frameMs;
+  const realSpeechMs = endEv ? endEv.speechFrames * frameMs : 3520; // 用户日志里"连续 77 帧"的量级
+  const bar = g.minSpeechMs;
+
+  // ---- ② 用户实测那两句的形状 → 放行（两条前缀都要认）----
+  check('「判定为无人说话」+ VAD 认了 3s 语音 → 放行', () => {
+    const v = vadMod.applyNoSpeechVeto('判定为无人说话（no_speech_prob=0.86） · 读数 avg_logprob -0.10 · temperature 0.00',
+      { vadSpeechMs: realSpeechMs, vadMinSpeechMs: bar });
+    if (v.reason !== null) throw new Error(`仍然被丢：${v.reason}`);
+    if (!v.released) throw new Error('没有记录 released，日志里就看不出放行过');
+  });
+  check('no_speech_prob=0.79 那条同样放行（不是只认一个数）', () => {
+    const v = vadMod.applyNoSpeechVeto('判定为无人说话（no_speech_prob=0.79） · 读数 avg_logprob -0.23', { vadSpeechMs: realSpeechMs, vadMinSpeechMs: bar });
+    if (v.reason !== null) throw new Error('仍然被丢');
+  });
+
+  // ---- ③ ⭐ 纯静音 + 幻觉文本 → **仍然丢**（这条是防"把幻觉放回来"的）----
+  check('VAD 没认语音（0/40/120/240ms）→ 幻觉仍然被丢', () => {
+    for (const ms of [0, 40, 120, 240]) {
+      const v = vadMod.applyNoSpeechVeto('判定为无人说话（no_speech_prob=0.88） · 读数 avg_logprob -0.05', { vadSpeechMs: ms, vadMinSpeechMs: bar });
+      if (v.reason === null) throw new Error(`VAD 只认了 ${ms}ms 却放行了 —— 幻觉会漏出去`);
+    }
+  });
+  check('门槛边界：正好等于门槛放行、低于一帧就丢', () => {
+    if (vadMod.applyNoSpeechVeto('判定为无人说话（x）', { vadSpeechMs: bar, vadMinSpeechMs: bar }).reason !== null) throw new Error('等于门槛却不放行');
+    if (vadMod.applyNoSpeechVeto('判定为无人说话（x）', { vadSpeechMs: bar - 1, vadMinSpeechMs: bar }).reason === null) throw new Error('低于门槛却放行');
+  });
+
+  // ---- ④ 其余三种闸门理由一律不受否决影响 ----
+  check('空文本 / 幻听套话 / 置信度低 / 解码回退 一律照旧拦', () => {
+    for (const o of ['空文本', '命中幻听套话',
+      '置信度低（avg_logprob=-1.20） · 读数 avg_logprob -1.20 · temperature 0.00',
+      '解码回退到 temperature=0.40 · 读数 avg_logprob -0.20 · temperature 0.40']) {
+      const v = vadMod.applyNoSpeechVeto(o, { vadSpeechMs: 99999, vadMinSpeechMs: bar });
+      if (v.reason !== o) throw new Error(`「${o.slice(0, 12)}」被改动了`);
+      if (v.released !== null) throw new Error(`「${o.slice(0, 12)}」记了个放行`);
+    }
+  });
+  check('已通过的（null）不会被记成放行', () => {
+    const v = vadMod.applyNoSpeechVeto(null, { vadSpeechMs: 99999, vadMinSpeechMs: bar });
+    if (v.reason !== null || v.released !== null) throw new Error(JSON.stringify(v));
+  });
+
+  // ---- ⑤ finalize 那两处拿不到 gate 事件 → 传进来的就是 NaN → **不否决**（宁可维持原判据）----
+  check('VAD 信息缺失时不否决（finalize 那两处没有 gate 事件可依）', () => {
+    for (const bad of [undefined, null, NaN, '', 'abc']) {
+      if (vadMod.noSpeechVetoed({ vadSpeechMs: bad, vadMinSpeechMs: bar }) !== false) throw new Error(`vadSpeechMs=${JSON.stringify(bad)} 竟然否决了`);
+    }
+    for (const bad of [undefined, null, NaN, 0, -5]) {
+      if (vadMod.noSpeechVetoed({ vadSpeechMs: 99999, vadMinSpeechMs: bad }) !== false) throw new Error(`vadMinSpeechMs=${JSON.stringify(bad)} 竟然否决了`);
+    }
+  });
+
+  // ---- ⑥ ⚠️ `refine.js` 那份**故意不共用**这套判据，行为必须逐字不变 ----
+  // 谁要是为了"统一"把否决也搬到 judgeRefinement 里，这条会红 ✓
+  check('refine.js 的 judgeRefinement 仍然独立判定（0.9 的 no_speech_prob 照样判不合格）', () => {
+    const r = loaded['lib/asr/refine.js'].judgeRefinement({
+      segments: [{ no_speech_prob: 0.9, avg_logprob: -0.1, temperature: 0 }],
+    });
+    if (!r || r.ok !== false) throw new Error('refine 竟然放行了 —— 说明它被"统一"了');
+    if (!/无人说话/.test(String(r.reason))) throw new Error(`理由变了：${r.reason}`);
+  });
+}
+
 console.log('\n[4] 设置与提供方');
 const settings = loaded['lib/settings.js'];
 const asrIndex = loaded['lib/asr/index.js'];
