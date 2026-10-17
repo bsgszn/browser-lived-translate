@@ -918,9 +918,23 @@ check('TARGET_LANGS 的 DeepL 代码齐全', () => {
   }
 });
 
-check('asrReadiness 能识别缺少 Key', () => {
+check('asrReadiness：默认（本地 VAD）就绪，只有显式选 Deepgram 且没 Key 才未就绪', () => {
+  /**
+   * ⚠️ 这条在 v2.66.74 之前是「默认配置没填 Key，应判定为未就绪」——
+   * 那时 `asr.provider` 默认是 `deepgram`。
+   * 默认改成 `vad`（本地 VAD，零 Key、零成本）之后，**默认配置本来就该是"就绪"**。
+   * 断言改成三个方向都验（默认就绪 / 显式 Deepgram 无 Key 未就绪 / 有 Key 就绪），
+   * 比原来那两行更强 —— 而且它同时钉住了"默认不是 Deepgram"这件事。
+   */
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
-  if (settings.asrReadiness(s).ok !== false) throw new Error('默认配置没填 Key，应判定为未就绪');
+  if (settings.asrReadiness(s).ok !== true) {
+    throw new Error('默认是本地 VAD，不需要 Key，应判定为就绪');
+  }
+  s.asr.provider = 'deepgram';
+  s.asr.deepgram.apiKey = '';
+  if (settings.asrReadiness(s).ok !== false) {
+    throw new Error('显式选 Deepgram 且没填 Key，应判定为未就绪');
+  }
   s.asr.deepgram.apiKey = 'abc';
   if (settings.asrReadiness(s).ok !== true) throw new Error('填了 Key 应判定为就绪');
 });
@@ -1749,6 +1763,8 @@ check('OpenAI Realtime 会话采样率为 24000', () => {
 
 check('Deepgram 缺少 Key 时给出中文提示', () => {
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  // ⚠️ v2.66.74 起默认 provider 是 vad（不需要 Key），所以要显式选 Deepgram 才测得到这条
+  s.asr.provider = 'deepgram';
   s.asr.deepgram.apiKey = '';
   try {
     asrIndex.createAsrSession(s, () => {});
@@ -2507,12 +2523,19 @@ check('环形缓冲：encodeWav 产出的头必须合法（字节序、长度、
   if (bytes[8] !== 0x00 || bytes[9] !== 0x80) throw new Error(`字节序不对：${bytes[8]},${bytes[9]}`);
 });
 
-check('识别校正：默认必须是关的（baseUrl 默认指向 8000，开了就是每句一次空请求）', () => {
+check('识别校正：默认必须是关的（没在本地跑 Whisper 的人，开了就是每句一次空请求）', () => {
   const r = settings.DEFAULT_SETTINGS.asr.refine;
   if (r.enabled !== false) throw new Error(`默认 enabled=${r.enabled}，必须显式打开`);
   // 这条不是形式主义：v1.9.1 就是因为默认打开才被整体回退的
-  if (settings.DEFAULT_SETTINGS.asr.whisperChunked.baseUrl.includes('8000') === false) {
-    throw new Error('前提变了：baseUrl 默认不再是 8000，这段注释该更新');
+  //
+  // ⚠️ v2.66.74：`whisperChunked.baseUrl` 的默认值从 8000 改成了 **8080**
+  // （主推的 whisper.cpp 那条路；`启动本地字幕服务.bat` 里就是 `set PORT=8080`）。
+  // 于是原来那句「baseUrl 默认指向 8000」的前提没了 —— 而**"默认关"这个决定不变**：
+  // 没在本地跑任何 Whisper 服务的人，默认打开仍然等于每句一次空请求。
+  // 所以这里不再钉"默认是不是 8000"，改成钉"默认地址和那个脚本里的端口一致"。
+  const base = settings.DEFAULT_SETTINGS.asr.whisperChunked.baseUrl;
+  if (!base.includes('8080')) {
+    throw new Error(`前提变了：默认 baseUrl 不是 8080 了（是 ${base}），这段注释和断言都该更新`);
   }
 });
 

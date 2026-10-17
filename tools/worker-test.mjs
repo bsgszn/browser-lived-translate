@@ -198,11 +198,27 @@ async function waitFor(pred, maxMs = 8000) {
   return st;
 }
 
+/**
+ * `livedub.settingsVersion` 在 lib/settings.js 里是私有常量（只导出了 STORAGE_KEY），
+ * 所以这里按字面量写。改那个键名的话，下面的迁移断言会立刻红 —— 不是无声失效。
+ */
+const VERSION_KEY = 'livedub.settingsVersion';
+
+/**
+ * 让 storage 看起来像"已经迁移过的 profile"。
+ * ⚠️ 不写它的话 `getSettings()` 会当成 v1 的老 profile，**每次调用都重跑迁移** ——
+ * 而 v8 的迁移会把「deepgram 且无 Key」改回 vad，于是那些用例测的就不是原本要测的东西了。
+ */
+function seedVersion(v = settingsMod.SETTINGS_VERSION) {
+  localStore.set(VERSION_KEY, v);
+}
+
 function seedSettings(overrides = {}) {
   const s = JSON.parse(JSON.stringify(settingsMod.DEFAULT_SETTINGS));
   s.asr.deepgram.apiKey = 'dg-test-key';
   Object.assign(s, overrides);
   localStore.set(settingsMod.STORAGE_KEY, s);
+  seedVersion();
   return s;
 }
 
@@ -226,8 +242,14 @@ console.log('\n[2] 启动采集');
 {
   // 没有 API Key 时必须拒绝并给出可读原因
   const bare = JSON.parse(JSON.stringify(settingsMod.DEFAULT_SETTINGS));
+  // ⚠️ v2.66.74 起默认 provider 是 vad（本地 VAD，不需要 Key），
+  //    所以要显式选 Deepgram 才测得到「缺 Key 拒绝启动」这条
+  bare.asr.provider = 'deepgram';
   bare.asr.deepgram.apiKey = '';
   localStore.set(settingsMod.STORAGE_KEY, bare);
+  // ⚠️ 必须同时写版本号：否则 getSettings() 会把这当成"v1 的老 profile"去跑迁移，
+  //    而 v8 的迁移会把「deepgram 且无 Key」改回 vad —— 那样测的就不是"缺 Key 拒绝启动"了。
+  seedVersion();
   const bad = await send({ type: 'LIVEDUB_START', tabId: 7 });
   check('缺 API Key 时拒绝启动并给出原因', bad?.state?.status === 'error' && /API Key/.test(bad.state.error || ''), JSON.stringify(bad));
 
