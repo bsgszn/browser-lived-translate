@@ -197,7 +197,7 @@ const DIAG_T0 = performance.now();
  * ⚠️ 为什么要它：配上导出的 WAV，就能回答"当时识别成了什么 / 显示成了什么"。
  *    面板上的诊断行**仍然只印长度、不印正文**（那是故意的，正文不该刷屏）。
  */
-const SUBLOG_KEEP = 120; // 条数。30 秒通常 10~30 句，留足余量；挤掉时导出会如实写明
+const SUBLOG_KEEP = 120; // 条数。60 秒通常 20~60 句，留足余量；挤掉时导出会如实写明
 const subLog = [];
 
 function diag(line, toConsole) {
@@ -358,7 +358,7 @@ async function copyDiag() {
  *
  * ⚠️ 导出的音频是 **ASR 实际吃到的那一份**（16kHz 单声道 int16），不是采集流。
  * 只有这样才能保证重放逐字节相同、结果可复现。它同时也是识别校正用的那份缓冲
- * （`pcmRing`，90 秒），所以这里不需要另建缓冲 —— 切最后 30 秒即可。
+ * （`pcmRing`，90 秒），所以这里不需要另建缓冲 —— 切最后 60 秒即可。
  *
  * ⚠️ **隐私:必须是用户主动点。** 这个扩展的卖点是「音频不出本机」，
  * 所以绝不自动存、不在后台存、不在出错时自动存。存下来的文件在用户自己机器上，
@@ -366,7 +366,7 @@ async function copyDiag() {
  *
  * ⚠️ 任何一步失败都不许抛 —— 打日志/导出绝不能把播放搞挂。
  */
-const SAVE_WINDOW_SEC = 30;
+const SAVE_WINDOW_SEC = 60;
 
 function downloadBlob(blob, filename) {
   if (!blob) return;
@@ -383,7 +383,7 @@ function downloadBlob(blob, filename) {
 async function saveAudioAndLog() {
   const cutMs = performance.now() - SAVE_WINDOW_SEC * 1000;
 
-  // —— 音频:从已有的 90 秒环形缓冲里切最后 30 秒 ——
+  // —— 音频:从已有的 90 秒环形缓冲里切最后 SAVE_WINDOW_SEC 秒 ——
   let wavBlob = null;
   let audioNote = '';
   try {
@@ -409,6 +409,22 @@ async function saveAudioAndLog() {
   const lines = diagLines.slice(win.from);
   const times = diagTimes.slice(win.from);
   const body = lines.map((t, i) => `[+${((times[i] - DIAG_T0) / 1000).toFixed(3)}s] ${t}`).join('\n');
+
+  // ⚠️ 日志缓冲区是按**行数**留的（`DIAG_KEEP`），不是按秒 ——
+  //    所以「最近 60 秒」只是**请求的窗口**，实际能覆盖多久取决于行密度。
+  //    实测 8 份导出:平均 1.57~2.40 行/秒、最密 5 秒里 4.4 行/秒 ⇒ 400 行大约够 90 秒以上，
+  //    正常情况下装得下 60 秒还有余量。但**出故障时行会突然变密** ——
+  //    而那时恰恰最需要日志。所以这里算出**实际覆盖**，不够就明说:
+  //    导出头不许在"只覆盖 20 秒"的时候写着"最近 60 秒" ✗
+  const nowMs = performance.now();
+  const coveredSec =
+    win.oldestMs !== null && Number.isFinite(win.oldestMs) ? Math.max(0, (nowMs - win.oldestMs) / 1000) : 0;
+  const logCoverNote =
+    lines.length === 0
+      ? `(这一窗口内没有日志行 —— 缓冲区最早只有 ${coveredSec.toFixed(1)}s 前的记录)\n`
+      : coveredSec + 1 < SAVE_WINDOW_SEC
+        ? `(⚠ 日志只覆盖最近 ${coveredSec.toFixed(1)} 秒 —— 缓冲区满、更早的行已被挤掉；音频仍是完整 ${SAVE_WINDOW_SEC} 秒)\n`
+        : '';
 
   // —— 识别与显示:同一时间窗内每句的「识别文本 / 实际显示文本」 ——
   // ⚠️ 单独成段,不混进上面的诊断行:那些是**过程**（谁在什么时候做了什么），
@@ -441,8 +457,7 @@ async function saveAudioAndLog() {
     `导出时刻 ${new Date().toISOString()}\n` +
     `窗口:最近 ${SAVE_WINDOW_SEC} 秒(音频与日志同一基准 performance.now())\n` +
     `${audioNote}\n` +
-    (lines.length ? '' : '(这一窗口内没有日志行 —— 缓冲区最早只有 ' +
-      `${win.oldestMs !== null ? ((performance.now() - win.oldestMs) / 1000).toFixed(1) : '0'}s 前的记录)\n`) +
+    logCoverNote +
     `---\n${body || '(空)'}\n` +
     `\n=== 识别与显示 · ${subNote} ===\n${subBody || '(空)'}\n` +
     `${snapshotLine('导出时')}\n`;
