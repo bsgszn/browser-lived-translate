@@ -465,6 +465,104 @@ const vadMod = loaded['lib/asr/vad.js'];
   });
 }
 
+// ─────────────────────────────────────────────────────────────
+// VAD 支路的归一化：救小声的语音，但**绝不动真安静**
+//
+// 实测（用户导出日志）：那 12 秒 VAD 全判"静默"，而输入电平只有 0.0016~0.0029，
+// 同一条流的常态是 0.0034~0.0045 ⇒ 比平时小了 1.5~2 倍。
+// 而同一段音频离线整段喂 Whisper，它把那 12 秒的话全认出来了 ⇒ 音频里有语音，只是 VAD 认不出。
+//
+// 真机衰减实验给的拐点：×0.116（peak 0.013）→ >0.5 占 19% ✓；×0.01（peak 0.0011）→ 0% ✗
+// 而那 12 秒 ≈ peak 0.006~0.01 ⇒ 正好卡在拐点上 ⇒ 放大 4~8 倍就能把它拉回能用的一侧。
+//
+// 🔴 而最大的风险是**把静音也放大**（噪声被认成语音 ⇒ 幻觉字幕）。
+// 所以增益的闸门是**绝对地板** `SILENT_LEVEL_RMS × floorRatio`，
+// 而不是"比底噪高 N 倍"—— 实测那两者只差 1.5~2 倍，相对判据分不开。
+{
+  const v = loaded['lib/asr/vad.js'];
+  const { VAD_NORM, SILENT_LEVEL_RMS } = v;
+
+  // ---- ① 小声的语音 → 必须放大 ----
+  check('VAD 归一化：小声的语音（0.0016~0.0029，用户实测那 12 秒）会被放大', () => {
+    for (const rms of [0.0016, 0.0022, 0.0029]) {
+      const g = v.vadGainFor(rms, 0.0011);
+      if (!(g > 1)) throw new Error(`rms=${rms} 增益只有 ${g}× —— 小声的语音没被救`);
+      if (g > VAD_NORM.maxGain + 1e-9) throw new Error(`rms=${rms} 增益 ${g}× 超过上限 ${VAD_NORM.maxGain}`);
+    }
+  });
+
+  // ---- ② ⭐ 真安静 / 底噪 → 一个字节都不许动（这是本节的要害）----
+  check('VAD 归一化：真安静与底噪（0~0.0014）→ 增益必须是 1，一个字节都不动', () => {
+    for (const rms of [0, 0.0003, 0.0009, 0.0012, 0.0014]) {
+      const g = v.vadGainFor(rms, 0.0011);
+      if (g !== 1) throw new Error(`rms=${rms} 竟然被放大到 ${g}× —— 静音会被认成语音`);
+    }
+  });
+
+  // ---- ③ 闸门的位置：必须落在"真安静"和"小声语音"之间 ----
+  check('VAD 归一化的地板落在"真安静(≤0.0012)"和"小声语音(≥0.0016)"之间', () => {
+    const floor = SILENT_LEVEL_RMS * VAD_NORM.floorRatio;
+    if (!(floor > 0.0012)) throw new Error(`地板 ${floor} 太低 —— 真安静会被放大`);
+    if (!(floor < 0.0016)) throw new Error(`地板 ${floor} 太高 —— 小声的语音救不回来`);
+  });
+
+  // ---- ④ 只放大、不衰减 ----
+  check('VAD 归一化：只放大不衰减（响的块增益恒为 1）', () => {
+    for (const rms of [0.012, 0.02, 0.04, 0.2]) {
+      if (v.vadGainFor(rms, 0.0011) !== 1) throw new Error(`rms=${rms} 被衰减了 —— 这不是那条支路的目的`);
+    }
+  });
+
+  // ---- ④b ⭐ 上限必须**够得着**（否则它等于没有）----
+  check('VAD 归一化的增益上限是够得着的，且在极限小声处真的生效', () => {
+    const floor = SILENT_LEVEL_RMS * VAD_NORM.floorRatio;
+    const need = VAD_NORM.targetRms / floor;
+    // 上限必须比"地板处的需求"低，否则 Math.min 永远不生效（实测漏过一个变异就是这么来的）
+    if (!(VAD_NORM.maxGain < need)) {
+      throw new Error(`上限 ${VAD_NORM.maxGain} 比地板处的需求 ${need.toFixed(2)} 还高 ⇒ 上限够不着，等于没有`);
+    }
+    const g = v.vadGainFor(floor + 1e-9, 0.0011);
+    if (Math.abs(g - VAD_NORM.maxGain) > 1e-6) {
+      throw new Error(`地板处的增益是 ${g}×，应被压到上限 ${VAD_NORM.maxGain}×`);
+    }
+  });
+
+  // ---- ⑤ 缩放本身不改变长度（否则帧位置 / 绝对时间全乱）----
+  check('VAD 归一化：缩放不改变样本数，且夹到 int16 范围内', () => {
+    const a = new Int16Array([100, -100, 30000, -30000]);
+    const b = v.scaleInt16(a, 8);
+    if (b.length !== a.length) throw new Error(`长度变了 ${a.length} → ${b.length}`);
+    if (b[0] !== 800 || b[1] !== -800) throw new Error(`缩放不对 [${b[0]}, ${b[1]}]`);
+    if (b[2] !== 32767 || b[3] !== -32768) throw new Error(`没夹紧 [${b[2]}, ${b[3]}]`);
+    if (v.scaleInt16(a, 1) !== a) throw new Error('增益 1 时不该新建数组');
+  });
+
+  // ---- ⑥ 底噪估计：往下跟得快、往上跟得慢 ----
+  check('VAD 底噪估计：往下跟得快、往上跟得慢', () => {
+    const down = v.trackNoiseFloor(0.01, 0.001);
+    const up = v.trackNoiseFloor(0.001, 0.01);
+    if (!(down < 0.009)) throw new Error(`下降太慢：0.01 → ${down}`);
+    if (!(up < 0.002)) throw new Error(`上升太快：0.001 → ${up}（一段语音会被当成新底噪）`);
+  });
+
+  // ---- ⑦ 整条链路：底噪块不动、语音块被放大，交替也不串 ----
+  check('VAD 归一化：底噪与小声语音交替时，各自的表现都对', () => {
+    let floor = 0.0011;
+    const seq = [['q', 0.0011], ['q', 0.0010], ['s', 0.0022], ['s', 0.0029], ['q', 0.0012]];
+    for (const [tag, rms] of seq) {
+      const g = v.vadGainFor(rms, floor);
+      if (tag === 'q' && g !== 1) throw new Error(`底噪 ${rms} 被放大到 ${g}×`);
+      if (tag === 's' && !(g > 1)) throw new Error(`小声语音 ${rms} 没被放大`);
+      floor = v.trackNoiseFloor(floor, rms);
+    }
+  });
+}
+// ⚠️ 已知盲区（写下来而不是补一条永远不可能红的断言）：
+//   "`audio.push(int16)` 送的是**原始**音频、`lastInputRms` 记的是**原始**电平"
+//   这两条**纯函数断言盖不住** —— 它们在 `createSession` 闭包里，而那条路要 ONNX 才跑得起来。
+//   现在靠"构造上成立"（`audio.push(int16)` 在归一化之前、`scaleInt16` 返回新数组）
+//   加逐行复核保证，没有自动化覆盖。
+
 console.log('\n[4] 设置与提供方');
 const settings = loaded['lib/settings.js'];
 const asrIndex = loaded['lib/asr/index.js'];
