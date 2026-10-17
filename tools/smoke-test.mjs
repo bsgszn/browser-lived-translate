@@ -7952,9 +7952,12 @@ check('回落链里三个台阶都在（H.264 / VP9 / VP8），且都不为空',
     if (cands.some((c) => /matroska/i.test(c))) throw new Error('MKV 候选在 Chrome 上恒为 false，不该留着');
     if (cands.some((c) => /webm[^;]*;codecs="h264/i.test(c))) throw new Error('WebM+H.264 在 Chrome 上恒为 false，不该留着');
 
-    // 观察窗必须有界 —— 无界的话一个不报错的候选能把启动卡死
-    if (!(Number(dp.MIME_PROBE_MS) > 0 && Number(dp.MIME_PROBE_MS) <= 3000)) {
-      throw new Error(`MIME_PROBE_MS 必须是个有界的小值，实际 ${dp.MIME_PROBE_MS}`);
+    // 观察窗必须有界 —— 无界的话一个不报错的候选能把启动卡死。
+    // ⚠️ 下限也是真的：v2.66.59 的真机日志里，4K45 + MP4+AAC 的 8 秒只有 3 片
+    //    （平均 2.7s 一片，Chrome 的 MP4 muxer 按 fragment 边界切），
+    //    窗口压到 1s 左右会让每次**健康**的 MP4 启动都被判"没证实"。
+    if (!(Number(dp.MIME_PROBE_MS) >= 2500 && Number(dp.MIME_PROBE_MS) <= 4000)) {
+      throw new Error(`MIME_PROBE_MS 必须是 2.5~4s 之间的值（要给 MP4 首片留时间），实际 ${dp.MIME_PROBE_MS}`);
     }
   } finally {
     g.MediaRecorder = savedR;

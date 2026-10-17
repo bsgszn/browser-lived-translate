@@ -35,6 +35,7 @@ import {
   findStuckFlights,
   countInflight,
   classifyThinBuffer,
+  MIME_PROBE_MS,
   tailMergeTrigger,
   mergeTailText,
 } from '../lib/delayed-player.js';
@@ -826,9 +827,21 @@ async function startCapture() {
             true,
           );
         }
-        // 观察窗里既没分片也没报错 → 这个格式**没被证实**，坏了也不知道该怪谁
+        /**
+         * ⚠️ 观察窗里没拿到分片 **不等于**故障 —— v2.66.59 的真机日志打出来了：
+         * 4K45 + MP4+AAC，8 秒里只有 3 片（平均 2.7s 一片），因为 Chrome 的 MP4 muxer
+         * 按 **fragment 边界**切、`timeslice` 只当参考。所以 3s 窗口内拿不到首片是**常态**。
+         *
+         * 这条原来写成「⚠ …还没被证实」，在健康启动里也刷一条 —— 警告刷多了就没人看了 ✗。
+         * 现在降级成一句说明（不进 console）；真出不来时下面的「缓冲」诊断会用
+         * `no-output` / `no-frames` 明确报出来。
+         */
         if (s.proven === false) {
-          diag(`${s.mimeType || '这个格式'} 还没被证实 —— 启动观察窗里既没拿到分片，也没收到报错`, true);
+          diag(
+            `${s.mimeType || '这个格式'} 的首片还没到（观察窗 ${Math.round(MIME_PROBE_MS / 1000)}s）` +
+              '—— MP4 按 fragment 边界切、首片常要 2s+，属正常；一直不出会由下面的缓冲诊断报',
+            false,
+          );
         }
         // 码率直接决定运动画面糊不糊，必须能一眼看到
         if (s.bitrateNote) diag(`视频码率 · ${s.bitrateNote}`, true);
