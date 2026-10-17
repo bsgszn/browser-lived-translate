@@ -5017,7 +5017,15 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
     const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
     const m = src.match(/if\s*\(\s*reason\s*===\s*'max-length'\s*&&\s*vadOpts\.smartCut\s*\)/);
     if (!m) throw new Error("没有找到 `reason === 'max-length' && vadOpts.smartCut` 这个判据");
-    if (/reason\s*!==\s*'max-length'/.test(src)) throw new Error('判据被写反了');
+    /**
+     * ⚠️ 查"判据被写反"必须**盯住那个判据本身**（`reason !== 'max-length' && vadOpts.smartCut`），
+     * 不能只查 `reason !== 'max-length'` 这个片段 ✗
+     * —— 尾巴补白那句 `padEnd: ev.reason !== 'max-length'` 是**另一件事**（要不要补尾白），
+     *    和被写反的判据无关，却会被这个宽正则误判成"写反了" ✗（实测踩到 ✓）
+     */
+    if (/if\s*\(\s*reason\s*!==\s*'max-length'\s*&&\s*vadOpts\.smartCut/.test(src)) {
+      throw new Error('判据被写反了');
+    }
   });
 
   check('合理断句的开关默认开（老配置里没这个字段也必须开）', () => {
@@ -5451,7 +5459,7 @@ check('VAD 帧长只能有一个来源（两处口径不一致会让位置越算
   if (/frameSamples = VAD_FRAME_SAMPLES \}/.test(gateSrc)) {
     throw new Error('toSamples 还在用常量兜底 —— 必须用 this.frameSamples');
   }
-  if (!/toSamples\(startFrame, endFrame, \{ totalSamples, frameSamples = this\.frameSamples \}/.test(gateSrc)) {
+  if (!/toSamples\(startFrame, endFrame, \{ totalSamples, frameSamples = this\.frameSamples/.test(gateSrc)) {
     throw new Error('toSamples 的 frameSamples 默认值应当取自 this.frameSamples');
   }
   if (!/this\.frameMs = frameMs === null \|\| frameMs === undefined \? \(this\.frameSamples \/ VAD_SAMPLE_RATE\) \* 1000/.test(gateSrc)) {
