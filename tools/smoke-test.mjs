@@ -9029,6 +9029,35 @@ check('软边界计时器：响过一次就清零，不会重复收句', () => {
   if (t2.fire) throw new Error('重复收句 ✗');
 });
 
+/**
+ * ⭐「丢弃过短片段」—— 默认关 + 单独开关。
+ *
+ * ⚠️ 为什么要这个开关（而不是直接让「最短话段」生效）：
+ *    它曾经真的生效过，代价是「はい」「ええ」这类短应答整句消失 ——
+ *    用户反馈「丢信息」就是这个。所以现在**必须显式打开**才丢 ✓
+ * ⚠️ 而关着时，行为和以前**逐字一致** —— 那 400ms 只是个不参与判定的读数 ✓
+ */
+check('丢弃过短片段：默认**关**（打开才丢 —— 否则「はい」「ええ」会整句消失）', () => {
+  const v = loaded['lib/settings.js'].DEFAULT_SETTINGS.asr.vad;
+  if (v.vadDropShort !== false) throw new Error(`vadDropShort 默认值是 ${v.vadDropShort}，必须是 false`);
+  // ⚠️ 顺手确认真相邻的那个老开关没被带坏
+  if (v.vadSmartCut !== true) throw new Error('vadSmartCut 默认值被改了（应当仍是 true）');
+});
+
+check('丢弃过短片段：配置判法是 `=== true`（**缺省即关**）—— 别照抄 smartCut 的 `!== false`', () => {
+  // ⚠️ 这一条验的是**接线形状**，不是行为：那个 if 在 createSession 的闭包里，
+  //    纯函数断言够不到它（和 `evenFloor` 那次「定义了却没人用」是同一类盲区）。
+  //    所以这里显式写成源码检查，并把"为什么"写进报错 —— 而不是假装有行为覆盖 ✗
+  const src = stripComments(fs.readFileSync('lib/asr/vad.js', 'utf8'));
+  if (!/dropShort:\s*config\.vadDropShort\s*===\s*true/.test(src)) {
+    throw new Error('vad.js 里 dropShort 不是 `config.vadDropShort === true` —— 那样老配置会被当成"开"，等于默认丢东西 ✗');
+  }
+  if (!/if\s*\(\s*vadOpts\.dropShort\s*&&\s*ev\.tooShort\s*\)/.test(src)) {
+    throw new Error('vad.js 里没有「开关打开 && 这段过短才丢」那个守卫 —— 那最短话段仍然不生效 ✗');
+  }
+});
+
+
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);

@@ -78,6 +78,7 @@ const FIELDS = [
   ['vd-padMs', 'number', 'asr.vad.vadPadMs'],
   // 「合理断句」：到单句上限时回看换气处，把切点从"时间到的那一刻"挪过去（见 vad.js 的 findLullCut）
   ['vd-smartCut', 'checkbox', 'asr.vad.vadSmartCut'],
+  ['vd-dropShort', 'checkbox', 'asr.vad.vadDropShort'],
   ['wc-prompt', 'text', 'asr.whisperChunked.prompt'],
   ['wc-hotwords', 'text', 'asr.whisperChunked.hotwords'],
   ['wc-glossaryHotwords', 'checkbox', 'asr.whisperChunked.glossaryHotwords'],
