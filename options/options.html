@@ -341,7 +341,8 @@
 
           <p class="note" data-backend="whisper">
             <b>差麦克风 / 说话快怎么办</b>——先试下面的「自动增益档位」调到<b>温和</b>，
-            再到下面「本地 Whisper 服务」那一栏填<b>提示词</b>引导识别。
+            再到下面「识别提示词与热词」那一栏填<b>提示词</b>或<b>热词</b>引导识别
+            （VAD 和分片两条路共用，所以放在面板外面）。
             <b>两项都可以单独试，不满意就改回默认</b>（默认 = 一直以来的行为）。
           </p>
           <p class="note" data-backend="dashscope">
@@ -385,37 +386,13 @@
               <input type="number" id="wc-pauseSec" min="0.1" max="1.5" step="0.05" />
               <small class="hint">词与词之间静这么久就算一句说完。<b>调小 → 句子更短更容易断</b>；调大 → 更少断、句子更长。觉得字幕一句太长就往下调。</small>
             </label>
-            <label class="field wide">
-              <span>提示词（可选）</span>
-              <input type="text" id="wc-prompt" placeholder="例：日语直播，说话快，有底噪。常见词：配信、スパチャ、切り抜き" />
-              <small class="hint">
-                用来引导识别。<b>差音源 + 快语速时尤其有用</b>，但写太长或写偏会把识别带跑，所以默认是空的。
-                <br />
-                <b>这一项以前在 VAD 模式下不起作用</b>（接线漏了，分片模式才会发）—— 现在两种模式都会发出去。
-              </small>
-            </label>
-            <label class="field wide">
-              <span>识别热词（可选，每行一个）</span>
-              <textarea id="wc-hotwords" rows="3" placeholder="配信&#10;スパチャ&#10;切り抜き&#10;凸"></textarea>
-              <small class="hint">
-                只放<b>反复听错</b>的词，别写句子。它们会拼在「提示词」后面一起发给 Whisper，
-                总长有上限（约 140 字符，超了只带前面的、后面的丢掉）。
-                <br />
-                ⚠️ 别贴整段术语表 —— 项目实测过，一堵英文术语会把识别<b>严重带偏</b>。
-                想用术语表里那几句专有名词，勾下面的开关。
-              </small>
-            </label>
-            <label class="check">
-              <input type="checkbox" id="wc-glossaryHotwords" />
-              <span>把术语表里的源词也并入识别热词（默认关，会改变识别行为）</span>
-            </label>
           </div>
           <div class="checks">
             <label class="check"><input type="checkbox" id="wc-skipSilence" /> <span>跳过静音片段（省算力、避免幻听）</span></label>
           </div>
           <p class="hint">
-            <b>服务地址在上面那一栏</b>（「本地 Whisper 服务」）—— 它和识别校正共用同一个地址，
-            所以没有放在这里，免得两个地方各填一份。
+            <b>服务地址、提示词、识别热词都在上面那一栏</b>（「本地 Whisper 服务」/「识别提示词与热词」）——
+            它们和 VAD、识别校正共用，所以没有放在这里，免得两个地方各填一份。
           </p>
         </div>
 
@@ -452,6 +429,42 @@
           ⚠️ <b>whisper.cpp 完全忽略「模型名」那一栏</b> —— 模型由它启动时的 <code>-m</code> 参数决定。
           填错也不影响，但别指望改这里能换模型。
         </p>
+
+        <!--
+          ⚠️ 提示词 / 识别热词必须放在**所有 data-panel 之外**。
+          它们对 VAD 和分片**两条路都生效**（`vad.js` 与 `whisper-chunked.js` 共用
+          `buildWhisperPrompt`），原来只写在「Whisper 分片」面板里 ——
+          用 VAD 的人根本看不见它，等于"参数生效却调不到"。
+          这跟「识别校正被误放进 panel」是同一类错配，所以按约定放在外面。
+        -->
+        <h4>识别提示词与热词<span class="sub">VAD 与分片两条路共用 · 只对本地 Whisper 生效</span></h4>
+        <div class="grid">
+          <label class="field wide">
+            <span>提示词（可选）</span>
+            <input type="text" id="wc-prompt" placeholder="例：日语直播，说话快，有底噪" />
+            <small class="hint">
+              用来引导识别。<b>差音源 + 快语速时尤其有用</b>，但写太长或写偏会把识别带跑，所以默认是空的。
+              <br />
+              Whisper 只取 prompt 的<b>末尾 224 token</b> —— 写长了前面会被截掉，所以这里别写长句。
+            </small>
+          </label>
+          <label class="field wide">
+            <span>识别热词（可选，每行一个）</span>
+            <textarea id="wc-hotwords" rows="3" placeholder="配信&#10;スパチャ&#10;切り抜き&#10;凸"></textarea>
+            <small class="hint">
+              只放<b>反复听错</b>的词，别写句子。它们会拼在「提示词」后面一起发给 Whisper，
+              总长有上限（约 140 字符；超了从后面丢词，<b>不会动你的提示词</b>）。
+              <br />
+              ⚠️ 别贴整段术语表 —— 实测过，一堵英文术语会把识别<b>严重带偏</b>。
+            </small>
+          </label>
+        </div>
+        <div class="checks">
+          <label class="check">
+            <input type="checkbox" id="wc-glossaryHotwords" />
+            <span>把术语表里的源词也并入识别热词（默认关，会改变识别行为）</span>
+          </label>
+        </div>
 
         <!--
           ⚠️ 识别校正必须放在**所有 data-panel 之外**。

@@ -953,7 +953,11 @@ subscriber moderators livestream graduation
   以及下面的「识别热词」
 - 提示词仍按**字符数**封顶（Whisper 的 prompt 只有 224 token）
 
-> **v2.66.63 起多了「识别热词」框**（设置页 → 本地 Whisper，和「提示词」分开）：
+> **v2.66.63 起多了「识别热词」框**（设置页 → **「识别提示词与热词」**那一栏，和「提示词」分开）：
+>
+> ⚠️ 这一栏和本地 Whisper 的地址一样放在**服务商面板外面** —— 因为 VAD 和分片**两条路共用它**
+> （`vad.js` 与 `whisper-chunked.js` 调的是同一个 `buildWhisperPrompt`）。选 Deepgram 时它也看得见，
+> 只是那时不发给 Deepgram（那是另一个字段 `asr.deepgram.keyterms`）。
 >
 > | | 提示词 | 识别热词 |
 > |---|---|---|

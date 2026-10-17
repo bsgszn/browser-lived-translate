@@ -2787,6 +2787,19 @@ check('共用字段必须放在所有 data-panel 之外，专属字段必须留�
     if (where) throw new Error(`${id} 在「${where.trim()}」里面 —— 它是两个功能共用的地址，必须一直可见`);
   }
 
+  /**
+   * ⚠️ 提示词 / 识别热词同样是**共用字段**：VAD 和分片两条路都会发（同一个 `buildWhisperPrompt`）。
+   * 它们一度只写在「Whisper 分片」面板里 —— 用 VAD 的人根本看不见，
+   * 正是这条断言要防的"参数生效却调不到"。
+   */
+  for (const id of ['wc-prompt', 'wc-hotwords', 'wc-glossaryHotwords']) {
+    const where = inPanel(id);
+    if (where === 'NOT-FOUND') throw new Error(`找不到 ${id}`);
+    if (where) {
+      throw new Error(`${id} 在「${where.trim()}」里面 —— VAD 和分片都要用它，必须放在所有 data-panel 之外`);
+    }
+  }
+
   // 反过来也要成立：Whisper 专属的字段**应该**留在 panel 里
   for (const id of ['wc-chunkSeconds', 'wc-skipSilence']) {
     if (!inPanel(id)) throw new Error(`${id} 跑出 panel 了 —— 那它会对所有识别服务都显示`);
