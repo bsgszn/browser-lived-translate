@@ -2550,6 +2550,54 @@ check('VAD 拒绝计数：按原因分开，不许把"闸门"也叫成"幻听"',
   if (dirty !== '') throw new Error(`脏值应视为 0（得空串），实际「${dirty}」`);
   if (/NaN|undefined/.test(dirty)) throw new Error(`脏值印出了 NaN/undefined：「${dirty}」`);
 });
+
+/**
+ * 「空文本接力」（v2.66.62）—— 一段音频识别出**空文本**时，音频不能丢。
+ *
+ * ⭐ 真实日志（v2.66.61 用户导出，本地 Whisper）:
+ *     [+81.796s] 闸门丢弃 · 丢弃一段识别结果 · 空文本 · 原文「」
+ *   而同一段音频在导出的 WAV 里 RMS 是 **0.027~0.040**（和正常语音同量级），
+ *   VAD 当时也判「说话中」。结果「して定期的にすることっていうのは…」整句消失，
+ *   下一句从「ための話だと思ってるのね」这个半句开始 ✗
+ *
+ * 病根不是闸门判错，而是**"空"被当成了"没有内容"**。
+ */
+check('空文本接力：起点只前挪、有上限、不越过缓冲区', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const C = v.carryStartFor;
+  if (typeof C !== 'function') throw new Error('vad.js 没有导出 carryStartFor —— 提不到模块级就没法验');
+  if (!(Number(v.CARRY_MAX_MS) > 0)) throw new Error('没有 CARRY_MAX_MS');
+  const sr = 16000;
+  const cap = Math.round((sr * v.CARRY_MAX_MS) / 1000);
+  // ① 没有待接力的音频 → 起点原样
+  if (C({ start: 1000, carryFrom: -1 }) !== 1000) throw new Error('没有接力时不该动起点');
+  // ② 有接力 → 从更早那一点开始（这就是"把上一段音频带上"）
+  if (C({ start: 1000, carryFrom: 400, baseOffset: 0 }) !== 400) throw new Error('有接力时应当从接力点开始');
+  // ③ 接力点反而更晚（不该发生）→ 取 min，不许把起点往后挪
+  if (C({ start: 1000, carryFrom: 1200, baseOffset: 0 }) !== 1000) throw new Error('接力点晚于当前时应取当前');
+  // ④ 最多往前 CARRY_MAX_MS —— 否则一句没识出会把整段历史都带上
+  const startAfterCap = cap + 5000;
+  if (C({ start: startAfterCap, carryFrom: 0, baseOffset: 0, capSamples: cap }) !== 5000) {
+    throw new Error('接力没有按上限截断');
+  }
+  // ⑤ 不能越过缓冲区起点 —— 早于 baseOffset 的音频 `takeRange` 取不到，白算
+  if (C({ start: 1000, carryFrom: 100, baseOffset: 700 }) !== 700) throw new Error('接力越过了缓冲区起点');
+  // ⑥ 脏值不许抛
+  if (C({}) !== undefined || C() !== undefined) throw new Error('缺参数时应当原样返回 undefined');
+  if (!Number.isNaN(C({ start: NaN, carryFrom: 5 }))) throw new Error('start 非法时应原样返回 NaN');
+});
+
+check('VAD 拒绝计数：接力**不是**"拦掉"', () => {
+  const S = loaded['lib/asr/vad.js'].rejectedSummary;
+  const withCarry = S(0, 0, 1, 2);
+  if (!/空文本 1/.test(withCarry)) throw new Error(`丢了 1 段空文本没标出来：「${withCarry}」`);
+  if (!/空文本接力 2/.test(withCarry)) throw new Error(`接力次数没标出来：「${withCarry}」`);
+  // ⚠️ 接力是被**救回来**的，不能读成"已拦掉"
+  if (/已拦掉[^·]*接力/.test(withCarry)) throw new Error(`接力被算进了「已拦掉」：「${withCarry}」`);
+  // 没有接力时，输出必须和原来一字不差（别把老日志的读法改了）
+  if (S(1, 0, 0, 0) !== S(1, 0, 0)) throw new Error('carried=0 时输出应当和原来完全一致');
+  if (S(0, 0, 0, 0) !== '') throw new Error('全零时应当为空串');
+});
 await checkAsync('识别校正：拿不到置信度时 refine 必须报 ok=false', async () => {
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
   s.asr.provider = 'whisper-chunked';
