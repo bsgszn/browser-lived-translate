@@ -8975,5 +8975,60 @@ console.log('\n[3f] 导出头的「时间对齐」与「电平分布」—— �
   });
 }
 
+/**
+ * ⭐ 软边界之后的静默计时器（`softEndNeed` / `softEndTick`）。
+ *
+ * ⚠️ 为什么需要它 —— 这是「句子留不住」的根子：
+ *   软边界只发 `final`、不收句（设计就是"和后面拼"），
+ *   而「静音继续到收句门槛就该收句」这条**只在 `flushSpeech` 里被检查**。
+ *   而 `flushSpeech` 只在**有新分片要发**时才被调用 ✗
+ *   ⇒ 人真停了 ⇒ 没有下一个分片 ⇒ 那条判据**永远不会再被检查** ✗
+ *   ⇒ 碎片在 pending 里干等，最后被看门狗硬吐成一条「1 字」的字幕 ✗
+ *   也就是说：它的触发条件，恰恰是它自己的前提所排除的那个条件。
+ */
+check('软边界计时器：还差多少静音 = 收句门槛 − 已静音（480/900 → 差 420）', () => {
+  const got = loaded['lib/asr/vad.js'].softEndNeed(480, 900, false);
+  if (got !== 420) throw new Error(`应为 420，得到 ${got}`);
+});
+
+check('软边界计时器：已按硬边界收句 → 不需要待收；门槛非法 → 也不进入待收', () => {
+  if (loaded['lib/asr/vad.js'].softEndNeed(480, 900, true) !== 0) throw new Error('hard 时应当 0');
+  if (loaded['lib/asr/vad.js'].softEndNeed(950, 900, false) !== 0) throw new Error('静音已超门槛应为 0');
+  if (loaded['lib/asr/vad.js'].softEndNeed(100, 0, false) !== 0) throw new Error('门槛 0 应为 0');
+  if (loaded['lib/asr/vad.js'].softEndNeed(100, NaN, false) !== 0) throw new Error('门槛 NaN 应为 0');
+});
+
+check('软边界计时器：420ms 需 11 帧（40ms/帧）—— 第 10 帧不许响、第 11 帧必须响', () => {
+  let st = { needMs: 420, silentMs: 0 };
+  let firedAt = 0;
+  for (let i = 1; i <= 11; i += 1) {
+    const t = loaded['lib/asr/vad.js'].softEndTick(st, { inSpeech: false, frameMs: 40 });
+    st = { needMs: t.needMs, silentMs: t.silentMs };
+    if (t.fire) firedAt = i;
+  }
+  if (firedAt !== 11) throw new Error(`应在第 11 帧响，实际 ${firedAt}`);
+  // ⚠️ 反向：只走 10 帧（400ms < 420）**不许**响 —— 否则断言对"提前收句"的单边改法无效
+  let st2 = { needMs: 420, silentMs: 0 };
+  for (let i = 1; i <= 10; i += 1) {
+    const t = loaded['lib/asr/vad.js'].softEndTick(st2, { inSpeech: false, frameMs: 40 });
+    st2 = { needMs: t.needMs, silentMs: t.silentMs };
+    if (t.fire) throw new Error(`第 ${i} 帧就响了 —— 提前收句 ✗`);
+  }
+});
+
+check('软边界计时器：人又开口 → 作废（不许收在半句话中间）', () => {
+  const t = loaded['lib/asr/vad.js'].softEndTick({ needMs: 420, silentMs: 400 }, { inSpeech: true, frameMs: 40 });
+  if (t.fire) throw new Error('开口了还响 ✗');
+  if (t.needMs !== 0 || t.silentMs !== 0) throw new Error('开口后应当作废清零');
+});
+
+check('软边界计时器：响过一次就清零，不会重复收句', () => {
+  const t1 = loaded['lib/asr/vad.js'].softEndTick({ needMs: 420, silentMs: 400 }, { inSpeech: false, frameMs: 40 });
+  if (!t1.fire) throw new Error('该响没响');
+  const t2 = loaded['lib/asr/vad.js'].softEndTick({ needMs: t1.needMs, silentMs: t1.silentMs }, { inSpeech: false, frameMs: 40 });
+  if (t2.fire) throw new Error('重复收句 ✗');
+});
+
+
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
