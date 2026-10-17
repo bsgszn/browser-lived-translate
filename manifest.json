@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "livedtranslate · 浏览器同声传译",
-  "version": "2.66.62",
+  "version": "2.66.63",
   "description": "捕获任意标签页的音频做实时语音识别与翻译：可在原页面叠双语字幕，也可推迟画面播放让字幕与画面对齐。",
   "minimum_chrome_version": "116",
   "permissions": [
