@@ -2917,11 +2917,52 @@ check('字数/时长：绝对判据拦幻觉，闭环误杀的两句必须保住
 });
 
 /**
- * ⭐ 「字数时长」要**单独计数并印出来**（v2.66.76）—— 它和「幻听套话」是两种幻觉：
- *   · 套话命中 → 内容是固定模板（`ご視聴ありがとうございました`）
- *   · 这条     → 内容不定，但**字数超过这段音频物理上能说出的量**
- * 混在一个数里就判断不出是哪一层在干活 ✗
+ * ⭐ **硬切之后掉下来的尾巴,文本不采信**（v2.66.77）
+ *
+ * 实测形态（用户真机 v2.66.75，三份日志同一形状）：
+ *   分片 5.2s · 26 字 · 收句（够长）          ← 到上限**硬切**一刀
+ *   分片 0.7s ·  2 字 · 静音 480ms · 先不收   ← 尾巴，语音只剩 220ms
+ * → 那两个字（「ある」，真值是「お札」）被合并进下一句，把好句子弄坏了 ✗
+ *
+ * ⚠️ 判据必须**同时**看 `prevCut === 'max-length'` 和 `speechMs < 250` ——
+ *    只看时长会误伤「はい」「ええ」（它们也是短语音，但是**完整的一句话** ✗）
  */
+check('硬切尾巴：上一段是 max-length 且语音 < 250ms 时，文本不采信', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const T = v.isHardCutTail;
+  if (typeof T !== 'function') throw new Error('vad.js 没有导出 isHardCutTail');
+  if (v.HARD_CUT_TAIL_SPEECH_MS !== 250) {
+    throw new Error(`门槛常量被改动（${v.HARD_CUT_TAIL_SPEECH_MS}），下面的窗口断言要一起重算`);
+  }
+
+  // ① 必须判：真机日志里那个形状（硬切之后 0.22 秒语音）
+  if (!T('max-length', 220)) throw new Error('硬切尾巴（220ms）没判出来');
+
+  // ② 门槛是**开区间** `speechMs < 250`：249 判、250 不判 —— 两边都要验，
+  //    否则「一律判」和「一律不判」都能让单边断言通过 ✗
+  if (!T('max-length', 249)) throw new Error('249ms 该判（< 250）');
+  if (T('max-length', 250)) throw new Error('250ms 不该判（门槛是严格小于）');
+
+  // ③ ⭐ 不许误伤：完整短应答
+  //    · 「はい」这类是**自然静音**收的 → prevCut 不是 max-length ✓
+  //      ⚠️ 这一条**必须给 < 250ms 的时长** —— 否则它进不了那条分支，
+  //         变异「去掉 prevCut 判据」就抓不到（第一版就是这样漏的 ✗）
+  if (T('silence', 220)) throw new Error('自然静音收的短应答被误判（「はい」会消失）');
+  if (T('silence', 350)) throw new Error('自然静音收的短应答被误判（「はい」会消失）');
+  if (T('utterance-end', 200)) throw new Error('utterance-end 收的短应答被误判');
+  //    · 即使是硬切之后的，只要语音够长（≥250ms）也照常合并 ✓
+  if (T('max-length', 380)) throw new Error('语音 380ms 的完整短应答被误判');
+  if (T('max-length', 1200)) throw new Error('语音 1.2s 的更不该判');
+
+  // ④ 拿不到可信信息时**不许判**（宁可放过，也不能凭 undefined 丢东西 ✗）
+  if (T('max-length', NaN)) throw new Error('NaN 不该判');
+  if (T('max-length', undefined)) throw new Error('undefined 不该判');
+  if (T('max-length', null)) throw new Error('null 不该判');
+  if (T('', 100)) throw new Error('空 prevCut 不该判');
+  if (T(undefined, 100)) throw new Error('undefined prevCut 不该判');
+  if (T(null, 100)) throw new Error('null prevCut 不该判');
+});
+
 check('VAD 拒绝计数：字数时长要单独一格，不许混进幻听', () => {
   const v = loaded['lib/asr/vad.js'];
   const S = v.rejectedSummary;
