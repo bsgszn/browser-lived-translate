@@ -3351,20 +3351,19 @@ check('延迟画面可以降分辨率（可选，不是默认）', () => {
     throw new Error('没有按高度等比缩放');
   }
   /**
-   * ⚠️ 宽高都取偶 —— 但这是**规范化，不是修 bug**。
-   *
-   * 以前这里用的是 `Math.round`，它会产出奇数（实测 2561×1440/1441 → 2559）。
-   * ⚠️ **但"奇数会让编码器产不出数据"这个猜测已被两次实测推翻**（见 `player.js`
-   * 里 `evenFloor` 的注释），所以取偶在这里只是让尺寸规整，**别把它当病因**。
-   *
-   * ⚠️ 取偶工具本身也在这里一起验 —— 它原来还有第二个调用点（采集侧），
-   * v2.66.31 删掉了（收益为零、代价未知），现在**只剩降分辨率这一处**。
+   * ⚠️ 宽高都取偶 —— 在这条路上是纯粹规范化（本来就在缩放）。
+   * 但**约束对象必须把 `maxFrameRate` 一起带上**：`applyConstraints` 是整组替换约束，
+   * 没写进去的属性会恢复默认值 —— 漏了它，这个"降分辨率省 CPU"的流反而会按更高帧率跑 ✗
    */
   if (!/function evenFloor\(n\) \{/.test(src)) throw new Error('没有 evenFloor 这个取偶工具');
   if (!/v >= 2 \? v - \(v % 2\) : 0/.test(src)) throw new Error('evenFloor 没有正确取偶');
   if (!/const w = evenFloor\(/.test(src)) throw new Error('降分辨率的宽度没取偶');
   if (!/const h = evenFloor\(maxHeight\)/.test(src)) throw new Error('降分辨率的高度没取偶');
-  if (!/applyConstraints\(\{ width: w, height: h \}\)/.test(src)) throw new Error('没有按高度等比缩放');
+  if (!/const sc = \{ width: w, height: h \};/.test(src)) throw new Error('降分辨率的约束对象没建出来');
+  if (!/sc\.frameRate = \{ max: maxFrameRate \}/.test(src)) {
+    throw new Error('降分辨率时把帧率上限丢了（applyConstraints 会整组替换约束）');
+  }
+  if (!/applyConstraints\(sc\)/.test(src)) throw new Error('没有按高度等比缩放');
   if (!/await playback\.start\(recordStream\)/.test(src)) throw new Error('录音用的还是原始流，缩放没生效');
   // 缩放失败必须退回原样，不能整个起不来
   if (!/降分辨率失败/.test(src)) throw new Error('缩放失败要退回原样并说明');
@@ -3400,7 +3399,18 @@ check('采集侧奇数尺寸要取偶（编码器可能直接拒绝奇数配置�
   if (iEven < 0) throw new Error('采集侧没有取偶');
   if (!(iTrack < iEven)) throw new Error('取偶必须在拿到视频轨之后');
   if (!(iEven < iSize)) throw new Error('取偶必须在读尺寸（算码率）之前 —— 否则码率还是按旧尺寸估的');
-  if (!/applyConstraints\(\{ width: w1, height: h1 \}\)/.test(cap)) throw new Error('取偶没有真的 applyConstraints');
+  if (!/const c = \{ width: w1, height: h1 \};/.test(cap)) throw new Error('取偶的约束对象没建出来');
+  /**
+   * ⚠️ 必须把 `maxFrameRate` 一起带上 —— `applyConstraints` 是**整组替换**约束
+   * （MDN：未包含的属性恢复默认值）。漏了它，取偶会顺手把帧率上限丢掉：
+   * 4K 60fps 的源照 60 采集，正好抵消掉"省 CPU"的初衷 ✗
+   */
+  if (!/c\.frameRate = \{ max: maxFrameRate \}/.test(cap)) {
+    throw new Error('取偶把帧率上限丢了（applyConstraints 会整组替换约束）');
+  }
+  if (!/applyConstraints\(c\)/.test(cap)) throw new Error('取偶没有真的 applyConstraints');
+  // 上限真丢了要能在日志里看见（读回来的 frameRate 明显超过上限）
+  if (!/帧率上限没保住/.test(cap)) throw new Error('帧率上限没保住时要报出来');
   // ⚠️ 只有真的是奇数才动 —— 偶数本来就是对的，碰它没有收益
   if (!/w1 !== w0 \|\| h1 !== h0/.test(cap)) throw new Error('应当只对奇数尺寸动手');
   /**
@@ -7517,16 +7527,24 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
   };
 
   /**
-   * 装一套假环境。`plan[i]` 决定第 i+1 个候选的录制器怎么表现:
+   * 装一套假环境。`plan` 是一个数组，**按 `mimeCandidates(尺寸)` 的顺序**决定行为:
    *   'ok'      正常吐分片
    *   'throw'   `start()` 同步抛
    *   'error'   `onerror` 异步报 EncodingError   ← 真实用户那条
-   *   'nothing' 既不分片也不报错
+   *   'nothing' 既不分片也不报错（静止标签页的形态）
+   *   'sbthrow' `addSourceBuffer` 就抛（MSE 不认这个容器）
+   *
+   * ⚠️ 候选的行为**按 mime 对**，不按"第几次构造"对。
+   * 原来的 `plan[this._i]` 用的是构造序号，而 `addSourceBuffer` 用的是
+   * `MIME_CANDIDATES.indexOf(m)` —— 两套下标只在"每个候选恰好构造一个 recorder"时才对齐，
+   * 而 `addSourceBuffer` 失败的那次根本不构造 recorder，序号就错位了 ✗
+   * 用例⑦ 之前就是靠 900ms 超时"碰巧"通过的，它验的其实是"超时也算成功"。
    */
   function install(plan) {
     const calls = [];
     const made = [];
-    let idx = 0;
+    const chain = dp.mimeCandidates({ width: 2560, height: 1440 });
+    const modeOf = (m) => plan[chain.indexOf(m)] || 'throw';
     class FakeSB {
       constructor() {
         this.mode = 'segments';
@@ -7563,8 +7581,7 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
       addSourceBuffer(m) {
         if (!m) throw new Error('空 mime');
         // 'sbthrow' → 这个候选在"建缓冲"这一步就失败（MSE 不认这个容器）
-        const i = dp.MIME_CANDIDATES.indexOf(m);
-        if (i >= 0 && plan[i] === 'sbthrow') throw new Error('This SourceBuffer type is not supported.');
+        if (modeOf(m) === 'sbthrow') throw new Error('This SourceBuffer type is not supported.');
         return new FakeSB();
       }
       endOfStream() {
@@ -7585,12 +7602,12 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
         this.ondataavailable = null;
         this.onerror = null;
         this.onstop = null;
-        this._i = idx++;
+        this._mode = modeOf(opts.mimeType);
         calls.push(this.mimeType);
         made.push(this);
       }
       start() {
-        const mode = plan[this._i] || 'throw';
+        const mode = this._mode;
         if (mode === 'throw') throw new Error('The given encoder configuration is not supported by the encoder.');
         this.state = 'recording';
         setTimeout(() => {
@@ -7618,7 +7635,6 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
     g.MediaSource = FakeMS;
     g.URL.createObjectURL = () => 'blob:fake';
     g.URL.revokeObjectURL = () => {};
-    idx = 0;
     return { calls, made };
   }
   function restore() {
@@ -7689,8 +7705,8 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
       if (r.ret !== true) problems.push(`同步抛时应当退到下一个并返回 true，实际 ${r.ret}`);
       if (!rec) problems.push('同步抛时没有 recording 状态');
       else {
-        if (!/avc1\.4D401E|h264/i.test(rec.mimeType || rec.mimeType === '' ? '' : ''))
-          ; // 只要求"不是第一个"，下面统一判
+        // 选中的必须是**后面**那个候选，不能原地复用第一个
+        if (rec.mimeType === r.env.calls[0]) problems.push(`同步抛之后仍然用了第一个候选 ${rec.mimeType}`);
         if ((rec.fallbacks || []).length !== 1) problems.push(`同步抛时应当记 1 条回落，实际 ${(rec.fallbacks || []).length}`);
         else if (!/start\(\) 抛错/.test(rec.fallbacks[0])) problems.push(`回落原因没写清是 start() 抛的: ${rec.fallbacks[0]}`);
       }
@@ -7712,7 +7728,9 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
 
     // ④ 全部候选都失败 → **不许抛**，退化成"只报错不出画面"（字幕照常的前提）
     {
-      const all = ['throw', 'error', 'throw', 'error', 'throw', 'error', 'throw', 'error', 'throw'];
+      const all = dp
+        .mimeCandidates({ width: 2560, height: 1440 })
+        .map((_, i) => (i % 2 ? 'error' : 'throw'));
       const r = await once(all);
       const failed = r.statuses.find((s) => s.phase === 'recorder-failed');
       if (r.threw) problems.push(`全部失败时不该抛（抛了字幕也会一起没）: ${r.threw.message}`);
@@ -7759,15 +7777,62 @@ await checkAsync('录制器报错/自己停了必须有话说，且编码器拒�
     {
       // 第 1 个候选的 addSourceBuffer 抛 —— 走"建立失败"那条路
       const plan = ['sbthrow', 'ok'];
-      // plan 按 MIME_CANDIDATES 的下标查，所以把 'sbthrow' 放到第 0 位
+      // plan 按 mimeCandidates(尺寸) 的下标查（见 install 里的说明），所以 'sbthrow' 在第 0 位
       const r = await once(plan);
       r.pb.stop();
       const rec = r.statuses.find((s) => s.phase === 'recording');
       if (r.threw) problems.push(`建立缓冲失败时不该让 start() 抛出来: ${r.threw.message}`);
       if (!rec) problems.push('建立缓冲失败时没有退到下一个候选');
-      else if (!(rec.fallbacks || []).some((x) => /建立失败/.test(x))) {
-        problems.push(`"建立缓冲失败"没被记进回落记录: ${JSON.stringify(rec.fallbacks)}`);
+      else {
+        if (!(rec.fallbacks || []).some((x) => /建立失败/.test(x))) {
+          problems.push(`"建立缓冲失败"没被记进回落记录: ${JSON.stringify(rec.fallbacks)}`);
+        }
+        // ⚠️ 第二个候选必须**真的跑起来**（拿到分片），不能靠观察窗超时"算成功"
+        if (rec.proven === false) problems.push('建立失败之后，下一个候选没有被证实（靠超时放行）');
       }
+    }
+
+    /**
+     * ⑧ **迟到的失败**：观察窗过了（`assumed`）、`start()` 已经返回，
+     * 编码器这时才报 `EncodingError` —— 仍然必须换下一个候选。
+     *
+     * ⚠️ 这条钉的是 v2.66.57 的主修。真实的触发路径是**静止标签页**：
+     *   开头没有帧 → 一个分片都没有 → 观察窗只能判 assumed →
+     *   用户点播放、第一个真实帧到达 → 编码器才拒绝配置。
+     * 旧代码在这里只报 `recorder-error`、不再回落，于是用户看到的还是黑屏 ✗
+     */
+    {
+      const r = await once(['nothing', 'ok']);
+      const before = r.statuses.filter((s) => s.phase === 'recording').length;
+      if (r.ret !== true) problems.push(`观察窗超时应当先放行（返回 true），实际 ${r.ret}`);
+      if (r.env.calls.length !== 1) problems.push(`第一个候选没报错时不该提前换，实际试了 ${r.env.calls.length} 个`);
+      const rec = r.env.made[r.env.made.length - 1];
+      if (rec && rec.onerror) {
+        rec.onerror({
+          error: {
+            name: 'EncodingError',
+            message: 'The given encoder configuration is not supported by the encoder.',
+          },
+        });
+      } else {
+        problems.push('假录制器没有 onerror —— 没法复现迟到的失败');
+      }
+      // 等回落链跑完：换候选 → 新候选吐分片 → 重起 clocks
+      await new Promise((res) => setTimeout(res, 80));
+      const recs = r.statuses.filter((s) => s.phase === 'recording');
+      const last = recs[recs.length - 1];
+      if (recs.length !== before + 1) {
+        problems.push(`迟到的报错之后应当再发一条 recording 状态，实际 ${recs.length - before} 条`);
+      } else if (!last.retried) {
+        problems.push('迟到回落之后的状态里应当带 retried（否则日志里看不出换过格式）');
+      }
+      if (r.env.calls.length !== 2) {
+        problems.push(`迟到的报错之后应当换到第 2 个候选，实际试了 ${r.env.calls.length} 个`);
+      }
+      if (last && !(last.fallbacks || []).some((x) => /迟到的 EncodingError/.test(x))) {
+        problems.push(`迟到的失败没被记进回落记录: ${JSON.stringify(last.fallbacks)}`);
+      }
+      r.pb.stop();
     }
   } finally {
     restore();
@@ -7799,6 +7864,32 @@ check('回落链里三个台阶都在（H.264 / VP9 / VP8），且都不为空',
     const chain = dp.mimeFallbacks();
     if (chain.length < 3) throw new Error(`回落链太短（${chain.length} 个），至少要有 H.264 / VP9 / VP8 三档`);
     for (const c of chain) if (!/^(video|audio)\//.test(c)) throw new Error(`候选里混进了不是 MIME 的东西: ${c}`);
+
+    /**
+     * ⚠️ H.264 的 **level 必须按分辨率算**。
+     *
+     * 旧候选写死 `avc1.42E01E` / `avc1.4D401E`，两档都是 **L3.0**（上限 720×480@30 / 10 Mbps）。
+     * 而 1440p/4K 的源必然被编码器拒绝 —— 于是"H.264 优先"从来没成立过，
+     * 只是被回落链藏住了（每次启动先撞一次墙）。
+     */
+    const lv1080 = dp.avcCodecFor(1920, 1080);
+    const lv1440 = dp.avcCodecFor(2560, 1440);
+    const lv4k = dp.avcCodecFor(3840, 2160);
+    if (!(lv1080 !== lv1440 && lv1440 !== lv4k)) {
+      throw new Error(`level 没按分辨率变: 1080p=${lv1080} 1440p=${lv1440} 4K=${lv4k}`);
+    }
+    if (!/^avc1\.640032$/.test(lv1440)) throw new Error(`1440p 应当用 High 5.0，实际 ${lv1440}`);
+    if (!/^avc1\.640033$/.test(lv4k)) throw new Error(`4K 应当用 High 5.1，实际 ${lv4k}`);
+    const cands = dp.mimeCandidates({ width: 2560, height: 1440 });
+    if (!cands[0].includes(lv1440)) throw new Error(`候选没有用按分辨率算出来的 level: ${cands[0]}`);
+    // 必须有一条 H.264 + Opus：绕开平台 AAC，同时还想吃硬件编码
+    if (!cands.some((c) => /^video\/mp4/.test(c) && /opus/.test(c))) {
+      throw new Error('缺 H.264 + Opus 的候选（AAC 缺失的机器就靠它）');
+    }
+    // 死候选不许回来：MKV 容器 / WebM 里的 H.264 在 Chrome 上恒为 false
+    if (cands.some((c) => /matroska/i.test(c))) throw new Error('MKV 候选在 Chrome 上恒为 false，不该留着');
+    if (cands.some((c) => /webm[^;]*;codecs="h264/i.test(c))) throw new Error('WebM+H.264 在 Chrome 上恒为 false，不该留着');
+
     // 观察窗必须有界 —— 无界的话一个不报错的候选能把启动卡死
     if (!(Number(dp.MIME_PROBE_MS) > 0 && Number(dp.MIME_PROBE_MS) <= 3000)) {
       throw new Error(`MIME_PROBE_MS 必须是个有界的小值，实际 ${dp.MIME_PROBE_MS}`);

@@ -696,6 +696,7 @@ async function startCapture() {
   let evenNote = '';
   let evenFail = '';
   let evenIgnored = false;
+  let evenFps = 0;
   try {
     const s0 = vtrack.getSettings();
     const w0 = Number(s0.width) || 0;
@@ -704,10 +705,19 @@ async function startCapture() {
     const h1 = evenFloor(h0);
     // 只有真的是奇数才动 —— 偶数本来就是对的，碰它没有收益
     if (w1 && h1 && (w1 !== w0 || h1 !== h0)) {
-      await vtrack.applyConstraints({ width: w1, height: h1 });
+      /**
+       * ⚠️ `applyConstraints` 是**整组替换**约束：没写进去的属性会恢复成默认值
+       * （MDN 写得很明确）。所以必须把 `maxFrameRate` 一起带上 ——
+       * 否则取偶会顺手把帧率上限丢掉，4K 60fps 的源照 60 采集，
+       * 正好抵消掉这里想省的 CPU，而日志还会照着旧变量印"（上限 60）"，等于在说谎 ✗
+       */
+      const c = { width: w1, height: h1 };
+      if (maxFrameRate > 0) c.frameRate = { max: maxFrameRate };
+      await vtrack.applyConstraints(c);
       const s1 = vtrack.getSettings();
       const w2 = Number(s1.width) || 0;
       const h2 = Number(s1.height) || 0;
+      evenFps = Number(s1.frameRate) || 0;
       evenNote = `${w0}×${h0} → ${w2 || '?'}×${h2 || '?'}`;
       evenIgnored = w2 === w0 && h2 === h0;
     }
@@ -729,6 +739,18 @@ async function startCapture() {
         : `奇数尺寸取偶 · ${evenNote} —— 编码器对奇数分辨率可能直接拒绝`,
       true,
     );
+    /**
+     * ⚠️ 取偶会整组替换约束（见上面那段）—— 帧率上限有没有被顺手丢掉，必须能看见。
+     * 读回来的 `frameRate` 明显超过用户设的上限，就说明 `frameRate` 约束没生效，
+     * 这正是"4K 60fps 吃满 CPU"的入口。
+     */
+    if (maxFrameRate > 0 && evenFps > maxFrameRate + 1) {
+      diag(
+        `⚠ 取偶之后帧率上限没保住 · 实际 ${Math.round(evenFps)}fps > 上限 ${maxFrameRate}fps` +
+          ` —— 4K 下这会多吃 CPU`,
+        true,
+      );
+    }
   } else if (evenFail) {
     diag(`奇数尺寸取偶失败，按原样继续 · ${evenFail}`, true);
   }
@@ -758,7 +780,13 @@ async function startCapture() {
        */
       const w = evenFloor(((s.width || 1920) * maxHeight) / (s.height || 1080)) || 2;
       const h = evenFloor(maxHeight) || 2;
-      await st.applyConstraints({ width: w, height: h });
+      /**
+       * ⚠️ 同样要把 `maxFrameRate` 带上：`applyConstraints` 是整组替换约束，
+       * 漏了它这个"降分辨率省 CPU"的流反而会以更高的帧率跑（见采集侧那段说明）。
+       */
+      const sc = { width: w, height: h };
+      if (maxFrameRate > 0) sc.frameRate = { max: maxFrameRate };
+      await st.applyConstraints(sc);
       recordStream = scaled;
       diag(`延迟画面已降到 ${w}×${h}（原 ${s.width}×${s.height}）· 减轻重编码负担`, true);
     } catch (e) {
@@ -787,7 +815,9 @@ async function startCapture() {
         const fb = Array.isArray(s.fallbacks) ? s.fallbacks : [];
         if (fb.length) {
           diag(
-            `⚠ 前 ${fb.length} 个录制格式被编码器拒绝，已自动退到上面这个 · 第一个失败：${fb[0]}`,
+            (s.retried
+              ? `⚠ 启动阶段换过录制格式（上一个起不来）· 已用上面这个重来 · 最近一次失败：${fb[fb.length - 1]}`
+              : `⚠ 前 ${fb.length} 个录制格式被编码器拒绝，已自动退到上面这个 · 第一个失败：${fb[0]}`),
             true,
           );
         }
@@ -809,15 +839,21 @@ async function startCapture() {
         const tried = Array.isArray(s.tried) ? s.tried : [];
         diag(
           `⚠ 没有任何录制格式能起来（试了 ${tried.length} 个）—— 画面和声音都出不来，字幕照常 · ` +
-            `第一个失败：${tried[0] || '?'}`,
+            `最后一个失败：${tried[tried.length - 1] || '?'}`,
           true,
         );
+        /**
+         * ⚠️ 别在这里猜原因。旧文案让用户"调低分辨率/改帧率"——
+         * 而真实原因可能是 H.264 的 level、平台缺 AAC、或者机器没有 H.264 编码器，
+         * 这三条**没有一条**是改分辨率能救的。用户照着做一遍没用，反馈也白给 ✗
+         * 所以直接把**编码器原话**摆到遮罩上，并让他把这行发回来。
+         */
         showOverlay(
           '录制器起不来',
           `浏览器拒绝了所有录制格式（试了 ${tried.length} 个），所以画面和声音出不来。` +
             '字幕走独立的音频管线，照常工作。',
-          '这通常是分辨率或编码器的问题。可以试：① 把「延迟画面」的分辨率上限设成 1080p；' +
-            '② 把「采集帧率上限」改回 30。每个格式的失败原因都在诊断面板里。',
+          `第一个报错：${tried[0] || '（没拿到原因）'} —— 把这一行发给我们就能定位` +
+            '（可能是 H.264 的 level、平台缺 AAC 编码器，或这台机器没有可用的 H.264 编码器）。',
         );
       }
       if (s.phase === 'append-error') {

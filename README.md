@@ -980,6 +980,41 @@ subscriber moderators livestream graduation
 所以码率**按画面尺寸自动估**（基准"1920×1080@30 → 10 Mbps"线性外推），再乘档位倍率。
 H.264 效率低于 VP9/AV1，所以它需要的码率更高。按尺寸估的好处是**换分辨率不用重调**。
 
+#### 录制格式：H.264 优先，起不来就自动往下退
+
+延迟画面用 `MediaRecorder` 重编码，候选按优先级排：
+
+| 顺序 | 格式 | 说明 |
+|---|---|---|
+| ① | `video/mp4;codecs="avc1.<level>,mp4a.40.2"` | H.264 硬编 + AAC。**level 按分辨率算**：1080p = High 4.0、1440p = High 5.0、4K = High 5.1 |
+| ② | `video/mp4;codecs="avc1.<level>,opus"` | 仍是 H.264 硬编，音频换成 Chrome 内置的 Opus（绕开平台 AAC） |
+| ③ | `video/webm;codecs="vp9,opus"` | 软件编码，4K 下吃 CPU |
+| ④ | `video/webm;codecs="vp8,opus"` | 最稳的兜底（libvpx + libopus，所有 Chrome 都有） |
+| ⑤ | `video/webm` | 连 codecs 都不写，交给浏览器自己定 |
+
+`MediaRecorder.isTypeSupported()` 说"支持"**不等于**编码器真能按它工作。实测过这种日志：
+
+```
+录制格式 · video/mp4;codecs="avc1.42E01E,mp4a.40.2"（H.264，通常硬件编码）
+⚠ 录制器报错 · EncodingError: The given encoder configuration is not supported by the encoder.
+⚠ 录制器停了 · 已输出 0 字节／0 片、跑了 0 秒
+→ 字幕照常，画面和声音全没
+```
+
+容器和 MIME 都认，编码器却在 `start()` 之后拒绝。所以启动时会**真的试**，不再靠预筛：
+
+- 拿到第一个分片 → 这个格式成立
+- 2 秒观察窗内报错 → 换下一个，日志写明 `⚠ 前 N 个录制格式被编码器拒绝，已自动退到上面这个`
+- 窗口过了还什么都没有（**标签页静止时 tabCapture 一帧都不给**）→ 先放行，
+  但保留回落能力：只要还没出过任何字节，**迟到的报错照样能换下一个**
+
+全部候选都失败时**不抛异常**：退化成"只有字幕、没有画面和声音"，识别和翻译照常跑 ——
+这比"整个延迟播放起不来、连字幕一起没"要好得多。
+
+> ⚠️ 奇数分辨率（例如 2561×1441）会让 H.264 编码器拒绝配置。采集到流之后会先**取偶**，
+> 并且把 `maxFrameRate` 一起传给 `applyConstraints` —— 它是**整组替换**约束，
+> 漏写就会把帧率上限静默丢掉（4K 60fps 照 60 采，正好抵消省 CPU 的意图）。
+
 > ⚠️ **采集帧率上限（默认 60）**是另一个容易白丢一半的地方：不显式给的话，
 > Chrome 对标签页采集常只给 **30fps**，源本身是 60fps 时运动画面就发顿。
 > 它是**上限不是强制值**，源只有 30fps 时没有副作用。
