@@ -2924,34 +2924,49 @@ check('字数/时长：绝对判据拦幻觉，闭环误杀的两句必须保住
  *   分片 0.7s ·  2 字 · 静音 480ms · 先不收   ← 尾巴，语音只剩 220ms
  * → 那两个字（「ある」，真值是「お札」）被合并进下一句，把好句子弄坏了 ✗
  *
- * ⚠️ 判据必须**同时**看 `prevCut === 'max-length'` 和 `speechMs < 250` ——
+ * ⚠️ 判据必须**同时**看 `prevCut === 'max-length'` 和 `speechMs < 350` ——
  *    只看时长会误伤「はい」「ええ」（它们也是短语音，但是**完整的一句话** ✗）
+ *
+ * ⭐ **门槛为什么是 350，不是 250**（v2.66.77 从 250 抬上来）：
+ *    250 时**它一次都触发不了** ✗ —— 实测（闭环造素材 + 真机日志）：
+ *      真机硬切尾巴 :0.7s 片 − 0.48s 静音 = **220ms** ✓ 判得对 ✓
+ *      合成尾巴     :0.8s 片 − 0.48s 静音 = **320ms** ✗ 250 判不出来 ✗✓✓
+ *      自然短应答   :语音 250ms + 留白 200 = **450ms** ✓ 不该判 ✓
+ *    ⇒ 350 落在 320 和 450 之间 —— 而 250 落在 220 和 320 之间，
+ *      于是「0.8 秒的尾巴」这个**真实存在的形态**整个漏在窗口外 ✗
+ *    ⚠️ 而那正是「定义了却永不生效」那一族 —— 本轮已出现五次 ✓
  */
-check('硬切尾巴：上一段是 max-length 且语音 < 250ms 时，文本不采信', () => {
+check('硬切尾巴：上一段是 max-length 且语音 < 350ms 时，文本不采信', () => {
   const v = loaded['lib/asr/vad.js'];
   const T = v.isHardCutTail;
   if (typeof T !== 'function') throw new Error('vad.js 没有导出 isHardCutTail');
-  if (v.HARD_CUT_TAIL_SPEECH_MS !== 250) {
+  if (v.HARD_CUT_TAIL_SPEECH_MS !== 350) {
     throw new Error(`门槛常量被改动（${v.HARD_CUT_TAIL_SPEECH_MS}），下面的窗口断言要一起重算`);
   }
 
-  // ① 必须判：真机日志里那个形状（硬切之后 0.22 秒语音）
-  if (!T('max-length', 220)) throw new Error('硬切尾巴（220ms）没判出来');
+  // ① 必须判：三个**实测**形状，一个都不能漏
+  if (!T('max-length', 220)) throw new Error('真机硬切尾巴（220ms）没判出来');
+  if (!T('max-length', 280)) throw new Error('合成尾巴（280ms）没判出来');
+  // ⭐ 320 是「0.8 秒的片 − 480ms 静音」—— 250 时它判不出来，那正是这次要修的 ✗
+  if (!T('max-length', 320)) throw new Error('0.8s 片的尾巴（320ms）没判出来');
 
-  // ② 门槛是**开区间** `speechMs < 250`：249 判、250 不判 —— 两边都要验，
+  // ② 门槛是**开区间** `speechMs < 350`：349 判、350 不判 —— 两边都要验，
   //    否则「一律判」和「一律不判」都能让单边断言通过 ✗
-  if (!T('max-length', 249)) throw new Error('249ms 该判（< 250）');
-  if (T('max-length', 250)) throw new Error('250ms 不该判（门槛是严格小于）');
+  if (!T('max-length', 349)) throw new Error('349ms 该判（< 350）');
+  if (T('max-length', 350)) throw new Error('350ms 不该判（门槛是严格小于）');
 
   // ③ ⭐ 不许误伤：完整短应答
   //    · 「はい」这类是**自然静音**收的 → prevCut 不是 max-length ✓
-  //      ⚠️ 这一条**必须给 < 250ms 的时长** —— 否则它进不了那条分支，
+  //      ⚠️ 这一条**必须给 < 350ms 的时长** —— 否则它进不了那条分支，
   //         变异「去掉 prevCut 判据」就抓不到（第一版就是这样漏的 ✗）
   if (T('silence', 220)) throw new Error('自然静音收的短应答被误判（「はい」会消失）');
-  if (T('silence', 350)) throw new Error('自然静音收的短应答被误判（「はい」会消失）');
+  if (T('silence', 320)) throw new Error('自然静音收的短应答被误判（「はい」会消失）');
   if (T('utterance-end', 200)) throw new Error('utterance-end 收的短应答被误判');
-  //    · 即使是硬切之后的，只要语音够长（≥250ms）也照常合并 ✓
+  //    · 即使是硬切之后的，只要语音够长（≥350ms）也照常合并 ✓
+  //      ⭐ **450 是「はい」量级的实测值**（语音 250 + 留白 200）——
+  //        它必须**不判**，否则真实的短应答会整句消失 ✗（v2.66.29 撤掉"丢短片段"就是为了这个）
   if (T('max-length', 380)) throw new Error('语音 380ms 的完整短应答被误判');
+  if (T('max-length', 450)) throw new Error('「はい」量级（450ms）被误判 —— 真实的短应答会消失 ✗');
   if (T('max-length', 1200)) throw new Error('语音 1.2s 的更不该判');
 
   // ④ 拿不到可信信息时**不许判**（宁可放过，也不能凭 undefined 丢东西 ✗）
