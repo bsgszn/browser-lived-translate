@@ -2683,6 +2683,35 @@ check('幻听判据：文本字数 ÷ VAD 语音秒数，太快就当编的', ()
   // 脏文本不抛
   if (F(null, 200) || F(undefined, 200)) throw new Error('空文本不该抛，也不该判');
 });
+/**
+ * 「切得太碎」的提醒（v2.66.66）。
+ *
+ * ⭐ 实测：静音确认 480ms、慢速解说 —— 每个停顿都被当句尾切开，
+ * 于是 Whisper 收到的是一堆 0.7 秒碎片，要么丢内容，要么凭空编一句
+ * （「まずいでほ ではでは」就是这么来的）。
+ * 这条只**提醒**，不自动改设置：静音确认调大对快语速主播是反效果。
+ */
+check('诊断提醒：短片段占多数时，提示把「静音确认」调大', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const H = v.shouldHintShortSegments;
+  if (typeof H !== 'function') throw new Error('vad.js 没有导出 shouldHintShortSegments');
+  const seg = (n, ms) => Array.from({ length: n }, () => ({ ms }));
+  // ① 实测那种：8 段全是 0.7s → 提醒
+  if (!H(seg(8, 700))) throw new Error('8 段全短于 1 秒时应当提醒');
+  // ② 段数不够（7 段）不下结论
+  if (H(seg(7, 700))) throw new Error('段数不足时不该提醒');
+  // ③ 只有少数短（2/8）→ 不提醒
+  if (H([...seg(2, 700), ...seg(6, 3000)])) throw new Error('短片段只占少数时不该提醒');
+  // ④ 边界：5/8 = 62.5% ≥ 60% → 提醒
+  if (!H([...seg(5, 700), ...seg(3, 3000)])) throw new Error('62.5% 短片段应当提醒');
+  // ⑤ 正好 1000ms 不算短（严格小于）
+  if (H(seg(10, 1000))) throw new Error('1000ms 不该算短片段');
+  // ⑥ 脏值不抛、也不提醒
+  for (const bad of [null, undefined, [], 'x', {}, [null, undefined, {}], seg(8, NaN)]) {
+    if (H(bad)) throw new Error(`脏值（${JSON.stringify(bad)}）不该触发提醒`);
+  }
+});
+
 await checkAsync('识别校正：拿不到置信度时 refine 必须报 ok=false', async () => {
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
   s.asr.provider = 'whisper-chunked';
