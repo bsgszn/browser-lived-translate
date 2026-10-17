@@ -2655,6 +2655,42 @@ check('识别热词：拼装规则（去重 / 限词数 / 限总长 / 不动用�
 });
 
 /**
+ * 术语表并入热词时必须**筛语言**（v2.66.69）。
+ *
+ * ⭐ 差点重演"一堵英文术语"事故：内置直播术语表是 **102 个词 / 786 字符**，
+ * 而且**英文排在前面**（superchat / super chat / membership…）。直接并进 140 字符的
+ * prompt，日语音频收到的全是英文偏置 —— 正是当初实测"严重损坏"的那个形态。
+ */
+check('术语表并热词：日语流只收日文词、英文流先英文、术语表最多 8 个', () => {
+  const B = loaded['lib/asr/vad.js'].buildWhisperPrompt;
+  const glossary = ['superchat', 'super chat', 'スパチャ', 'membership', '配信者'];
+  // ① 日語流：英文词一个都不许进来
+  const ja = B({ includeGlossary: true, glossary, language: 'ja' }).text;
+  if (/superchat|membership/i.test(ja)) throw new Error(`日语流混进了英文术语：「${ja}」`);
+  if (!ja.includes('スパチャ')) throw new Error(`日语流没带上日文术语：「${ja}」`);
+  // ② 英文流：英文词优先（顺序也要对）
+  const en = B({ includeGlossary: true, glossary, language: 'en' }).text;
+  if (!en.startsWith('superchat')) throw new Error(`英文流应当先放英文：「${en}」`);
+  // ③ auto：非 ASCII 优先（用户多半在听日/中）
+  const auto = B({ includeGlossary: true, glossary, language: 'auto' }).text;
+  if (!auto.startsWith('スパチャ')) throw new Error(`auto 时应当先放非 ASCII：「${auto}」`);
+  // ④ 术语表最多贡献 8 个词（哪怕表里 102 个）
+  const many = Array.from({ length: 20 }, (_, i) => `語${i}`);
+  if (B({ includeGlossary: true, glossary: many, language: 'ja' }).hotwords !== 8) {
+    throw new Error('术语表没有按 8 个封顶');
+  }
+  // ⑤ 用户手填的不受这 8 个限制（他自己的词永远优先，且不会被挤掉）
+  const own = Array.from({ length: 10 }, (_, i) => `自${i}`).join('\n');
+  const mixed = B({ hotwords: own, includeGlossary: true, glossary: many, language: 'ja' });
+  for (let i = 0; i < 10; i++) {
+    if (!mixed.text.includes(`自${i}`)) throw new Error(`用户手填的「自${i}」被术语表挤掉了`);
+  }
+  if (!mixed.text.startsWith('自0')) throw new Error('用户手填的词必须排在前面');
+  // 10 个自己的 + 8 个术语表（上限）
+  if (mixed.hotwords !== 18) throw new Error(`术语表应当只补 8 个，实际总数 ${mixed.hotwords}`);
+});
+
+/**
  * 「文本和音频时长对不上」= 幻听（v2.66.65）。
  *
  * ⭐ 实测：0.7s 的分片、静音占 480ms（真正语音 ~220ms），Whisper 吐出 9 个字
