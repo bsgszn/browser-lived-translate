@@ -2846,6 +2846,101 @@ check('幻听判据：文本字数 ÷ VAD 语音秒数，太快就当编的', ()
 });
 
 /**
+ * ⭐ 阈值 **15 字/秒** 是被实测夹出来的，不是拍的（v2.66.76 从 20 降下来）。
+ *
+ * ⚠️ 为什么必须降：**20 在真实数据上一条都拦不到** ✗
+ *   5 次闭环（每次 186 秒）的 195 条分片，字/秒分布是：
+ *
+ *       0~5   56 条 ✓      5~8   77 条 ✓      8~12  42 条 ✓
+ *      12~15  14 条 ✓     15~20   6 条 ✗     20~∞   0 条 ← **老阈值 15~20 那 6 条全漏** ✗
+ *
+ *   也就是说：20 这个数字**看起来留了两倍余量，实际上什么都没拦** ✗
+ *   （最高正常 13.6、最低异常 15.6 —— 真实数据的缝在 13.6~15.6，而 20 在缝外面 ✗）
+ *
+ * ⚠️ 而用户实测的三句幻觉都落在 15~20 这 6 条里：
+ *   「横のボタンを押してください」13 字 / 0.22s = 59.1（这条能被 20 抓到，但它不总会这么极端）
+ *   「では、また。」去标点只剩 4 字 → 4 / 0.22 = **18.2** ← **20 一定漏** ✗
+ *   「あーついてこそ」7 字 / 0.22s = 31.8
+ *
+ * ⚠️ 而余量**很窄**：13.6（最高正常）< 15 < 15.6（最低异常）。
+ *    往上抬到 20 会把那 6 条放回去，往下压到 13 会开始误伤 12~15 那 14 条正常句 ✗
+ */
+check('字数/时长阈值 15：三句实测幻觉全拦，13 句正常句全过', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const F = v.looksTooFastForAudio;
+  const E = v.effectiveSpeechMs;
+  if (typeof F !== 'function' || typeof E !== 'function') throw new Error('缺 looksTooFastForAudio / effectiveSpeechMs');
+
+  /** 日志里的一行 → 判据会怎么判（字/秒由判据自己算，这里只复算给报错用） */
+  const judge = (chars, durSec, silenceMs) => {
+    const speechMs = E({ durationMs: durSec * 1000, silenceMs, vadSpeechMs: durSec * 1000 });
+    return { flag: F('あ'.repeat(chars), speechMs), cps: chars / (Math.max(1, speechMs) / 1000) };
+  };
+
+  // ① 必须拦：三份 v2.66.75 日志里的幻觉（数字全部来自日志原文）
+  for (const [chars, durSec, sil, label] of [
+    [13, 0.7, 480, '横のボタンを押してください'],
+    [7, 0.7, 480, 'あーついてこそ'],
+    [6, 0.7, 480, 'では、また。'],
+    [6, 0.7, 480, 'ある とかもあるよ'],
+    [14, 0.7, 480, 'v2.66.66 漏网那次 14 字'],
+  ]) {
+    const r = judge(chars, durSec, sil);
+    if (!r.flag) throw new Error(`「${label}」没拦住（${r.cps.toFixed(1)} 字/秒 ≤ 15）`);
+  }
+
+  // ② 不许误伤：日志里的正常句（含**最快的**那句 12.9）
+  for (const [chars, durSec, sil, label] of [
+    [23, 5.2, 0, '5.2s/23 字'],
+    [33, 5.2, 0, '5.2s/33 字'],
+    [10, 1.8, 480, '1.8s/10 字'],
+    [24, 4.0, 480, '4.0s/24 字'],
+    [7, 1.5, 480, '1.5s/7 字'],
+    [21, 2.9, 480, '2.9s/21 字'],
+    [5, 1.4, 480, '1.4s/5 字'],
+    [8, 1.1, 480, '1.1s/8 字 ← 最快的正常句'],
+  ]) {
+    const r = judge(chars, durSec, sil);
+    if (r.flag) throw new Error(`「${label}」被误伤（${r.cps.toFixed(1)} 字/秒 > 15）`);
+  }
+
+  // ③ 窗口本身要成立：正常上限 < 15 < 幻觉下限 —— 余量没了就说明阈值该重算
+  const fastestNormal = judge(8, 1.1, 480).cps;   // 12.9
+  const slowestHallu = judge(4, 0.7, 480).cps;    // 18.2（去标点后 4 字）
+  if (!(fastestNormal < 15 && 15 < slowestHallu)) {
+    throw new Error(`阈值 15 不在窗口 (${fastestNormal.toFixed(1)}, ${slowestHallu.toFixed(1)}) 里 —— 余量没了`);
+  }
+  // 往上抬到 18.2 就会放回「では、また。」：这是那个决定性的边界，单独钉一次
+  if (!F('あ'.repeat(4), 220)) throw new Error('18.2 字/秒那条边界不该被放过');
+});
+
+/**
+ * ⭐ 「字数时长」要**单独计数并印出来**（v2.66.76）—— 它和「幻听套话」是两种幻觉：
+ *   · 套话命中 → 内容是固定模板（`ご視聴ありがとうございました`）
+ *   · 这条     → 内容不定，但**字数超过这段音频物理上能说出的量**
+ * 混在一个数里就判断不出是哪一层在干活 ✗
+ */
+check('VAD 拒绝计数：字数时长要单独一格，不许混进幻听', () => {
+  const v = loaded['lib/asr/vad.js'];
+  const S = v.rejectedSummary;
+  if (typeof S !== 'function') throw new Error('vad.js 没有导出 rejectedSummary');
+  const fastOnly = S(0, 0, 0, 0, 3);
+  if (!/字数时长 3/.test(fastOnly)) throw new Error(`没列出字数时长：「${fastOnly}」`);
+  if (/幻听/.test(fastOnly)) throw new Error(`混进了幻听：「${fastOnly}」`);
+  // 五类同时非零 → 五者都要在（加参数不能挤掉旧的）
+  const all = S(1, 2, 3, 4, 5);
+  for (const k of ['幻听套话', '闸门', '空文本', '空文本接力', '字数时长']) {
+    if (!all.includes(k)) throw new Error(`混合时缺了「${k}」：「${all}」`);
+  }
+  // 旧的四个参数行为逐字不变
+  if (S(0, 0, 0, 0) !== '') throw new Error('全零仍应得空串');
+  if (!/空文本接力 5/.test(S(0, 0, 0, 5))) throw new Error('接力那格变了');
+  // 脏值不许印 NaN
+  const dirty = S(1, 0, 0, 0, 'x');
+  if (/NaN|undefined/.test(dirty)) throw new Error(`脏值印出了 NaN/undefined：「${dirty}」`);
+});
+
+/**
  * 「说话时长」的取法（v2.66.67）。
  *
  * ⚠️ gate 的 `speechFrames` 在语音态里**每帧都自增**（含没到静音门槛的尾巴），
