@@ -488,7 +488,13 @@ async function saveAudioAndLog() {
   const sv = () => settings || {};
   const configNote =
     `配置快照(导出时实际生效的值;? = 读不到):\n` +
-    `  识别 ${cfg(() => sv()?.asr?.provider)} · 翻译 ${cfg(() => sv()?.translation?.provider)}` +
+    `  识别 ${cfg(() => sv()?.asr?.provider)}` +
+    /** ⚠️ **识别语言必须印出来**。它曾经默认 `'en'` 而预设里是 `'ja'` ——
+     *  于是日语视频全部认错（「お札とかもあるよ」被认成「マリオ」），
+     *  而那两个错**看起来像模型问题**，不像配置问题，所以错了很久没人发现 ✗
+     *  → 一个没被印出来的配置，错了就没人能一眼看出来。 */
+    ` · 识别语言 ${cfg(() => sv()?.asr?.language)}` +
+    ` · 翻译 ${cfg(() => sv()?.translation?.provider)}` +
     ` · 目标延迟 ${cfg(() => sv()?.capture?.delaySec)}s` +
     ` · 帧率上限 ${cfg(() => sv()?.capture?.maxFrameRate)}\n` +
     `  VAD 阈值 ${cfg(() => sv()?.asr?.vad?.vadThreshold)}` +
