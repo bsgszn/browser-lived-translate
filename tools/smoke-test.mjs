@@ -136,6 +136,7 @@ const MODULES = [
   'lib/asr/vad-gate.js',
   'lib/asr/hallucination.js',
   'lib/asr/index.js',
+  'lib/hotwords/ja-live.js',
   'lib/translate/index.js',
   'background/service-worker.js',
   'offscreen/offscreen.js',
@@ -2910,6 +2911,98 @@ check('术语表并热词：日语流只收日文词、英文流先英文、术�
 });
 
 /**
+ * 内置「直播热词」（v2.66.80）。
+ *
+ * ⭐ 用户原话:「把这个删掉吧 他有问题 —— 把这个热词加上这个位置，
+ *            换成直播热词的开关，然后默认成打开状态」。
+ *   删的是「把术语表里的源词也并入识别热词」那个勾选框：术语表是**翻译**用的表，
+ *   词多且杂（`support=辅助` 也在里面），整表塞进 Whisper 的 prompt 会把识别带偏。
+ *   换上的是 `lib/hotwords/ja-live.js` —— 人工挑的 146 个日语直播行话。
+ *
+ * ⚠️ 它和用户手填的热词**共用**同一套上限（20 词 / 140 字符），所以：
+ *   · 打开开关**不会让 prompt 变长**（只占用原本空着的额度）
+ *   · 146 个词实际只带得进最前面的 20 个 —— **顺序就是优先级**，这条要如实钉住
+ */
+check('内置直播热词：默认开、只占空额度、用户的词优先、带不完要说出来', () => {
+  const B = loaded['lib/asr/vad.js'].buildWhisperPrompt;
+  const v = loaded['lib/asr/vad.js'];
+  const HOT = loaded['lib/hotwords/ja-live.js'];
+  const list = HOT.JA_LIVE_HOTWORD_LIST;
+  const TOTAL = 146;
+
+  // ① 词表本身合规：条数对、无重复、每条都过项目自己的长度规范
+  if (!Array.isArray(list) || list.length !== TOTAL) {
+    throw new Error(`内置词表应当是 ${TOTAL} 条，实际 ${list && list.length}`);
+  }
+  if (HOT.JA_LIVE_HOTWORD_COUNT !== list.length) throw new Error('JA_LIVE_HOTWORD_COUNT 和数组长度不一致');
+  if (new Set(list.map((w) => w.toLowerCase())).size !== list.length) throw new Error('内置词表里有重复词');
+  const badWords = list.filter((w) => !v.hotwordLengthOk(w));
+  if (badWords.length) throw new Error(`内置词表里有不合规的词（超长）：${badWords.join(' | ')}`);
+  if (list.some((w) => /[\r\n]/.test(w))) throw new Error('内置词表里有带换行的词');
+
+  // ② 关掉时必须**逐字节相同** —— "不改设置就和以前一样"是硬要求
+  const off = B({ prompt: '日语直播', hotwords: 'スパチャ', liveHotwords: list, includeLiveHotwords: false });
+  const plain = B({ prompt: '日语直播', hotwords: 'スパチャ' });
+  if (off.text !== plain.text) throw new Error(`关掉开关后 prompt 变了：「${off.text}」`);
+  if (off.live !== 0 || off.truncated !== false) throw new Error('关掉时不该报内置词，也不该报截断');
+
+  // ③ 打开：内置词真的进来了，顺序和词表一致
+  const on = B({ liveHotwords: list, includeLiveHotwords: true });
+  if (on.live < 10) throw new Error(`打开后只带了 ${on.live} 个内置词 —— 词表可能没接上`);
+  if (!on.text.startsWith(list[0])) throw new Error(`第一个内置词应当是「${list[0]}」：「${on.text}」`);
+  if (on.liveTotal !== TOTAL) throw new Error(`liveTotal 应当是 ${TOTAL}，实际 ${on.liveTotal}`);
+
+  // ④ 用户手填的永远优先，且不会被内置词挤掉
+  const own = B({ hotwords: '我自己填的词\nスパチャ', liveHotwords: list, includeLiveHotwords: true });
+  if (!own.text.startsWith('我自己填的词')) throw new Error('用户手填的词必须排在前面');
+  if (!own.text.includes('スパチャ')) throw new Error('用户手填的词被内置词挤掉了');
+  // 去重时以用户的为准：内置表里也有 スパチャ，只该出现一次
+  if (own.text.split('スパチャ').length - 1 !== 1) throw new Error('同一个词出现了两次（去重没生效）');
+
+  // ⑤ ⚠️ 如实钉住那个上限：146 个词带不完 —— 这不是 bug，是 Whisper prompt 的长度约束
+  if (on.live >= on.liveTotal) throw new Error('146 个词全带进去了？140 字符装不下，上限没生效');
+  if (on.text.length > 140) throw new Error(`prompt 超过 140 字符：${on.text.length}`);
+
+  // ⑥ maxLive 封顶（用户手填的不受它影响）
+  //    ⚠️ 放在 truncated 那条**前面**：把 maxLive 去掉之后，`push` 会一直加到 maxWords
+  //    并把 overflow 记起来 ⇒ truncated 也会变真 —— 两条都会红，但先红的必须是这条，
+  //    否则"maxLive 到底有没有用"就验不清了（变异测试里踩过）。
+  const capped = B({ liveHotwords: list, includeLiveHotwords: true, maxLive: 3 });
+  if (capped.live !== 3) throw new Error(`maxLive=3 时应当只带 3 个，实际 ${capped.live}`);
+
+  // ⑦ ⚠️ 内置词带不完**不许**把 `truncated` 弄成真 ——
+  //    那条读数是给"用户自己填超了"报警用的；内置表本来就有 146 个，
+  //    若让它污染 `truncated`，这个读数就永远是 true，等于失效。
+  if (on.truncated) throw new Error('内置词带不完不该置 truncated（会让那条读数永远为真）');
+  // 而用户自己填超了**仍然**要报 —— 这个语义不能被顺手改掉
+  const manyOwn = Array.from({ length: 30 }, (_, i) => `w${i}`).join('\n');
+  if (!B({ hotwords: manyOwn, liveHotwords: list, includeLiveHotwords: true }).truncated) {
+    throw new Error('用户填了 30 个词却没报 truncated');
+  }
+
+  // ⑧ 提示词一个字都不许动
+  const withPrompt = B({ prompt: '日语直播，说话快', liveHotwords: list, includeLiveHotwords: true });
+  if (!withPrompt.text.startsWith('日语直播，说话快')) throw new Error('内置热词改动了用户提示词');
+
+  // ⑨ 设置默认开；而那个被删掉的字段不该还留在默认值里
+  const D = loaded['lib/settings.js'].DEFAULT_SETTINGS;
+  if (D.asr.whisperChunked.liveHotwords !== true) throw new Error('liveHotwords 默认必须是 true');
+  if ('glossaryHotwords' in D.asr.whisperChunked) {
+    throw new Error('asr.whisperChunked.glossaryHotwords 已按用户要求删除，不该还在默认值里');
+  }
+  // 阿里云那个同名字段是另一件事（它有自己的面板），不许被顺手删掉
+  if (D.asr.dashscope.glossaryHotwords !== false) {
+    throw new Error('阿里云的 glossaryHotwords 是另一件事，不该被删');
+  }
+
+  // ⑩ 设置页：新开关在，旧勾选框没了
+  const html = fs.readFileSync(path.join(process.cwd(), 'options', 'options.html'), 'utf8');
+  if (!/id="wc-liveHotwords"/.test(html)) throw new Error('设置页没有「直播热词」那个勾选框');
+  if (/id="wc-glossaryHotwords"/.test(html)) throw new Error('设置页那个「术语表源词」勾选框没删干净');
+});
+
+
+/**
  * 「文本和音频时长对不上」= 幻听（v2.66.65）。
  *
  * ⭐ 实测：0.7s 的分片、静音占 480ms（真正语音 ~220ms），Whisper 吐出 9 个字
@@ -3290,7 +3383,7 @@ check('共用字段必须放在所有 data-panel 之外，专属字段必须留�
    * 它们一度只写在「Whisper 分片」面板里 —— 用 VAD 的人根本看不见，
    * 正是这条断言要防的"参数生效却调不到"。
    */
-  for (const id of ['wc-prompt', 'wc-hotwords', 'wc-glossaryHotwords']) {
+  for (const id of ['wc-prompt', 'wc-hotwords', 'wc-liveHotwords']) {
     const where = inPanel(id);
     if (where === 'NOT-FOUND') throw new Error(`找不到 ${id}`);
     if (where) {
