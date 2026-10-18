@@ -303,7 +303,7 @@
               <small class="hint">一句最长多久。超了强制切断 —— 否则有人一直不停顿就永远不出字幕。</small>
             </label>
             <div class="checks">
-              <label class="check"><input type="checkbox" id="vd-smartCut" /> <span>合理断句（到上限时回看换气处，不从词中间切）</span></label>
+              <label class="check"><input type="checkbox" id="vd-smartCut" /> <span>合理断句（默认关：到上限时回看换气处，不从词中间切）</span></label>
               <label class="check"><input type="checkbox" id="vd-dropShort" /> <span>丢弃过短片段（默认关：打开后「最短话段」才生效）</span></label>
             </div>
             <small class="hint" style="display: block; margin: -6px 0 12px 26px">
@@ -313,6 +313,10 @@
               <b>找不到换气就完全和从前一样</b>，所以关掉它只是"回到从前"，不是修正什么。
               <br />开启后，实际每段长度会落在 <b>（上限 − 窗口）~ 上限</b> 之间 ——
               比如上限设 8 秒，实际就是 6.5~8 秒，<b>不会把你设的值改小很多</b>。
+              <br /><b>⚠️ 默认关</b>（v2.66.79 起）：实测打开之后<b>句子更短更碎</b>
+              —— 整句中位字数 22 → 18、4 字以下的整句 0 → 2 条、整句最短 6 → 4 字；
+              而它本来想减少的那种"0.2 秒短碎片"<b>一条都没减少</b>（2 → 2）。
+              想再试可以随时打开。
             </small>
             <label class="field">
               <span>前后留白（毫秒）</span>
