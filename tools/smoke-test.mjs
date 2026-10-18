@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 // 纯函数，不碰 chrome —— 所以可以静态导入（在下面那个 chrome 桩之前求值也没问题）。
-import { pushDiagPair, diagWindow, formatAlignNote } from '../lib/diag-window.js';
+import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote } from '../lib/diag-window.js';
 // 「按锚点改文件」的共用守卫 —— 判断逻辑是纯函数，所以这里能真调它断言。
 import { planReplace } from '../lib/anchor-edit.js';
 
@@ -2984,9 +2984,21 @@ check('内置直播热词：默认开、只占空额度、用户的词优先、�
   const withPrompt = B({ prompt: '日语直播，说话快', liveHotwords: list, includeLiveHotwords: true });
   if (!withPrompt.text.startsWith('日语直播，说话快')) throw new Error('内置热词改动了用户提示词');
 
-  // ⑨ 设置默认开；而那个被删掉的字段不该还留在默认值里
+  // ⑨ 设置默认**关**（v2.66.81 从"开"改回来：实测带热词 prompt 会让每段少认一半以上的字）；
+  //    而那个被删掉的字段不该还留在默认值里
   const D = loaded['lib/settings.js'].DEFAULT_SETTINGS;
-  if (D.asr.whisperChunked.liveHotwords !== true) throw new Error('liveHotwords 默认必须是 true');
+  if (D.asr.whisperChunked.liveHotwords !== false) {
+    throw new Error('liveHotwords 默认必须是 false —— 实测带热词 prompt 会让每段少认一半以上的字');
+  }
+  // 而默认关不能靠"判法"兜：`vad.js` / `whisper-chunked.js` 用的是 `!== false`，
+  // 所以默认值一旦写成 true 就真的会带 prompt。这里钉住默认值的**值和类型**。
+  if (typeof D.asr.whisperChunked.liveHotwords !== 'boolean') {
+    throw new Error('liveHotwords 默认值必须是 boolean，否则 `!== false` 的判法会把它当成开');
+  }
+  // 迁移表的版本号必须跟上（v2.66.81 把 10 推到 11，否则老用户读不到这条迁移）
+  if (!(loaded['lib/settings.js'].SETTINGS_VERSION >= 11)) {
+    throw new Error('SETTINGS_VERSION 没跟上：liveHotwords 的迁移挂在 11 上');
+  }
   if ('glossaryHotwords' in D.asr.whisperChunked) {
     throw new Error('asr.whisperChunked.glossaryHotwords 已按用户要求删除，不该还在默认值里');
   }
@@ -9373,6 +9385,44 @@ console.log('\n[3f] 导出头的「时间对齐」与「电平分布」—— �
     const s = dw.formatAlignNote({ audioTakeSec: 12.5, nowMs: NOW, logFromMs: NaN, logToMs: NaN, lineCount: 0, t0: 0 });
     if (!s.includes('(这一窗口内没有日志行)')) throw new Error(`没有明说：\n${s}`);
     if (!s.includes('12.5s')) throw new Error('实际音频长度没印');
+  });
+
+  /**
+   * ⚠️ 「提示词」那一栏存在的理由：v2.66.80 把 146 个内置热词默认塞进 Whisper 的 prompt，
+   * 而**日志里一个字都看不到 prompt** —— 于是"同一段 5.6 秒的音频从 22 字掉到 7 字"
+   * 被读成"Whisper 认不全"，查了一整天才发现 prompt 让它**提前停**
+   * （`no_speech_prob` 0.93→0.01、识别段数 3→1）。会改变解码行为的输入必须可见。
+   */
+  check('提示词读数：三个数都印、格式固定、全拿不到时印 —（而不是省略整格）', () => {
+    const s = formatPromptNote({ promptChars: 105, liveUsed: 20, liveTotal: 146, userCount: 3 });
+    if (!s.includes('提示词 105 字')) throw new Error(`字数没印：${JSON.stringify(s)}`);
+    if (!s.includes('热词 20/146')) throw new Error(`热词没印：${JSON.stringify(s)}`);
+    if (!s.includes('用户词 3')) throw new Error(`用户词没印：${JSON.stringify(s)}`);
+    if (s.includes('已截断')) throw new Error('没截断却印了"已截断" —— 那会变成永远为假的后缀');
+    if (!s.endsWith('\n')) throw new Error('没有以换行结尾，接进快照会粘行');
+  });
+
+  check('提示词读数：只有一个数也要印（不能因为别的缺失就整格不印）', () => {
+    const s = formatPromptNote({ promptChars: 0 });
+    if (!s.includes('提示词 0 字')) throw new Error(`0 字没印出来：${JSON.stringify(s)}`);
+    if (s.includes('热词')) throw new Error('没有热词数据却印了热词那格');
+  });
+
+  check('提示词读数：全拿不到 → 印 —（省略会被读成"这一项不存在"）', () => {
+    const s = formatPromptNote({});
+    if (!s.includes('提示词 —')) throw new Error(`没印 —：${JSON.stringify(s)}`);
+    if (s.includes('undefined') || s.includes('NaN')) throw new Error(`印出了脏值：${JSON.stringify(s)}`);
+  });
+
+  check('提示词读数：真的截断时才出现"已截断"', () => {
+    const s = formatPromptNote({ promptChars: 140, liveUsed: 20, liveTotal: 146, userCount: 0, truncated: true });
+    if (!s.includes('已截断')) throw new Error('截断了却没提');
+  });
+
+  check('提示词读数：空值/负数/非数字一律不印脏值', () => {
+    const s = formatPromptNote({ promptChars: null, liveUsed: -1, liveTotal: 'abc', userCount: '' });
+    if (s.includes('-1') || s.includes('NaN') || s.includes('abc')) throw new Error(`脏值漏出来了：${JSON.stringify(s)}`);
+    if (!s.includes('提示词 —')) throw new Error(`应该印 —：${JSON.stringify(s)}`);
   });
 
   /**

@@ -22,7 +22,14 @@ import { PcmRing, encodeWav } from '../lib/pcm-ring.js';
 import { createRefiner } from '../lib/asr/refine.js';
 // 诊断日志的追加与窗口切片收在 lib/diag-window.js —— 页面脚本在 smoke-test 里加载不了，
 // 而「两个数组必须等长」和「窗口边界取 >=」这两条行为需要断言守住。
-import { pushDiagPair, diagWindow, formatAlignNote } from '../lib/diag-window.js';
+import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote } from '../lib/diag-window.js';
+// ⚠️ 为了让「这次识别到底带了多长的提示词」能印出来，必须拿到**算提示词的那个函数本身** ——
+//    在 player.js 里另写一份合并逻辑就是"同一事实记两遍"，迟早和它不一致 ✗。
+//    `lib/asr/vad.js` 早已在模块图里（`lib/asr/index.js` 顶层 import 了它），
+//    所以这里再加一条 import 不增加加载开销；而它的顶层依赖也只有 util / vad-gate /
+//    hallucination / glossary / hotwords（onnxruntime 是运行时才动态取）。
+import { buildWhisperPrompt } from '../lib/asr/vad.js';
+import { JA_LIVE_HOTWORD_LIST } from '../lib/hotwords/ja-live.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
 import {
   DelayedPlayback,
@@ -50,6 +57,44 @@ let job = null;
 let stream = null;
 let ctx = null;
 let playback = null;
+
+/**
+ * 「这次识别带了多长的提示词」。
+ *
+ * ⚠️ 为什么必须印：v2.66.80 把 146 个内置热词默认塞进 Whisper 的 prompt，
+ *    而**日志里一个字都看不到 prompt** ✗ —— 于是"每段少认一半的字"被读成
+ *    "Whisper 认不全"，查了一整天才发现是我们自己让它**提前停**（`no_speech_prob` 0.93→0.01、
+ *    识别段数 3→1）。一个会改变解码行为的输入没被印出来，错了就没人能一眼看出来。
+ *
+ * 数值全部来自 `buildWhisperPrompt` 本身（**不在这里另算一遍**），
+ * 格式化交给 `lib/diag-window.js` 的 `formatPromptNote`（纯函数，可断言）。
+ */
+function promptDiagLine() {
+  try {
+    const wc = settings?.asr?.whisperChunked || {};
+    const userRaw = String(wc.hotwords || '');
+    const userCount = userRaw.split('\n').filter((l) => String(l).trim()).length;
+    const built = buildWhisperPrompt({
+      prompt: String(wc.prompt || ''),
+      hotwords: userRaw,
+      liveHotwords: JA_LIVE_HOTWORD_LIST,
+      // ⚠️ 和 `vad.js` / `whisper-chunked.js` 用**同一个判法**（`!== false`）——
+      //    判法不一致就会印出"关着"而实际带上了。
+      includeLiveHotwords: wc.liveHotwords !== false,
+    });
+    return formatPromptNote({
+      promptChars: String(built?.text || '').length,
+      liveUsed: built?.live,
+      liveTotal: built?.liveTotal,
+      userCount,
+      truncated: built?.truncated === true,
+    });
+  } catch {
+    // 印不出来也不许把日志打挂 —— 和 `formatPromptNote` 的"全拿不到就印 —"是同一条约定
+    return formatPromptNote({});
+  }
+}
+
 /**
  * ⚠️ `appendBuffer` 失败的**累计次数**与**最后一次原因**。
  *
@@ -534,7 +579,11 @@ async function saveAudioAndLog() {
     /** ⚠️ 这一项**目前不参与丢弃判定**（见 lib/asr/vad.js 的注释）—— 但照样印出来，
      *  否则读日志的人会按它去解释"这句为什么被丢了" ✗ */
     ` · 最短话段 ${cfg(() => sv()?.asr?.vad?.vadMinUtteranceMs)}ms(⚠ 目前不参与丢弃判定)` +
-    ` · 延迟画面高度上限 ${cfg(() => sv()?.capture?.delayMaxHeight)}\n`;
+    ` · 延迟画面高度上限 ${cfg(() => sv()?.capture?.delayMaxHeight)}\n` +
+      /** ⚠️ **提示词长度必须印出来**。理由见 `promptDiagLine()` 上面那段注释：
+       *  v2.66.80 的热词 prompt 让 Whisper 提前停（同一段音频 5.6s 从 22 字掉到 7 字），
+       *  而当时日志里**一个字都看不到 prompt**，于是所有症状都被读成"识别不准" ✗。 */
+      promptDiagLine();
 
   const logText =
     `livedtranslate 诊断导出 · v${chrome.runtime.getManifest().version}\n` +
@@ -1291,6 +1340,10 @@ async function startAudioEngine(audioTrack) {
 
   await asr.start();
   diag(`识别已连接 · ${asr.sampleRate / 1000}kHz`, true);
+  // ⚠️ 顺带把「这次识别带了多长的提示词」印进**真机日志**（不只是导出时才有的配置快照）。
+  //    理由见 promptDiagLine() 上面那段注释 —— 这个输入会改变解码行为，
+  //    而它曾经完全不可见，让"每段少认一半的字"看起来像模型问题。
+  diag(promptDiagLine().trim(), true);
 }
 
 // ═══════════════════════════ ASR → 翻译 → 排期 ═══════════════════════════
