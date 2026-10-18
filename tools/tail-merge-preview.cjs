@@ -163,12 +163,15 @@ async function invariants() {
     if (r.pushed !== 0) bad.push('watchdog 合并时建了新条目');
   }
 
-  // ⑥ 开关读的是同一个字段、同一种判法（缺字段 = 开）
+  // ⑥ 开关读的是同一个字段、同一种判法
+  // ⚠️ 这里喂的是**没合并过的裸对象**：`!== false` 会回落到「开」。
+  //    生产路径的配置一定经过 getSettings() 合并（DEFAULT_SETTINGS 里是 false），
+  //    所以产品默认值是**关**；这一条只钉判法形状，不代表默认值。
   {
     const src = fs.readFileSync(PLAYER, 'utf8');
     const smartFn = extractFn(src, 'smartCutEnabled');
     const fn = new Function('settings', `${smartFn}; return smartCutEnabled;`)({ asr: {} });
-    if (fn() !== true) bad.push('老配置里没有 vadSmartCut 字段时应当算**开**');
+    if (fn() !== true) bad.push('裸对象（没有该字段）时 `!== false` 应当回落到开 —— 判法形状变了');
     const fn2 = new Function('settings', `${smartFn}; return smartCutEnabled;`)({ asr: { vad: { vadSmartCut: false } } });
     if (fn2() !== false) bad.push('显式关掉时应当算关');
   }

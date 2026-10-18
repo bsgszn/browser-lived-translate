@@ -1417,11 +1417,13 @@ const utterances = new UtteranceAccumulator({ maxSpanSec: 10, maxChars: 60, watc
  * （不是"说完 + D"：那样字幕要等画面播完整句、再补等一个 D，就成了"人都快说完了才上"。）
  */
 /**
- * 「合理断句」开着没。
+ * 「合理断句」开着没。**默认关**（v2.66.79 起；闭环 A/B 实测开着让句子更碎）。
  *
- * ⚠️ 判 `!== false` 而不是 `=== true`：老配置里没有这个字段，那也应当算开。
- *    必须和 `lib/asr/vad.js` 读它的方式**一致** —— 两处不一致就会出现
- *    "断句按开着做、合并按关着做"这种半开半关的状态。
+ * ⚠️ 判 `!== false` 而不是 `=== true`，且必须和 `lib/asr/vad.js` 读它的方式**一致** ——
+ *    两处不一致就会出现"断句按开着做、合并按关着做"这种半开半关的状态。
+ * ⚠️ 这里的 `settings` 一定来自 `getSettings()`（已合并默认值），而
+ *    `DEFAULT_SETTINGS.asr.vad.vadSmartCut` 是 false ⇒ 没调过的人读到 false。
+ *    **默认关由默认值保证，不由这个判法保证**；改成 `=== true` 收益为零、还要两处同改。
  */
 function smartCutEnabled() {
   return settings?.asr?.vad?.vadSmartCut !== false;

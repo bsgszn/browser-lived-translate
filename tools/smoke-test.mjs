@@ -5298,13 +5298,16 @@ check('VAD 窗长必须是 576（Silero v6 的 16kHz 窗长，不是 v5 的 512�
     }
   });
 
-  check('合理断句的开关默认开（老配置里没这个字段也必须开）', () => {
+  check('合理断句的开关默认**关**，且两处判法一致（`!== false`）', () => {
     const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'asr', 'vad.js'), 'utf8'));
     if (!/smartCut:\s*config\.vadSmartCut\s*!==\s*false/.test(src)) {
-      throw new Error('开关不是 `config.vadSmartCut !== false` —— 那样老配置会被当成关，等于改了默认值老用户拿不到');
+      throw new Error('开关不是 `config.vadSmartCut !== false` —— player.js 那边也是这个判法，两处必须一致');
     }
     const s = loaded['lib/settings.js'];
-    if (s.DEFAULT_SETTINGS.asr.vad.vadSmartCut !== true) throw new Error('DEFAULT_SETTINGS 里 vadSmartCut 不是 true');
+    if (s.DEFAULT_SETTINGS.asr.vad.vadSmartCut !== false) {
+      throw new Error(`DEFAULT_SETTINGS 里 vadSmartCut 是 ${s.DEFAULT_SETTINGS.asr.vad.vadSmartCut}，必须是 false`
+        + '（闭环 A/B：开着让整句中位 22→18 字、≤4 字整句 0→2，而短尾巴 2→2 没减少）');
+    }
   });
 
   /**
@@ -7203,8 +7206,10 @@ check('合并短段必须被**调用点**真的用上，且判据字段三层同
 
   /**
    * ⚠️ 开关必须和断句层读的是**同一个字段、同一种判法**。
-   * 断句层判 `!== false`（老配置没这个字段时算开）；这里要是判 `=== true`，
-   * 老用户就会变成"断句按开着做、合并按关着做"这种半开半关的状态。
+   * 断句层判 `!== false`；这里要是改成 `=== true`，两处就分叉了，
+   * 变成"断句按开着做、合并按关着做"这种半开半关的状态。
+   * ⚠️ 而「默认关」这件事**由默认值保证**（`DEFAULT_SETTINGS` 里是 false），
+   *    不由判法保证 —— 合并后的设置一定带这个字段，所以 `!== false` 读到就是 false。
    */
   if (!/settings\?\.asr\?\.vad\?\.vadSmartCut !== false/.test(player)) {
     throw new Error('smartCutEnabled 读的字段或判法和 lib/asr/vad.js 不一致');
@@ -9370,8 +9375,8 @@ check('软边界计时器：响过一次就清零，不会重复收句', () => {
 check('丢弃过短片段：默认**关**（打开才丢 —— 否则「はい」「ええ」会整句消失）', () => {
   const v = loaded['lib/settings.js'].DEFAULT_SETTINGS.asr.vad;
   if (v.vadDropShort !== false) throw new Error(`vadDropShort 默认值是 ${v.vadDropShort}，必须是 false`);
-  // ⚠️ 顺手确认真相邻的那个老开关没被带坏
-  if (v.vadSmartCut !== true) throw new Error('vadSmartCut 默认值被改了（应当仍是 true）');
+  // ⚠️ 顺手确认相邻的那个开关没被带坏（v2.66.79 起它默认**关**）
+  if (v.vadSmartCut !== false) throw new Error(`vadSmartCut 默认值是 ${v.vadSmartCut}，必须是 false`);
 });
 
 check('丢弃过短片段：配置判法是 `=== true`（**缺省即关**）—— 别照抄 smartCut 的 `!== false`', () => {
