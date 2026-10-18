@@ -81,7 +81,10 @@ const FIELDS = [
   ['vd-dropShort', 'checkbox', 'asr.vad.vadDropShort'],
   ['wc-prompt', 'text', 'asr.whisperChunked.prompt'],
   ['wc-hotwords', 'text', 'asr.whisperChunked.hotwords'],
-  ['wc-glossaryHotwords', 'checkbox', 'asr.whisperChunked.glossaryHotwords'],
+  // 内置「直播热词」（lib/hotwords/ja-live.js）—— **默认开**。
+  // 原来这里是「把术语表里的源词也并入识别热词」，用户反馈它有问题（术语表是翻译用的表，
+  // 整表塞进 prompt 会把识别带偏），v2.66.80 起换成这个。
+  ['wc-liveHotwords', 'checkbox', 'asr.whisperChunked.liveHotwords'],
   ['wc-skipSilence', 'checkbox', 'asr.whisperChunked.skipSilence'],
   // AGC 档位：差麦克风场景下 gentle 常常比默认更稳（提升减半、收敛慢 4 倍、噪声门抬高）
   ['cp-agcProfile', 'text', 'capture.agcProfile'],
