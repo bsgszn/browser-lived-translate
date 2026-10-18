@@ -253,6 +253,20 @@ function snapshotLine(tag) {
     const sbRanges = g(() => sb?.buffered?.length ?? 0);
     const vRanges = g(() => v?.buffered?.length ?? 0);
     const vEnd = g(() => (v?.buffered?.length ? v.buffered.end(v.buffered.length - 1) : null), null);
+    /**
+     * ⚠️ 缓冲的**起点** —— 这一格是为了让「裁剪到底有没有发生」在日志里可判 ✗。
+     *
+     * 原来只有 `末尾 {vEnd}`，于是这两种**完全相反**的状态在日志里长得一模一样:
+     *   · `t60.0 … 末尾 66.0` 而 `起 0.0`   ⇒ 裁剪**一次都没生效**（缓冲从 0 一直挂到 66）✗
+     *   · `t60.0 … 末尾 66.0` 而 `起 55.2`  ⇒ 裁剪正常工作（后面 6 秒是留的余量）✓
+     * 有个用户报「延迟模式跑一段时间稳定崩溃」，而"是不是缓冲在涨"正好卡在这一格上 ✗。
+     */
+    const vStart = g(() => (v?.buffered?.length ? v.buffered.start(0) : null), null);
+    /**
+     * 裁剪统计 + 缓冲占用**估算**（只读，见 `DelayedPlayer#sbDiagnostics` 的注释）。
+     * ⚠️ 取不到就整体不印 —— 不许因为一个新读数把快照打挂。
+     */
+    const sbx = g(() => p?.sbDiagnostics, null);
     const lag = g(() => {
       const x = p?.actualDelaySec;
       return x === null || x === undefined ? '—' : Number(x).toFixed(1);
@@ -301,7 +315,21 @@ function snapshotLine(tag) {
       `\n〔快照 ${tag}·播放〕` +
       ` rs${g(() => v?.readyState)} ${g(() => (v?.paused ? '暂停' : '播放中'))}` +
       ` t${g(() => Number(v?.currentTime || 0).toFixed(1))}/${vRanges} 段` +
+      (vStart === null ? '' : ` 起 ${Number(vStart).toFixed(1)}`) +
       (vEnd === null ? '' : ` 末尾 ${Number(vEnd).toFixed(1)}`) +
+      /**
+       * ⚠️ 裁剪统计和缓冲估算 —— **必须和上面的 `起` / `t` 一起读**，单独看会说谎:
+       *   · `裁 0次` 而 `起 0.0`   ⇒ 裁剪**从来没发起过** ✗
+       *   · `裁 3次` 而 `起 0.0`   ⇒ 发起了却**没落地**（remove 排进队列但没生效）✗
+       *   · `裁 3次` 而 `起 55.2`  ⇒ 正常 ✓
+       * `缓冲估` 只回答"**量级**在不在涨" ✗ —— 它是码率×时长算出来的估算，
+       * 不是显存读数（见 `DelayedPlayer#sbDiagnostics` 里为什么刻意不印 `performance.memory`）。
+       */
+      (sbx && sbx.trimCount !== null
+        ? ` · 裁 ${sbx.trimCount}次` +
+          (sbx.sinceTrimSec === null ? '' : `/${Number(sbx.sinceTrimSec).toFixed(1)}s前`) +
+          (sbx.estBytes === null ? '' : ` · 缓冲估 ${(Number(sbx.estBytes) / 1048576).toFixed(1)}MB`)
+        : '') +
       ` · locked ${g(() => p?.locked)} · 被拒 ${g(() => p?.playBlocked)} · 延迟 ${lag}` +
       ` · seek ${seekN}${seekT === null ? '' : `@${seekT}`}` +
       ` · 见底 ${g(() => p?.stallCount)} · 帧 ${g(() => p?.totalFrames)}/${g(() => p?.droppedFrames)}` +
