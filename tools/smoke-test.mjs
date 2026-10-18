@@ -1202,6 +1202,104 @@ await checkAsync('v2→v3：用户没有旧术语表时不会凭空造一个出�
   if (s.translate.glossary !== '') throw new Error(`应为空字符串，实际：${JSON.stringify(s.translate.glossary)}`);
 });
 
+await checkAsync('v8→v9：三个断句参数按"等于旧默认才改"迁到新默认', async () => {
+  // 一份"v8 时代"的设置：断句三个旋钮还是旧默认 450 / 5 / 200
+  const v8 = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  v8.asr.vad.vadMinSilenceMs = 450;
+  v8.asr.vad.vadMaxSpeechSec = 5;
+  v8.asr.vad.vadPadMs = 200;
+  localStore.clear();
+  localStore.set(settings.STORAGE_KEY, v8);
+  localStore.set('livedub.settingsVersion', 8);
+
+  const s = await settings.getSettings();
+  if (s.asr.vad.vadMinSilenceMs !== 600) {
+    throw new Error(`静音确认没迁移到 600：${s.asr.vad.vadMinSilenceMs}`);
+  }
+  if (s.asr.vad.vadMaxSpeechSec !== 6) {
+    throw new Error(`单句上限没迁移到 6：${s.asr.vad.vadMaxSpeechSec}`);
+  }
+  if (s.asr.vad.vadPadMs !== 400) {
+    throw new Error(`前后留白没迁移到 400：${s.asr.vad.vadPadMs}`);
+  }
+  // 两级边界不能被迁移搞成倒挂
+  if (!(s.asr.vad.vadUtteranceEndMs > s.asr.vad.vadMinSilenceMs)) {
+    throw new Error('迁移后硬边界没大于软边界 —— 等于没有两级');
+  }
+});
+
+await checkAsync('v8→v9：用户自己调过的断句参数一律保留', async () => {
+  const v8 = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  v8.asr.vad.vadMinSilenceMs = 350; // 用户为快语速自己调的
+  v8.asr.vad.vadMaxSpeechSec = 4; // 同上
+  v8.asr.vad.vadPadMs = 600; // 同上
+  localStore.clear();
+  localStore.set(settings.STORAGE_KEY, v8);
+  localStore.set('livedub.settingsVersion', 8);
+
+  const s = await settings.getSettings();
+  if (s.asr.vad.vadMinSilenceMs !== 350) throw new Error('用户设的静音确认被覆盖了');
+  if (s.asr.vad.vadMaxSpeechSec !== 4) throw new Error('用户设的单句上限被覆盖了');
+  if (s.asr.vad.vadPadMs !== 600) throw new Error('用户设的前后留白被覆盖了');
+});
+
+await checkAsync('v9 的用户不会被重复迁移（迁移后自己再调回去要保住）', async () => {
+  localStore.clear();
+  await settings.getSettings(); // 全新安装 → 落盘成当前版本
+  // ⚠️ 必须深拷贝再改：假 store 存的是**引用**，而 mergeSettings 会把 DEFAULT_SETTINGS 的
+  //    嵌套对象直接挂进返回值里 —— 就地改就会把默认值改掉，后面的断言全跟着歪
+  //    （第一次写这条时就是这么把 DEFAULT_SETTINGS.asr.vad.vadMinSilenceMs 改成 400 的）。
+  const cur = JSON.parse(JSON.stringify(localStore.get(settings.STORAGE_KEY)));
+  // 模拟"迁移之后用户又把静音确认调小"
+  cur.asr.vad.vadMinSilenceMs = 400;
+  localStore.set(settings.STORAGE_KEY, cur);
+
+  const s = await settings.getSettings();
+  if (s.asr.vad.vadMinSilenceMs !== 400) {
+    throw new Error('已经是当前版本了还在迁移 —— 用户的新选择被覆盖');
+  }
+});
+
+await checkAsync('迁移不许改掉 DEFAULT_SETTINGS 本身（mergeSettings 会按引用复用嵌套对象）', async () => {
+  // ⚠️ 真实 bug（v2.66.78 加 9 号迁移时暴露）：
+  //    `mergeSettings(DEFAULT_SETTINGS, stored)` 在 patch 里**没有**某个键时是
+  //    `out[k] = base[k]` —— 按引用复用。于是老 profile（缺 `asr.vad` 整块）拿到的
+  //    `merged.asr.vad` 和 `DEFAULT_SETTINGS.asr.vad` 是**同一个对象**，
+  //    而 `runMigrations` 是就地 `setByPath` ⇒ 一跑迁移就把默认值改了 ✗。
+  //    测试里的表现是「改默认值的断言永远红不了」（被它坑过一次，所以钉这一条）。
+  const before = JSON.stringify(settings.DEFAULT_SETTINGS);
+  // ① 一份缺 asr.vad 的老配置 —— 这正是触发别名复用的形状
+  localStore.clear();
+  localStore.set(settings.STORAGE_KEY, { asr: { provider: 'vad' } });
+  localStore.set('livedub.settingsVersion', 8);
+  const s1 = await settings.getSettings();
+  // 迁移确实生效了，否则这条断言没在测东西
+  if (s1.asr.vad.vadMinSilenceMs !== 600) {
+    throw new Error(`老配置没被迁移（${s1.asr.vad.vadMinSilenceMs}）—— 这条断言没测到东西`);
+  }
+  if (JSON.stringify(settings.DEFAULT_SETTINGS) !== before) {
+    throw new Error('DEFAULT_SETTINGS 被迁移改掉了 —— mergeSettings 的别名复用没挡住');
+  }
+  // ⭐ 上面那条"值没变"是**结果**；下面这条是**机理**。
+  //    只钉结果会漏：今天的默认值恰好都不等于任何迁移的旧值，所以别名写不进去，
+  //    "值没变"照样成立 —— 那是一次"接近等价"的检查（写这条时才发现）。
+  //    直接钉"返回值不许引用 DEFAULT_SETTINGS 的嵌套对象"，才能在去掉深拷贝时变红。
+  //    ⚠️ 必须查 **s1**（那一次真的跑了迁移、merged 走的是 mergeSettings 的别名）；
+  //       s2 时 storage 里已经是迁移写回的完整对象，天然是新对象，查不出问题。
+  if (s1.asr.vad === settings.DEFAULT_SETTINGS.asr.vad) {
+    throw new Error('getSettings() 直接把 DEFAULT_SETTINGS.asr.vad 挂了进去 —— 任何就地修改都会污染默认值');
+  }
+  if (s1.asr.deepgram === settings.DEFAULT_SETTINGS.asr.deepgram) {
+    throw new Error('getSettings() 直接引用了 DEFAULT_SETTINGS.asr.deepgram');
+  }
+  // ② v1 用户（缺整块 asr.vad）同理
+  storeAsV1();
+  await settings.getSettings();
+  if (JSON.stringify(settings.DEFAULT_SETTINGS) !== before) {
+    throw new Error('v1 用户跑完迁移后 DEFAULT_SETTINGS 也变了');
+  }
+});
+
 console.log('\n[5] 翻译上下文与术语表');
 // ─────────────────────────────────────────────────────────────
 
@@ -4421,8 +4519,23 @@ check('本地 VAD：必须注册成识别服务，并带上自己的参数', () 
   for (const k of ['vadThreshold', 'vadMinSilenceMs', 'vadMaxSpeechSec', 'vadPadMs']) {
     if (typeof s.asr.vad[k] !== 'number') throw new Error(`缺参数 ${k}`);
   }
-  // 默认静音确认不能太大 —— 它直接等于主要延迟
-  if (s.asr.vad.vadMinSilenceMs > 500) throw new Error('默认静音确认太长，延迟会明显变差');
+  // ⭐ v2.66.78：默认静音确认从 450 提到 **600** —— 那是闭环 A/B/C 测出来的拐点，
+  // 不是拍的。450 → 600：整句中位字数 18 → 27（+50%）、min 4 → 7、≥8 字整句 93% → 97%；
+  // 代价是识别滞后中位 3.5 → 4.4s（+0.9s），而 max 反而 9.6 → 8.6（更稳）。
+  // 600 → 750 没有进一步改善（中位 27 → 27、min 7 → 5）⇒ 600 是拐点。
+  // ⚠️ 这一项**直接等于主要延迟**，所以钉死它、并且不许再往上加。
+  if (s.asr.vad.vadMinSilenceMs !== 600) {
+    throw new Error(`默认静音确认应为 600ms（A/B/C 的拐点，见 lib/settings.js 的迁移注释），实际 ${s.asr.vad.vadMinSilenceMs}`);
+  }
+  if (s.asr.vad.vadMinSilenceMs > 600) throw new Error('默认静音确认超过 600ms —— 那一段延迟是白等的');
+
+  // ⭐ 「正常语速」档必须和默认值逐字一致，否则全新用户不落在 normal 档
+  // （下面「语速档位」那条也会因此变红，但在这里先报，定位更快）
+  const normalPreset = loaded['lib/settings.js'].VAD_RATE_PRESETS.find((p) => p.id === 'normal');
+  if (!normalPreset) throw new Error('缺 normal 语速档');
+  if (normalPreset.values['asr.vad.vadMinSilenceMs'] !== s.asr.vad.vadMinSilenceMs) {
+    throw new Error('normal 档的静音确认和默认值不一致 —— 全新用户会落到 custom');
+  }
 
   // 下拉框里要有这一项
   const list = loaded['lib/settings.js'].ASR_PROVIDERS.map((p) => p.id);
@@ -5603,8 +5716,21 @@ check('VAD 收句：够长就必须立刻收（否则碎片都"先不收"，累�
   }
   // 一句最长不能太大：20 秒会攒出六七十字的巨型字幕
   const s = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  // ⭐ v2.66.78：5 → **6**。上限那一刀是**按时间**切的，切在"到上限时正在说的那个音"上，
+  // 会切在词中间；5 秒太密 ⇒ 切点更多 ⇒ 半个词被分到两侧的次数更多
+  // （真机现场：「徴用の節句」被切成三片，线上认成「蝶用」/「石窟」/「セックス」）。
+  if (s.asr.vad.vadMaxSpeechSec !== 6) {
+    throw new Error(`默认单句上限应为 6s，实际 ${s.asr.vad.vadMaxSpeechSec}`);
+  }
   if (s.asr.vad.vadMaxSpeechSec > 6) {
     throw new Error(`vadMaxSpeechSec=${s.asr.vad.vadMaxSpeechSec} 太大，会攒出巨型字幕（实测 20 秒会到 66 字）`);
+  }
+
+  // ⭐ v2.66.78：前后留白 200 → **400**。200ms 只够一个音节，而日语
+  // 「ちょっと」「ネコ」这种要 300~400ms；真机里「ネコの真似」被切成两半 →
+  // 线上认成「この場」。留白**不加延迟**，只是前后各多取一点音频。
+  if (s.asr.vad.vadPadMs !== 400) {
+    throw new Error(`默认前后留白应为 400ms，实际 ${s.asr.vad.vadPadMs}`);
   }
 });
 
@@ -6081,6 +6207,22 @@ check('改过默认值的设置项必须在 MIGRATIONS 里有迁移（否则老�
   // 版本号必须真的推进，否则迁移根本不会跑
   if (settings.SETTINGS_VERSION < 6) {
     throw new Error(`SETTINGS_VERSION=${settings.SETTINGS_VERSION}，加了 6 号迁移就必须至少是 6`);
+  }
+
+  // ⭐ v2.66.78：本地 VAD 的三个断句默认值一起改了，必须三条都在表里。
+  // 少一条 = 那一项对老用户永远无效（本项目的"改了默认值没加迁移"已栽三次）。
+  for (const [path, oldV, newV] of [
+    ['asr.vad.vadMinSilenceMs', 450, 600],
+    ['asr.vad.vadMaxSpeechSec', 5, 6],
+    ['asr.vad.vadPadMs', 200, 400],
+  ]) {
+    const re = new RegExp(`'${path.replace(/\./g, '\\.')}',\\s*${oldV},\\s*${newV}\\b`);
+    if (!re.test(m[1])) {
+      throw new Error(`${path} 的默认值从 ${oldV} 改成了 ${newV}，但 MIGRATIONS 里没有 [路径, ${oldV}, ${newV}] 这条`);
+    }
+  }
+  if (settings.SETTINGS_VERSION < 9) {
+    throw new Error(`SETTINGS_VERSION=${settings.SETTINGS_VERSION}，加了 9 号迁移就必须至少是 9`);
   }
 });
 

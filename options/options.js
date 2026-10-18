@@ -183,7 +183,7 @@ async function init() {
   $('delayQuality').addEventListener('change', updateQualityHint);
   /**
    * 语速档位。断句参数跟语速强相关，而"这人说话快不快"用户一眼就知道，
-   * 比让他去猜「静音确认填 300 还是 450」直观得多。
+   * 比让他去猜「静音确认填 300 还是 600」直观得多。
    * 选档位只是把一组合理的起点写进那几个旋钮，之后仍可单独微调。
    */
   fillSelect($('vd-rate'), [
