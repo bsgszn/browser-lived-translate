@@ -140,6 +140,9 @@ const MODULES = [
   'lib/asr/hallucination.js',
   'lib/asr/whisper-segments.js',
   'lib/asr/silence-span.js',
+  // ⚠️ 「连续 N 帧都达标才算开口」的判据本体 —— 它原来内联在 `vad.js` 的闭包里 ✗
+  //    ⇒ 断言只能靠源码正则，测不到行为。提出来之后这里才测得到 ✓
+  'lib/asr/speech-run.js',
   // ⚠️ 批次引擎（新断句路径的驱动）—— 它曾经**不在这个清单里** ⇒ 一个断言都没有 ✗
   'lib/asr/whisper-batch.js',
   'lib/asr/index.js',
@@ -10580,6 +10583,136 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     if (SS.LEADING_TRIM_RATIO !== 4) throw new Error(`LEADING_TRIM_RATIO = ${SS.LEADING_TRIM_RATIO}`);
   });
 }
+
+// 「连续 N 帧都达标才算开口」（lib/asr/speech-run.js）—— 新路开口锚的判据本体
+//
+// ⚠️ 为什么必须单独钉：这段逻辑原来内联在 `vad.js` 的 `createSession` 闭包里 ✗
+//    ⇒ 断言只能对源码做正则，测不到"算出来是多少" ✓
+//    而它今天正是**算错了**却没被任何断言拦住的典型（单帧判据 ⇒ 音乐床在批起点就过阈值
+//    ⇒ `shift = 0` ⇒ 锚点形同不存在 ✗）
+//
+// ⭐ 关键不变量：**返回首帧，不是末帧** ✗
+//    返回末帧会把开口推迟 `minRunFrames - 1` 帧（7 帧 = 240ms）⇒ 字幕又变晚 ✗
+function assertSpeechRun() {
+  const SR = loaded['lib/asr/speech-run.js'];
+  if (typeof SR.findSpeechRun !== 'function') throw new Error('speech-run.js 没有 findSpeechRun');
+
+  /** 把普通数组包成 `get`，并用 `minRunFrames` 扫 [0, len-1] ✓ */
+  const scan = (probs, minRunFrames, threshold = 0.5) =>
+    SR.findSpeechRun(SR.arrayGetter(probs), {
+      fromIdx: 0, toIdx: probs.length - 1, threshold, minRunFrames,
+    });
+
+  check('开口锚：连续 7 帧才算 —— 前面断过的单帧不算', () => {
+    // 0.9 之后立刻断，再从 index 2 起连续 7 个 0.9 ⇒ 首帧应是 2
+    const probs = [0.9, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+    const got = scan(probs, 7);
+    if (got !== 2) throw new Error(`应返回 2（那段连续帧的首帧），得到 ${got}`);
+  });
+
+  check('开口锚：全达标返回 0、全不达标返回 null', () => {
+    if (scan(new Array(12).fill(0.9), 7) !== 0) throw new Error('全达标应返回 0');
+    if (scan(new Array(12).fill(0.1), 7) !== null) throw new Error('全不达标应返回 null');
+  });
+
+  check('开口锚：恰好 7 帧达标 → 返回起点；只有 6 帧 → null（窗口末尾凑不满）', () => {
+    const exactly = [0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+    if (scan(exactly, 7) !== 1) throw new Error(`恰好 7 帧应返回 1，得到 ${scan(exactly, 7)}`);
+    const only6 = [0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+    if (scan(only6, 7) !== null) throw new Error('只有 6 帧应返回 null');
+  });
+
+  check('开口锚：返回的是首帧不是末帧（错成末帧会让开口晚 240ms）', () => {
+    const probs = new Array(10).fill(0.9);
+    const got = scan(probs, 7);
+    if (got !== 0) throw new Error(`10 帧全达标、need=7 ⇒ 首帧应是 0；得到 ${got}（=1 就说明返回的是末帧减一，=6 就是末帧）`);
+  });
+
+  check('开口锚：`minRunFrames = 1` 时行为等于旧的单帧判据', () => {
+    const probs = [0.1, 0.1, 0.9, 0.1];
+    if (scan(probs, 1) !== 2) throw new Error(`单帧判据应返回 2，得到 ${scan(probs, 1)}`);
+    // 不传 minRunFrames 也必须等价于 1（默认值）
+    if (SR.findSpeechRun(SR.arrayGetter(probs), { fromIdx: 0, toIdx: 3, threshold: 0.5 }) !== 2) {
+      throw new Error('不传 minRunFrames 应等价于 1');
+    }
+  });
+
+  check('开口锚：非有限值会打断连续，不会被当成达标', () => {
+    // 环里没写过的槽是 undefined —— 把它当达标会让窗口头部立刻成立
+    const probs = [0.9, 0.9, undefined, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9];
+    const got = scan(probs, 7);
+    if (got !== 3) throw new Error(`undefined 应打断连续（应从 3 起算），得到 ${got}`);
+    if (scan([NaN, NaN, NaN, NaN, NaN, NaN, NaN, NaN], 7) !== null) {
+      throw new Error('全 NaN 应返回 null');
+    }
+  });
+
+  check('开口锚：脏索引一律 null（`Number(null) === 0` 那个坑）', () => {
+    const get = SR.arrayGetter([0.9, 0.9, 0.9]);
+    for (const bad of [
+      { fromIdx: null, toIdx: 2, threshold: 0.5 },
+      { fromIdx: 0, toIdx: null, threshold: 0.5 },
+      { fromIdx: 0, toIdx: 2, threshold: null },
+      { fromIdx: NaN, toIdx: 2, threshold: 0.5 },
+      { fromIdx: 0, toIdx: Infinity, threshold: 0.5 },
+    ]) {
+      const got = SR.findSpeechRun(get, bad);
+      if (got !== null) throw new Error(`${JSON.stringify(bad)} 应返回 null，得到 ${got}`);
+    }
+    if (SR.findSpeechRun(null, { fromIdx: 0, toIdx: 2, threshold: 0.5 }) !== null) {
+      throw new Error('get 不是函数应返回 null');
+    }
+  });
+
+  check('开口锚：fromIdx > toIdx 时返回 null，不崩', () => {
+    const get = SR.arrayGetter([0.9, 0.9, 0.9]);
+    if (SR.findSpeechRun(get, { fromIdx: 5, toIdx: 2, threshold: 0.5, minRunFrames: 1 }) !== null) {
+      throw new Error('倒置区间应返回 null');
+    }
+  });
+
+  check('开口锚：环形缓冲的取帧（越界帧当作"没这一帧"，不当作 0）', () => {
+    // ⚠️ 用 1 而不是 0.9 —— Float32Array 存 0.9 会变成 0.89999…，直接比会假红 ✗
+    const ring = new Float32Array([1, 1, 1, 1]);
+    const g = SR.ringGetter(ring, 4, 5);
+    if (g(4) !== 1 || g(5) !== 1) throw new Error(`已写过的帧应取得到，得到 g(4)=${g(4)} g(5)=${g(5)}`);
+    if (g(6) !== undefined) throw new Error(`超过 lastFrame 应返回 undefined，得到 ${g(6)}`);
+    if (g(-1) !== undefined) throw new Error('负索引应返回 undefined');
+    // lastFrame = 0 时，第 0 帧之前的帧都不该存在
+    const g0 = SR.ringGetter(ring, 4, 0);
+    if (g0(1) !== undefined) throw new Error('g0(1) 应 undefined');
+    if (g0(0) !== 1) throw new Error('g0(0) 应 1');
+    // 真的绕圈：lastFrame = 5、ringLen = 4 ⇒ 索引 4 落在槽 0，索引 5 落在槽 1
+    const ring2 = new Float32Array([1, 2, 3, 4]);
+    const g2 = SR.ringGetter(ring2, 4, 5);
+    if (g2(4) !== 1 || g2(5) !== 2) throw new Error(`绕圈取帧错：g2(4)=${g2(4)} g2(5)=${g2(5)}`);
+  });
+
+  check('开口锚：脏 ring / arrayGetter 不崩', () => {
+    for (const bad of [null, undefined, {}, 'abc', 42]) {
+      if (typeof SR.arrayGetter(bad) !== 'function') throw new Error('arrayGetter 必须始终返回函数');
+      if (SR.arrayGetter(bad)(0) !== undefined) throw new Error('脏输入的 getter 应返回 undefined');
+      if (SR.ringGetter(bad, 4, 3)(0) !== undefined) throw new Error('脏 ring 的 getter 应返回 undefined');
+      if (SR.ringGetter(new Float32Array(4), 0, 3)(0) !== undefined) throw new Error('ringLen = 0 应返回 undefined');
+    }
+  });
+
+  check('开口锚：`vad.js` 真的调这个纯函数（不是还在自己内联扫一遍）', () => {
+    const src = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
+    if (!/firstSpeechAt[\s\S]{0,1500}?findSpeechRun\(/.test(src)) {
+      throw new Error('vad.js 的 firstSpeechAt 没有调用 findSpeechRun —— 判据可能还是内联的');
+    }
+    // 反证：`firstSpeechAt` 里不该再出现手写的 `run += 1`
+    const fnStart = src.indexOf('function firstSpeechAt');
+    if (fnStart >= 0) {
+      const body = src.slice(fnStart, fnStart + 2000);
+      if (/run\s*\+=\s*1/.test(body)) {
+        throw new Error('firstSpeechAt 里还有手写的 run 计数 —— 判定逻辑有第二份');
+      }
+    }
+  });
+}
+assertSpeechRun();
 
 // 批次引擎（lib/asr/whisper-batch.js）—— 新断句路径「按 Whisper 的边界推进」
 //
