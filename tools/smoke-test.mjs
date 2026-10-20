@@ -11041,6 +11041,104 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     }
   });
 
+  /**
+   * ⭐ **一批里的第一段**：`seg.start` 的信任窗口要放宽到 1 秒 ✓
+   *
+   * 病根（实测，同一份素材、两轮闭环、都延迟 10、按内容互配 37 对）:
+   * ```
+   * 提前 >0.5s 的 12 条里，9 条满足「新路跨度比旧路长 >1s」
+   *   −5.89s 旧跨 6.4s → 新跨 8.0s
+   *   −2.78s 旧跨 2.0s → 新跨 4.0s
+   *   −1.63s 旧跨 2.1s → 新跨 4.0s   ← 同一句「そうなんだよね」，sim 1.00
+   * ```
+   * ⇒ 那些段的 `seg.start` 都在 **0.02 秒以上** ⇒ 旧的严格门槛**根本不去问 VAD** ✗
+   * ⇒ 而"批首段 + 段变长"一起出现，正是"起点被夹在批首"的指纹 ✓
+   *
+   * ⚠️ 判据用「回调**被调了几次**」而不是只看返回值 ——
+   *    "调了但结果碰巧相等"会让值断言漏判 ✗（这一族今天栽过）
+   * ⚠️ 而**第一段之后**的段必须保持严格 0.02：它们的 `start` 是听完整个批之后
+   *    给出的段间边界，覆盖它会把本来正确的段挪歪 ✗
+   */
+  check('上屏时刻：**批首段**的 `seg.start` 信任窗口放宽到 1 秒（其余段仍是 0.02）', () => {
+    const base = 20;
+    const pcm = new Int16Array(Math.round(3 * SR));
+    const amp = 0.0128 * Math.SQRT2 * 32768;
+    for (let i = 0; i < pcm.length; i += 1) {
+      pcm[i] = Math.round(amp * Math.sin((2 * Math.PI * 180 * i) / SR));
+    }
+    /** 造一个"总在 base+shift 开口"的回调，并记录被调次数 */
+    function mk(shift) {
+      const box = { calls: 0 };
+      box.fn = (a, b) => {
+        box.calls += 1;
+        const t = base + shift;
+        return t > a && t < b ? t : null;
+      };
+      return box;
+    }
+
+    // ① 首段 + `seg.start = 0.4`（> 0.02 而 < 1）⇒ **必须**问 VAD，且采信
+    //    ⚠️ 锚点要比 `offsetSec + seg.start`（= 20.4）晚 **≥ 0.1s** 才采信 ✓
+    {
+      const seg = { start: 0.4, end: 3.4, text: 'ああああああ' };
+      const cb = mk(1.0); // ⇒ 21.0，比 20.4 晚 0.6s ✓
+      const got = WB.shownStartOf({
+        offsetSec: base, seg, pcm, sampleRate: SR,
+        firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst: true,
+      });
+      if (cb.calls !== 1) throw new Error(`首段 seg.start=0.4 必须问 VAD 一次，实际 ${cb.calls} 次`);
+      if (Math.abs(got - (base + 1.0)) > 1e-6) {
+        throw new Error(`首段应锚到 ${base + 1.0}，实际 ${got}`);
+      }
+    }
+
+    // ② 非首段 + 同样 seg.start = 0.4 ⇒ **一次都不许问**
+    {
+      const seg = { start: 0.4, end: 3.4, text: 'ああああああ' };
+      const cb = mk(0.42);
+      const got = WB.shownStartOf({
+        offsetSec: base, seg, pcm, sampleRate: SR,
+        firstSpeechAt: cb.fn, speechThreshold: 0.5,
+      });
+      if (cb.calls !== 0) throw new Error(`非首段 seg.start=0.4 不许问 VAD，实际 ${cb.calls} 次`);
+      const plain = WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR });
+      if (got !== plain) throw new Error(`非首段必须和不传回调时一致：${got} ≠ ${plain}`);
+    }
+
+    // ③ 首段但 `seg.start = 1.5`（>= 1 秒）⇒ Whisper 已经在说"开头 1.5 秒没语音" ⇒ 不许问
+    {
+      const seg = { start: 1.5, end: 4.5, text: 'ああああああ' };
+      const cb = mk(0.5);
+      WB.shownStartOf({
+        offsetSec: base, seg, pcm, sampleRate: SR,
+        firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst: true,
+      });
+      if (cb.calls !== 0) {
+        throw new Error(`首段 seg.start=1.5 已携带位置信息，不许问 VAD，实际 ${cb.calls} 次`);
+      }
+    }
+
+    // ④ 窗口边界：首段 `seg.start = 0.99` 仍要问（<= 1 秒）
+    {
+      const seg = { start: 0.99, end: 3.39, text: 'ああああああ' };
+      const cb = mk(1.3);
+      const got = WB.shownStartOf({
+        offsetSec: base, seg, pcm, sampleRate: SR,
+        firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst: true,
+      });
+      if (cb.calls !== 1) throw new Error(`首段 seg.start=0.99 要问 VAD，实际 ${cb.calls} 次`);
+      if (Math.abs(got - (base + 1.3)) > 1e-6) throw new Error(`应锚到 ${base + 1.3}，实际 ${got}`);
+    }
+
+    // ⑤ `isFirst` 缺省 ⇒ 和 `false` 逐字一样（旧行为不许被动）
+    {
+      const seg = { start: 0.4, end: 3.4, text: 'ああああああ' };
+      const a = WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR, firstSpeechAt: () => base + 1, speechThreshold: 0.5 });
+      const b = WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR, firstSpeechAt: () => base + 1, speechThreshold: 0.5, isFirst: false });
+      if (a !== b) throw new Error(`isFirst 缺省必须等于 false：${a} ≠ ${b}`);
+    }
+  });
+
   check('上屏时刻：`clampShownAt` 夹住排期倒退与过近（播放器同一刻只显示一条）', () => {
     // ⚠️ 病根：播放器同一时刻只显示一条字幕 ⇒「上一条显示了多久」**完全等于**
     //    两条 `at` 之间的距离。所以只要新路的 `at` 有一处**倒退**、或前进得只差
