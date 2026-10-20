@@ -136,6 +136,7 @@ const MODULES = [
   'lib/asr/vad-gate.js',
   'lib/asr/hallucination.js',
   'lib/asr/whisper-segments.js',
+  'lib/asr/silence-span.js',
   'lib/asr/index.js',
   'lib/hotwords/ja-live.js',
   'lib/translate/index.js',
@@ -9928,6 +9929,125 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     if (I(input) !== want) throw new Error(`${label} → ${I(input)}，应为 ${want}`);
   }
 });
+
+// 静音回看 · 纯函数（lib/asr/silence-span.js）—— 新断句架构"end 之后有没有静音"的判据
+// ⭐ 阈值全部来自**真机实测四档电平**：静音 0.0007 / 说话 0.0128 · 0.0416 · 0.1727
+{
+  const SS = loaded['lib/asr/silence-span.js'];
+  const SR = 16000;
+  /** 造一段给定 RMS 的 PCM（正弦 220Hz，RMS = amp/√2） */
+  const blk = (rms, ms) => {
+    const n = Math.round((SR * ms) / 1000);
+    const a = new Int16Array(n);
+    const amp = rms * Math.SQRT2 * 32768;
+    for (let i = 0; i < n; i += 1) {
+      a[i] = Math.max(-32768, Math.min(32767, Math.round(amp * Math.sin((2 * Math.PI * 220 * i) / SR))));
+    }
+    return a;
+  };
+  const cat = (...parts) => {
+    const n = parts.reduce((s, p) => s + p.length, 0);
+    const out = new Int16Array(n);
+    let o = 0;
+    for (const p of parts) {
+      out.set(p, o);
+      o += p.length;
+    }
+    return out;
+  };
+  const QUIET = 0.0007;
+  const SOFT = 0.0128;
+  const MID = 0.0416;
+  const LOUD = 0.1727;
+
+  check('静音回看：真机四档电平各跑一遍（静音段要判出、说话段要判不出）', () => {
+    // 每档都配一段 240ms 静音 —— 三档说话都该判 true
+    for (const [lvl, label] of [[SOFT, '小声 0.0128'], [MID, '中 0.0416'], [LOUD, '大 0.1727']]) {
+      const pcm = cat(blk(lvl, 1000), blk(QUIET, 240));
+      const got = SS.hasSilenceIn(pcm);
+      if (got !== true) throw new Error(`${label} + 静音 240ms → ${got}，应 true`);
+    }
+    // 而全程说话不能判出静音
+    for (const [lvl, label] of [[SOFT, '小声'], [MID, '中'], [LOUD, '大']]) {
+      const got = SS.hasSilenceIn(cat(blk(lvl, 1500)));
+      if (got !== false) throw new Error(`全程${label} → ${got}，应 false`);
+    }
+  });
+
+  check('静音回看：**全程静音**必须判 true（纯相对判据在这里会错，靠绝对地板兜住）', () => {
+    // ⚠️ 这一条是设计的要害：纯相对判据下，全程静音和全程说话的"最长低谷"都是 0，
+    //    唯一能分开它们的是绝对电平（差 59 倍）。删掉 SILENCE_FLOOR_RMS 这条就红。
+    const got = SS.hasSilenceIn(cat(blk(QUIET, 1500)));
+    if (got !== true) throw new Error(`全程静音 → ${got}，应 true（绝对地板没生效？）`);
+  });
+
+  check('静音回看：窗粒度 40ms 的边界（200 判 true、160 判 false）', () => {
+    // 门槛是 200ms，而判定单位是一整窗（40ms）⇒ 200ms 刚好 5 窗
+    const at200 = SS.hasSilenceIn(cat(blk(MID, 1000), blk(QUIET, 200)));
+    if (at200 !== true) throw new Error(`静音 200ms → ${at200}，应 true（正好 5 窗）`);
+    const at160 = SS.hasSilenceIn(cat(blk(MID, 1000), blk(QUIET, 160)));
+    if (at160 !== false) throw new Error(`静音 160ms → ${at160}，应 false（只有 4 窗）`);
+  });
+
+  check('静音回看：静音在开头 / 结尾 / 中间都能判出', () => {
+    const head = SS.hasSilenceIn(cat(blk(QUIET, 320), blk(MID, 800)));
+    const tail = SS.hasSilenceIn(cat(blk(MID, 800), blk(QUIET, 320)));
+    const mid = SS.hasSilenceIn(cat(blk(MID, 600), blk(QUIET, 320), blk(MID, 600)));
+    if (!head || !tail || !mid) throw new Error(`头 ${head} · 尾 ${tail} · 中 ${mid}，应全 true`);
+  });
+
+  check('静音回看：两段静音取最长的那段', () => {
+    const pcm = cat(blk(QUIET, 240), blk(MID, 400), blk(QUIET, 320));
+    const longest = SS.longestSilenceMs(pcm);
+    if (longest !== 320) throw new Error(`最长 = ${longest}，应 320（取最长那段，不是相加）`);
+  });
+
+  check('静音回看：脏输入不崩，且 hasSilenceIn 一律 false', () => {
+    // hasSilenceIn 不返回 null —— 判不了就当 false（保守方向：不确定就当"没静音"）
+    for (const bad of [null, undefined, new Int16Array(0), {}, 'abc', new Int16Array(10)]) {
+      const l = SS.longestSilenceMs(bad);
+      if (l !== null) throw new Error(`longestSilenceMs(${JSON.stringify(bad)}) = ${l}，应 null`);
+      if (SS.hasSilenceIn(bad) !== false) throw new Error(`hasSilenceIn(${JSON.stringify(bad)}) 应 false`);
+    }
+  });
+
+  check('静音回看：测出的是**静音段的长度**，不是"整段都算静音"（低谷比例的防线）', () => {
+    // ⚠️ 这一条是 `SILENCE_LULL_RATIO` 的唯一行为断言。
+    //    只判 `hasSilenceIn === true` 的话，比例取 0.5 时**说话段也会被算进低谷**，
+    //    总长从 240ms 变成 1240ms —— 而 `true` 依旧成立，于是变异抓不到 ✗
+    //    所以必须钉**数值**：说话 0.0128（真机"小声"那档）+ 静音 0.0007 240ms
+    const pcm = cat(blk(SOFT, 1000), blk(QUIET, 240));
+    const longest = SS.longestSilenceMs(pcm);
+    if (longest !== 240) {
+      throw new Error(`最长静音 = ${longest}，应 240（低谷比例太大时会把 0.0128 的说话也吞进去 → 1240）`);
+    }
+    // 而"中"那档（0.0416）同样只应量到 240ms
+    const mid = SS.longestSilenceMs(cat(blk(MID, 1000), blk(QUIET, 240)));
+    if (mid !== 240) throw new Error(`中电平那档最长 = ${mid}，应 240`);
+
+    // ⭐ 而"先短促大声、再持续小声"才是低谷比例真正起作用的形态：
+    //    ceil 被小声段主导（p90 避开 100ms 爆音），而小声 0.0128 必须**不算静音**。
+    //    比例取 0.15 时这里会变成 800ms（600ms 小声被吞）⇒ 误判"这句说完了" ⇒ 采纳半句 ✗
+    const burst = SS.longestSilenceMs(cat(blk(LOUD, 100), blk(SOFT, 600), blk(QUIET, 240)));
+    if (burst !== 240) {
+      throw new Error(`爆音+小声那档最长 = ${burst}，应 240（低谷比例太大时小声会被吞 → 800）`);
+    }
+  });
+
+  check('静音回看：常量是预期值（改常量要同步改这里和注释里的标定）', () => {
+    if (SS.SILENCE_WIN_MS !== 40) throw new Error(`SILENCE_WIN_MS = ${SS.SILENCE_WIN_MS}`);
+    if (SS.SILENCE_MIN_MS !== 200) throw new Error(`SILENCE_MIN_MS = ${SS.SILENCE_MIN_MS}`);
+    if (SS.SILENCE_LULL_RATIO !== 0.1) throw new Error(`SILENCE_LULL_RATIO = ${SS.SILENCE_LULL_RATIO}`);
+    if (SS.SILENCE_FLOOR_RMS !== 0.003) throw new Error(`SILENCE_FLOOR_RMS = ${SS.SILENCE_FLOOR_RMS}`);
+  });
+
+  check('静音回看：`pickPct` 的边界（空数组 → NaN，单元素 → 它自己）', () => {
+    if (!Number.isNaN(SS.pickPct([], 0.9))) throw new Error('空数组应为 NaN');
+    if (SS.pickPct([0.5], 0.9) !== 0.5) throw new Error('单元素应返回它自己');
+    if (SS.pickPct([1, 2, 3, 4, 5], 0) !== 1) throw new Error('p0 应是最小值');
+    if (SS.pickPct([1, 2, 3, 4, 5], 1) !== 5) throw new Error('p1 应是最大值');
+  });
+}
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
