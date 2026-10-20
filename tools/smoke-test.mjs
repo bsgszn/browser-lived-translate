@@ -8512,7 +8512,15 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
     return pj.slice(a, b);
   };
 
-  const renderLoop = between('for (const item of schedule.due(', 'setTimeout(pumpSubtitles');
+  /**
+   * ⚠️ 锚点只能用 `schedule.due(`（**不能带 `for (const item of`**）✗ ——
+   *    渲染循环后来重构成"先把到点条目收进 `dueItems`、再按下标遍历"，
+   *    好让「屏上让位」能把没处理完的条目**放回队首**（`due()` 是 `shift()` 弹出的，
+   *    直接 `break` 会丢字幕 ✗）。
+   *    ⇒ 旧锚点在重构后切出**空串**，这条断言于是无条件变红 ✓
+   *    —— 那个方向是对的（它宁可红也不肯悄悄变绿 ✓），而锚点本身必须跟上重构 ✓
+   */
+  const renderLoop = between('schedule.due(', 'setTimeout(pumpSubtitles');
   check(
     '看门狗的基准是「字幕真的上屏」：上屏时刻必须打在真正的渲染循环里',
     renderLoop.length > 100 && /lastShownAt\s*=\s*Date\.now\(\)/.test(renderLoop) && /shownCount\s*\+=\s*1/.test(renderLoop),
@@ -11126,6 +11134,72 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     if (out[out.length - 1] !== 20.0) {
       throw new Error(`相距很远的那条不许被推动，实际 ${out[out.length - 1]}`);
     }
+  });
+
+  check('上屏时刻：`holdSwitchForGap` 屏上让位（上一条没待够就别换屏，只对新路）', () => {
+    // ⚠️ 为什么夹在**排期时刻**上不够（实测）：`at` 里含会变的 `delayMs` ✗
+    //    `xhsp-ab3-B` 里「夹紧推后」**一次都没触发**（0 次），而导出日志里仍有
+    //    `73.512 → 72.992（−0.52）` / `91.146 → 91.046（−0.10）` 这种倒退 ✗
+    //    ⇒ 那几条推入时的 `usedDelayMs` 不同 ⇒ 必须在**显示层**再夹一道 ✓
+
+    if (WB.MIN_SHOW_HOLD_MS !== 500) {
+      throw new Error(`屏上最小停留应是 500ms，实际 ${WB.MIN_SHOW_HOLD_MS}`);
+    }
+    const H = WB.holdSwitchForGap;
+
+    // ① ⭐ **还没换过屏（0）⇒ 不许挡** —— `0` 不能被当成"刚换过" ✗
+    //    （`Number(null) === 0` 那一族；挡了的话第一条字幕就永远不上屏 ✗）
+    //
+    //    ⚠️ 用例必须覆盖 **now 很小**的情形 ✗ ——
+    //       `pumpSubtitles` 用的是 `performance.now()`，它**从页面加载起算**，
+    //       所以启动后的头 500ms 里 `now` 就是 100~400 这种小值 ✓
+    //       而第一版用例写的是 `now = 1000`（`1000 - 0 = 1000 ≥ 500`），
+    //       即便守卫被删掉也返回 false ⇒ **变异全绿、断言抓不到** ✗（本轮的教训 ✓）
+    for (const now of [0, 100, 300, 499, 1000]) {
+      if (H({ now, lastSwitchAt: 0 }) !== false) {
+        throw new Error(`还没换过屏时不许挡（now=${now}）—— 否则第一条字幕永远上不了`);
+      }
+    }
+
+    // ② 刚换过 100ms ⇒ 挡
+    if (H({ now: 1100, lastSwitchAt: 1000 }) !== true) {
+      throw new Error('刚换过 100ms 应当挡');
+    }
+
+    // ③ **正好 500ms ⇒ 不挡**（边界用 `<` 而不是 `<=`，否则每隔一拍都会被多挡一次 ✗）
+    if (H({ now: 1500, lastSwitchAt: 1000 }) !== false) {
+      throw new Error('正好 500ms 时不该再挡');
+    }
+    // ④ 600ms ⇒ 不挡
+    if (H({ now: 1600, lastSwitchAt: 1000 }) !== false) {
+      throw new Error('已过 600ms 时不该挡');
+    }
+
+    // ⑤ ⭐ **旧路必须逐字不受影响**（`enabled=false` ⇒ 永远不挡）✗
+    if (H({ now: 1001, lastSwitchAt: 1000, enabled: false }) !== false) {
+      throw new Error('旧路（enabled=false）不许挡 —— 它的时机用户认可，动它就是回归');
+    }
+
+    // ⑥ 脏输入一律**不挡**（挡了会永久停住 ✗）
+    for (const bad of [
+      { now: NaN, lastSwitchAt: 1000 },
+      { now: undefined, lastSwitchAt: 1000 },
+      { now: 1100, lastSwitchAt: null },
+      { now: 1100, lastSwitchAt: NaN },
+      { now: 1100, lastSwitchAt: -5 },
+      { now: 1100, lastSwitchAt: 1000, minHoldMs: 0 },
+      { now: 1100, lastSwitchAt: 1000, minHoldMs: -1 },
+      { now: 1100, lastSwitchAt: 1000, minHoldMs: NaN },
+    ]) {
+      if (H(bad) !== false) {
+        throw new Error(`脏输入 ${JSON.stringify(bad)} 时不许挡（会永久停住）`);
+      }
+    }
+
+    // ⑦ 一拍 100ms 的量级：从换屏那一拍到"能换下一屏"最多 5 拍
+    let n = 0;
+    for (let t = 1000; H({ now: t, lastSwitchAt: 1000 }) && n < 50; t += 100) n += 1;
+    if (n > 5) throw new Error(`最多该挡 5 拍（0.5s / 100ms），实际挡了 ${n} 拍`);
   });
 }
 
