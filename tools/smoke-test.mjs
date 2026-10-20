@@ -137,6 +137,8 @@ const MODULES = [
   'lib/asr/hallucination.js',
   'lib/asr/whisper-segments.js',
   'lib/asr/silence-span.js',
+  // ⚠️ 批次引擎（新断句路径的驱动）—— 它曾经**不在这个清单里** ⇒ 一个断言都没有 ✗
+  'lib/asr/whisper-batch.js',
   'lib/asr/index.js',
   'lib/hotwords/ja-live.js',
   'lib/translate/index.js',
@@ -10046,6 +10048,155 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     if (SS.pickPct([0.5], 0.9) !== 0.5) throw new Error('单元素应返回它自己');
     if (SS.pickPct([1, 2, 3, 4, 5], 0) !== 1) throw new Error('p0 应是最小值');
     if (SS.pickPct([1, 2, 3, 4, 5], 1) !== 5) throw new Error('p1 应是最大值');
+  });
+}
+
+// 批次引擎（lib/asr/whisper-batch.js）—— 新断句路径「按 Whisper 的边界推进」
+//
+// ⭐ 这节钉的是**接线**，不是决策（决策在 whisper-segments.js 那节）✓：
+//    引擎的输出形状、`offsetSec` 的绝对值、`allowShort` 的收尾、出错后能不能恢复。
+//
+// ⚠️ 为什么必须钉：引擎在 `vad.js` 里只被 `pumpSegments()` 一处调用，
+//    而那一处**在闭包里、断言够不到** ✗ —— 所以引擎自己必须先被锁住 ✓
+//    （这一族今天栽过多次：`tooShort` 算了没人消费、`Math.min` 上限永不生效、
+//      以及它加进仓库之后**一个断言都没有** ✗）
+{
+  const WB = loaded['lib/asr/whisper-batch.js'];
+  const SR = 16000;
+
+  /**
+   * 造一个引擎。`silent` 决定 `takeRange` 返回什么：
+   *   · true  → 全 0（RMS 0）⇒ `hasSilenceIn` 判"静音" ⇒ 每段都被确认 ✓
+   *   · false → 全 8000（RMS ≈ 0.244）⇒ 判"不静音" ⇒ 一律停在尾段 ✗
+   * 引擎本身不看 PCM 内容，只有「静音确认」那一步看 ✓
+   */
+  const mkLoop = (totalSec, { silent = true } = {}) => {
+    const total = SR * totalSec;
+    const fill = silent ? 0 : 8000;
+    return WB.createSegmentLoop({
+      takeRange: (s, e) => {
+        const a = Math.max(0, s);
+        const b = Math.min(total, e);
+        if (b <= a) return new Int16Array(0);
+        const out = new Int16Array(b - a);
+        out.fill(fill);
+        return out;
+      },
+      transcribe: async () => [],
+      sampleRate: SR,
+    });
+  };
+
+  check('批次引擎：常量是预期值（改常量要同步改注释里的标定）', () => {
+    if (WB.FIRST_BATCH_SEC !== 6) throw new Error(`FIRST_BATCH_SEC = ${WB.FIRST_BATCH_SEC}`);
+    if (WB.CONTINUE_BATCH_SEC !== 5) throw new Error(`CONTINUE_BATCH_SEC = ${WB.CONTINUE_BATCH_SEC}`);
+    if (WB.MAX_BATCH_SEC !== 12) throw new Error(`MAX_BATCH_SEC = ${WB.MAX_BATCH_SEC}`);
+    if (WB.SILENCE_CHECK_SEC !== 0.25) throw new Error(`SILENCE_CHECK_SEC = ${WB.SILENCE_CHECK_SEC}`);
+  });
+
+  check('批次引擎：音频不够长时不开批（首批 6 秒，只给 5 秒要等）', () => {
+    const loop = mkLoop(30);
+    if (loop.next(SR * 5) !== null) throw new Error('5 秒就该等，实际开了批');
+    const plan = loop.next(SR * 6);
+    if (!plan) throw new Error('6 秒应当开批');
+    if (Math.abs(plan.pcm.length / SR - 6) > 0.01) {
+      throw new Error(`首批音频 ${(plan.pcm.length / SR).toFixed(2)}s，应 6s`);
+    }
+  });
+
+  check('批次引擎：`allowShort` 让收尾拿短音频（stop 时不许丢掉最后一句）', () => {
+    const loop = mkLoop(30);
+    if (loop.next(SR * 2) !== null) throw new Error('不开 allowShort 时 2 秒该等');
+    const plan = loop.next(SR * 2, { allowShort: true });
+    if (!plan) throw new Error('allowShort 时应当开批');
+    if (Math.abs(plan.pcm.length / SR - 2) > 0.01) {
+      throw new Error(`应取 2 秒，实际 ${(plan.pcm.length / SR).toFixed(2)}s`);
+    }
+  });
+
+  check('批次引擎：offsetSec 是本批起点，绝对时间 = offsetSec + seg.start', () => {
+    const loop = mkLoop(60);
+    const p1 = loop.next(SR * 6);
+    if (!p1) throw new Error('首批应当开批');
+    if (Math.abs(p1.offsetSec) > 1e-6) throw new Error(`首批 offsetSec = ${p1.offsetSec}，应 0`);
+    const o1 = loop.apply([
+      { start: 0, end: 4, text: 'A' },
+      { start: 4, end: 6, text: 'B' },
+    ]);
+    if (o1.accepted.length !== 2) throw new Error(`应采纳 2 段，实际 ${o1.accepted.length}`);
+    if (Math.abs(o1.nextStart - 6) > 1e-6) throw new Error(`nextStart = ${o1.nextStart}，应 6`);
+
+    // 下一批：nextStart = 6，尾巴为空 ⇒ 要 5 秒新音频
+    const p2 = loop.next(SR * 11);
+    if (!p2) throw new Error('11 秒时第二批应当开批');
+    if (Math.abs(p2.offsetSec - 6) > 1e-6) throw new Error(`第二批 offsetSec = ${p2.offsetSec}，应 6`);
+    const o2 = loop.apply([{ start: 0.5, end: 3, text: 'C' }]);
+    // ⚠️ 这就是那条最容易犯的错：漏加 offsetSec 的话绝对起点会是 0.5 而不是 6.5 ✗
+    const abs = o2.offsetSec + o2.accepted[0].start;
+    if (Math.abs(abs - 6.5) > 1e-6) throw new Error(`绝对起点 ${abs}，应 6.5`);
+  });
+
+  check('批次引擎：没静音确认就一直不采纳（`tail-unconfirmed`，nextStart 回到那段 start）', () => {
+    const loop = mkLoop(60, { silent: false });
+    loop.next(SR * 6);
+    const out = loop.apply([
+      { start: 0, end: 2, text: 'A' },
+      { start: 2, end: 5, text: 'B' },
+    ]);
+    if (out.accepted.length !== 0) throw new Error(`没静音却采纳了 ${out.accepted.length} 段`);
+    if (out.reason !== 'tail-unconfirmed') throw new Error(`reason = ${out.reason}`);
+    if (Math.abs(out.nextStart) > 1e-6) throw new Error(`nextStart = ${out.nextStart}，应 0`);
+  });
+
+  check('批次引擎：`force` 兜底能推上屏（stop / 要停了才用）', () => {
+    const loop = mkLoop(60, { silent: false });
+    loop.next(SR * 6);
+    const out = loop.apply([{ start: 0, end: 4, text: 'A' }], { force: true });
+    if (out.accepted.length !== 1) throw new Error(`force 应采纳 1 段，实际 ${out.accepted.length}`);
+    if (out.reason !== 'force-accepted') throw new Error(`reason = ${out.reason}`);
+    if (Math.abs(out.nextStart - 4) > 1e-6) throw new Error(`nextStart = ${out.nextStart}，应 4`);
+  });
+
+  check('批次引擎：`isTextTrustworthy` 真的被透传（幻觉段不上屏）', () => {
+    const loop = WB.createSegmentLoop({
+      takeRange: () => new Int16Array(SR),
+      transcribe: async () => [],
+      sampleRate: SR,
+      isTextTrustworthy: (seg) => seg.text !== 'BAD',
+    });
+    loop.next(SR * 6);
+    const out = loop.apply([
+      { start: 0, end: 2, text: 'OK' },
+      { start: 2, end: 5, text: 'BAD' },
+    ]);
+    if (out.accepted.length !== 1) throw new Error(`应只采纳 1 段，实际 ${out.accepted.length}`);
+    if (out.accepted[0].text !== 'OK') throw new Error(`采纳了「${out.accepted[0].text}」`);
+    if (out.reason !== 'text-untrusted') throw new Error(`reason = ${out.reason}`);
+    // ⚠️ 不传 → 完全跳过那道判据（回归保护）：同一批两段都该采纳 ✓
+    const loop2 = WB.createSegmentLoop({
+      takeRange: () => new Int16Array(SR),
+      transcribe: async () => [],
+      sampleRate: SR,
+    });
+    loop2.next(SR * 6);
+    const out2 = loop2.apply([
+      { start: 0, end: 2, text: 'OK' },
+      { start: 2, end: 5, text: 'BAD' },
+    ]);
+    if (out2.accepted.length !== 2) throw new Error(`不传回调时应采纳 2 段，实际 ${out2.accepted.length}`);
+  });
+
+  check('批次引擎：`apply([])` 能释放 inflight（否则出错就永久停住）', () => {
+    const loop = mkLoop(60);
+    const p1 = loop.next(SR * 6);
+    if (!p1) throw new Error('首批应当开批');
+    // ⚠️ 有 inflight 时 next() 必须返回 null（防重入）
+    if (loop.next(SR * 20) !== null) throw new Error('在飞的时候不该再开批');
+    const out = loop.apply([]);
+    if (out.reason !== 'no-segments') throw new Error(`空结果 reason = ${out.reason}`);
+    // ⚠️ 这就是"静默停住"：出错后若没 apply([])，下面这行会是 null ⇒ 字幕全停 ✗
+    const p2 = loop.next(SR * 20);
+    if (!p2) throw new Error('apply([]) 之后应当能再开批（否则出错就永久停住）');
   });
 }
 
