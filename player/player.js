@@ -31,7 +31,13 @@ import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote, formatAtSt
 import { buildWhisperPrompt } from '../lib/asr/vad.js';
 // ⚠️ 只取两个**纯函数**（不引整条识别链）—— 它们和「什么时候该上屏」有关，
 //    和 `shownStartOf` / `clampShownAt` 是同一族，放在同一个模块里 ✓
-import { holdSwitchForGap, MIN_SHOW_HOLD_MS } from '../lib/asr/whisper-batch.js';
+import {
+  holdSwitchForGap,
+  MIN_SHOW_HOLD_MS,
+  MIN_SHOW_GAP_SEC,
+  shouldMergeShown,
+  joinShownText,
+} from '../lib/asr/whisper-batch.js';
 import { JA_LIVE_HOTWORD_LIST } from '../lib/hotwords/ja-live.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
 import {
@@ -201,6 +207,13 @@ let lastShownAt = 0;
 let lastShowSwitchAt = 0;
 /** 被「屏上让位」挡下来的次数（进心跳/诊断，否则这事在日志里看不见 ✗） */
 let showHeldCount = 0;
+/**
+ * 被「屏上合并」并进上一条的次数（和 `showHeldCount` 同一个理由：看不见就查不到 ✓）。
+ *
+ * 合并**不推迟任何东西** —— 它只是把"两句挤在一起、后一句把前一句顶掉"换成"一行显示两句" ✓
+ * 而它和"让位"是**互斥**的两条路：能并就并（用户定的），并不了才让位 ✓
+ */
+let showMergedCount = 0;
 /** 上次刷新"没有识别结果"提示的时刻（要持续刷新，不能只报一次） */
 let lastNoticeAt = 0;
 /** 上次报告「缓冲落后实况多久」的时刻（每 10 秒报一次，免得刷屏） */
@@ -2235,6 +2248,57 @@ function pumpSubtitles() {
   const holdEnabled = String(settings?.asr?.provider || '') === 'vad-segments';
   for (let di = 0; di < dueItems.length; di += 1) {
     const item = dueItems[di];
+    /**
+     * ⭐ **屏上合并闸** ✓ —— 两句排期撞在一起（一批出两句）时，**并成一行一起显示** ✓
+     *
+     * 用户定的规矩（原话）：
+     * > 「如果句子比较短,且第一句不超排期的话,两句或者多句一起送出可以」
+     * > 「注意是最后上字幕一起送出来,**不是说改变识别方式**」
+     *
+     * ⇒ 所以它**只动显示**：识别结果、`at`、排期一个都不改 ✓
+     *
+     * 为什么要有它（实测）：`段内切分` 会一批出两条，而那两条的 `at` 只差几十毫秒
+     * （`xhsp-seg25-B` 的 `91.092 → 91.013` = **−0.079s**）⇒ 后一条一到就把前一条顶掉 ✗
+     * 而下面的「让位」只能把它**推迟** 0.5 秒（那又变成"晚"✗）。
+     * ⇒ **能并就并、并不了才让位** —— 顺序不能反 ✗
+     */
+    if (holdEnabled) {
+      const prevId = history.length ? history[history.length - 1] : null;
+      const prevItem = prevId ? rendered.get(prevId) : null;
+      if (
+        shouldMergeShown({
+          prev: prevItem,
+          next: item,
+          now,
+          prevShownAt: lastShowSwitchAt,
+        })
+      ) {
+        const joinedOriginal = joinShownText(prevItem.original, item.original);
+        const joinedTranslation = joinShownText(prevItem.translation, item.translation);
+        prevItem.original = joinedOriginal;
+        prevItem.translation = joinedTranslation;
+        // 跨度只用于诊断（"这句说了多久"）—— 并了就把尾巴接上 ✓
+        const prevEnd = Number(prevItem.end);
+        if (Number.isFinite(item.end)) {
+          prevItem.end = Number.isFinite(prevEnd) ? Math.max(prevEnd, item.end) : item.end;
+        }
+        prevItem.mergedCount = (Number(prevItem.mergedCount) || 0) + 1;
+        showMergedCount += 1;
+        /**
+         * ⚠️ **不更新 `lastShowSwitchAt`** —— 屏上那一条**没有换**，只是变长了 ✓
+         *    更新它会让下一条被无端"让位"0.5 秒 ✗
+         * ⚠️ **不 push `history`** —— 否则就是两行、又回到"分别推送"✗
+         */
+        diag(
+          `屏上合并 · 第 ${showMergedCount} 次 · 合计 ${joinedOriginal.length} 字` +
+            ` · 两条排期差 ${((item.at - prevItem.at) / 1000).toFixed(2)}s` +
+            `（< ${MIN_SHOW_GAP_SEC}s ⇒ 本来会顶掉前一条）· 上屏时刻不变`,
+          false,
+        );
+        renderSubs();
+        continue;
+      }
+    }
     /**
      * 🔴 **屏上让位闸** ✗ —— 上一条还没在屏上待够 `MIN_SHOW_HOLD_MS`，
      *    这一拍先别换屏，下一拍（100ms 后）再来 ✓
