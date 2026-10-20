@@ -191,7 +191,18 @@ let lastShownAt = 0;
 let lastNoticeAt = 0;
 /** 上次报告「缓冲落后实况多久」的时刻（每 10 秒报一次，免得刷屏） */
 let lastRecLagAt = 0;
-let actualDelayEma = null;
+/**
+ * 「实测延迟 − 目标延迟」的毫秒差（负 = 画面比目标更靠前 ⇒ 按目标排会**偏晚**）。
+ *
+ * ⚠️ **只用于诊断，不参与排期** ✗ —— 排期按目标值走（见 `currentDelayMs`）。
+ *    用户的原话是「不是要偏早,也不是要偏晚,而是要**准**；短句尤其不许早也不许晚」✗
+ *    ⇒ 而"准"的前提是 `actual ≈ target`；达不到时必须**说出来**，
+ *      不许用排期悄悄补偿（那会让"短句为什么晚"变得查不出来）✗
+ */
+let scheduleDeviationMs = null;
+let scheduleDeviationEma = null;
+/** 偏差超过这么多毫秒才值得报（0.3 秒，人眼开始能看出错位） */
+const SCHEDULE_DEVIATION_WARN_MS = 300;
 const agc = new AgcController();
 let levelRms = 0;
 let lastLevelAt = 0;
@@ -1560,12 +1571,17 @@ function scheduleUtterance(u) {
 
   const id = `d${Date.now().toString(36)}${Math.floor(Math.random() * 1e4).toString(36)}`;
   const timing = { start: u.start, duration: u.duration };
+  /**
+   * ⚠️ 只调**一次** `currentDelayMs()`（它有副作用，会刷 EMA）——
+   *    排期和诊断必须用**同一个数**，否则日志里那格解释不了排在哪儿 ✗
+   */
+  const usedDelayMs = currentDelayMs();
   const at = schedule.push(
     // ⚠️ `cut` 要存进条目：合并判据要看**上一段**的切法，那时 u 已经过去了
     { id, original: text, translation: '', cut: String(u.cut || '') },
     timing,
     firstAudioAt || Date.now(),
-    currentDelayMs(),
+    usedDelayMs,
     Number(settings.capture.syncOffsetMs) || 0,
   );
 
@@ -1600,6 +1616,23 @@ function scheduleUtterance(u) {
   const asrLagSec = delayForDiagSec - remainSec;
   const overBudget = asrLagSec > delayForDiagSec;
   /**
+   * ⚠️ 排期按**目标值**排（`currentDelayMs`），而画面**实际**落后多少是另一回事。
+   *    两者差得多时，这一句就会**偏早 / 偏晚**那个差值 —— 而**必须报出来** ✗
+   *
+   *    原因：用户报过「句子明明很短，但是出来的晚 —— 或者说很早就出来了」✗
+   *    而排期如果悄悄按实测值挪（v2.66.83 干过），就变成"字幕时准时不准，
+   *    而日志里看不出为什么" ✗ —— 那比偏差本身更难查 ✓
+   *
+   *    ⇒ 这里只**说清偏差**，不动排期；真正该改的是"缓冲要真的填满"
+   *      （或者把目标降下来 —— 即缩短批长，见 `MAX_BATCH_SEC`）✓
+   */
+  const devSec = scheduleDeviationEma === null ? null : scheduleDeviationEma / 1000;
+  const devText =
+    devSec === null || Math.abs(devSec) * 1000 < SCHEDULE_DEVIATION_WARN_MS
+      ? ''
+      : ` · ⚠ 画面实际比目标${devSec < 0 ? '靠前' : '靠后'} ${Math.abs(devSec).toFixed(1)}s` +
+        ` ⇒ 这句会${devSec < 0 ? '晚' : '早'} ${Math.abs(devSec).toFixed(1)}s（缓冲没填到目标）`;
+  /**
    * 「这条字幕为什么这么长」—— 原来答不出来。
    *
    * ⚠️ `reason` 本来就印着（`max-span` / `max-chars` 就在那一格），但**只有标签没有量**，
@@ -1625,7 +1658,8 @@ function scheduleUtterance(u) {
   diag(
     `整句上屏 · ${whenText} · ${text.length} 字 · ${u.reason}` +
       ` · 累积 ${fmtNum(u.parts, 0, ' 片')} · 跨度 ${fmtNum(u.duration, 1, 's')}` +
-      ` · 识别滞后 ${asrLagSec.toFixed(1)}s${overBudget ? ` ⚠ 超过延迟预算 ${delayForDiagSec}s` : ''}`,
+      ` · 识别滞后 ${asrLagSec.toFixed(1)}s${overBudget ? ` ⚠ 超过延迟预算 ${delayForDiagSec}s` : ''}` +
+      devText,
     overBudget,
   );
 
@@ -1881,37 +1915,42 @@ function buildContext(seg) {
 }
 
 /**
- * 排期用的延迟值（毫秒）。
+ * 排期用的延迟值（毫秒）—— **我们向播放器要的那个延迟**。
  *
- *   actualDelaySec = bufferedEnd − currentTime          （画面缓冲领先播放头多少）
- *   recorderLag    = (现在 − 开始录音) − bufferedEnd     （还没进缓冲的那一段）
- *   ───────────────────────────────────────────────────
- *   画面离实况的真实距离 = actualDelaySec + recorderLag
+ * ⚠️ 这里用的是 `effectiveDelaySec`（**目标值**），不是实测值。为什么，是用户定的：
  *
- * ⚠️ 只用 actualDelaySec 排期，字幕会恒定偏早 recorderLag 那么多（实测约 1.0~1.4 秒）。
+ *   > 「宁可早，不晚 —— 记得不是绝对的。如果句子真的很长可以稍微晚点。
+ *   >   但是不要说：句子明明很短，但是出来的晚 —— 或者说很早就出来了」
  *
- * ⚠️⚠️ **下限不能低于目标值** —— v2.66.83 修的「新路字幕提前」就是这个。
+ *   ⇒ **目标不是"偏早"也不是"偏晚"，而是"误差小到看不出来"** ✓
+ *   ⇒ 而排期按**目标值**排，就等于"假定画面真的在目标延迟那个位置" ✓
+ *      —— 那是**设计意图**，也是字幕本该对齐的地方 ✓
  *
- *   新断句路径要 ≈10 秒（首批音频 6 秒 + 一次往返 + 确认）。而 `actualDelaySec` 量的是
- *   **缓冲领先多少**，缓冲没填满时它比 10 小（实测只填到 7.1 秒时算成 7.1 + 录音滞后 ≈ 8.3 秒）。
- *   于是字幕被排在 8.3 秒那一刻，而画面要到 10 秒才播到那一帧
- *   ⇒ **字幕提前 (10 − 8.3) 秒** —— 用户实测「提前按秒算」，和这里算出来的数吻合。
+ * ⚠️⚠️ 而 `actualDelaySec`（缓冲领先播放头多少）**明显小于**目标值时，
+ *    画面**其实还在更前面**，按目标排就会让这句**偏晚** ✗ ——
+ *    而**这个偏差不许悄悄用排期去掩盖**（那会让"短句晚/早"变得看不出原因）✗
+ *    ⇒ 所以这里**只报警**（`scheduleDeviationMs`，见调用处那行诊断）✓，
+ *      **不改排期** ✓；真正的修法是**让 actual 达到 target**（缩短批长 / 让缓冲真的填满）✓
  *
- *   ⇒ 取 `max(target, actual*1000)`：实测更小就按目标值排（宁可靠后一帧，不许提前）。
- *   ⚠️ **只取 max、不取 min**：actual 大于 target 时不能用 target 压下来 —— 那会让字幕迟到。
+ * ⚠️ 例外：还没测到实测值时，回落到目标值（那是唯一能用的估计）。
  */
 function currentDelayMs() {
   const target = effectiveDelaySec(settings) * 1000;
   const lag = recorderLagMs();
   const actual = playback?.actualDelaySec;
-  if (!Number.isFinite(actual) || actual <= 0) return target + lag;
-  // 画面离实况的**真实距离不可能小于目标值**：目标值是这条链路的下限（批长 + 往返 + 确认）。
-  const floor = target + lag;
-  const ms = Math.max(target, actual * 1000) + lag;
-  actualDelayEma = actualDelayEma === null ? ms : actualDelayEma + (ms - actualDelayEma) * 0.2;
-  // ⚠️ 平滑之后也要夹回下限 —— 一次低估就是一条提前上屏的字幕。
-  //    而且不能夹 `actualDelayEma` 本身：它是"实测值"的平滑，留着才能看出实测到底是多少。
-  return Math.max(floor, actualDelayEma);
+  /**
+   * 实测与目标差多少毫秒（负 = 画面比目标**更靠前** ⇒ 按目标排会**晚**）。
+   * `null` = 还没测到。
+   */
+  scheduleDeviationMs = Number.isFinite(actual) && actual > 0 ? actual * 1000 - target : null;
+  // 平滑只为诊断可读（实测是台阶值，瞬时值抖）；**不参与排期**
+  if (scheduleDeviationMs !== null) {
+    scheduleDeviationEma =
+      scheduleDeviationEma === null
+        ? scheduleDeviationMs
+        : scheduleDeviationEma + (scheduleDeviationMs - scheduleDeviationEma) * 0.2;
+  }
+  return target + lag;
 }
 
 /**

@@ -78,6 +78,17 @@ function runOnce(offsetMs, utterance) {
      */
     effectiveDelaySec: () => 6.6,
     currentDelayMs: () => 6600,
+    /**
+     * ⚠️ 排期按**目标值**走之后，那行诊断还要报「实测 vs 目标」的偏差
+     * （`scheduleDeviationEma` / `SCHEDULE_DEVIATION_WARN_MS`）。
+     * 少了它们就是 `ReferenceError`，而三条「整句上屏」断言正在这儿跑，会一起红 ✗
+     *
+     * 这里给 `null` = **还没测到实测值** ⇒ 不印偏差那一段。
+     * ⚠️ 「有偏差时会印什么」**不在这里**验 —— 那是 player.js 自己那条断言管的 ✓
+     */
+    scheduleDeviationEma: null,
+    scheduleDeviationMs: null,
+    SCHEDULE_DEVIATION_WARN_MS: 300,
     diag: (line) => printed.push(line),
     refineEnabled: () => false,
     refiner: null,
