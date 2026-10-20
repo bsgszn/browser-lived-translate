@@ -85,6 +85,10 @@ const FIELDS = [
   // 原来这里是「把术语表里的源词也并入识别热词」，用户反馈它有问题（术语表是翻译用的表，
   // 整表塞进 prompt 会把识别带偏），v2.66.80 起换成这个。
   ['wc-liveHotwords', 'checkbox', 'asr.whisperChunked.liveHotwords'],
+  // 新的断句架构（Whisper 先断、VAD 只做静音确认）—— **默认关**。
+  // ⚠️ 现在打开它不会有任何变化：新路还没接进 vad.js 的 flushSpeech（旧路仍在跑）。
+  //    零件已齐（lib/asr/whisper-segments.js + lib/asr/silence-span.js），接上才生效。
+  ['wc-whisperSegments', 'checkbox', 'asr.whisperChunked.whisperSegments'],
   ['wc-skipSilence', 'checkbox', 'asr.whisperChunked.skipSilence'],
   // AGC 档位：差麦克风场景下 gentle 常常比默认更稳（提升减半、收敛慢 4 倍、噪声门抬高）
   ['cp-agcProfile', 'text', 'capture.agcProfile'],
