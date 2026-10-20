@@ -10929,6 +10929,230 @@ function assertSpeechRun() {
       throw new Error('时长是数字字符串时必须照 8000 处理（和 looksTooFastForAudio 同一套归一化）');
     }
   });
+
+  /**
+   * ⭐ **段内切分** —— Whisper 把两句话合成一段时，把它切开 ✗
+   *
+   * ## 为什么需要它
+   *
+   * 「提前」实测还剩 9 条（`xhsp-ab6`，两轮都延迟 10、同素材、按内容配对），
+   * 其中 **4 条有同一个指纹：新路跨度比旧路长 1.5~4 秒** ✗
+   * ⇒ Whisper 把两句话合成一段 ⇒ 整段的 `at` 落在第一句开头，
+   *    而拿它去和旧路配「第二句」时，就成了提前一整个第一句的时长 ✗
+   *
+   * ## 这一条钉的是**保守方向**
+   *
+   * 判不准就**不切** ✓ —— 因为"一句话从中间被断开"比"合成一句"更难解释 ✗
+   * ⇒ 所以三条门槛（停顿够长 / 前面有内容 / 后面有内容）**每条都要单独反证** ✓
+   */
+  check('段内切分：三条门槛都成立才切，判不准就不切', () => {
+    if (typeof SR.planPauseSplit !== 'function') throw new Error('speech-run.js 没有 planPauseSplit');
+    /** 把「帧数 × 概率」的规格铺成帧数组 ✓ */
+    const mk = (spec) => {
+      const a = [];
+      for (const [v, n] of spec) for (let i = 0; i < n; i += 1) a.push(v);
+      return SR.arrayGetter(a);
+    };
+    const O = { threshold: 0.5 };
+
+    /** ① 典型形态：0.4s 语音 → 0.48s 停顿 → 1.2s 语音 ⇒ 切在停顿之后那一帧 ✓ */
+    {
+      const g = mk([[0.9, 10], [0.1, 12], [0.9, 30]]);
+      const r = SR.planPauseSplit(g, { ...O, fromIdx: 0, toIdx: 51 });
+      if (!r) throw new Error('「前有语音 + 停顿 480ms + 长尾」必须切');
+      /** ⚠️ 切点必须是**停顿结束后的第一帧**（10 + 12 = 22），不是停顿首帧、也不是峰值帧 ✗ */
+      if (r.splitIdx !== 22) throw new Error(`切点应是 22（停顿之后第一帧），实际 ${r.splitIdx}`);
+      if (r.gapFrames !== 12) throw new Error(`停顿帧数应是 12，实际 ${r.gapFrames}`);
+      if (r.leadFrames !== 10) throw new Error(`前导语音帧数应是 10，实际 ${r.leadFrames}`);
+      if (r.tailFrames !== 30) throw new Error(`尾部语音帧数应是 30，实际 ${r.tailFrames}`);
+    }
+    /** ② 完全没有停顿 ⇒ 不切 ✓ */
+    if (SR.planPauseSplit(mk([[0.9, 52]]), { ...O, fromIdx: 0, toIdx: 51 }) !== null) {
+      throw new Error('连续语音里没有停顿，不许切');
+    }
+    /** ③ 停顿太短（5 帧 = 200ms < 480ms）⇒ 不切 ✓ */
+    if (SR.planPauseSplit(mk([[0.9, 12], [0.1, 5], [0.9, 35]]), { ...O, fromIdx: 0, toIdx: 51 }) !== null) {
+      throw new Error('停顿只有 200ms 就切 —— 那会把换气当成句间停顿');
+    }
+    /** ④ 停顿**前面**内容太少（4 帧 = 160ms < 400ms）⇒ 不切 ✓（那是段首静音，归开口锚管） */
+    if (SR.planPauseSplit(mk([[0.9, 4], [0.1, 12], [0.9, 36]]), { ...O, fromIdx: 0, toIdx: 51 }) !== null) {
+      throw new Error('停顿前面只有 160ms 就切 —— 那是段首静音，该归开口锚');
+    }
+    /** ⑤ 停顿**后面**内容太少（6 帧 = 240ms < 1000ms）⇒ 不切 ✓（避免切出极短的第二句） */
+    if (SR.planPauseSplit(mk([[0.9, 30], [0.1, 12], [0.9, 6]]), { ...O, fromIdx: 0, toIdx: 47 }) !== null) {
+      throw new Error('停顿后面只有 240ms 就切 —— 会切出一个看不见的第二句');
+    }
+    /**
+     * ⑥ ⚠️ **非有限值必须同时打断"停顿"** ✗
+     *    把它算成静音会**凭一个坏帧造出一个停顿** ⇒ 直接切错 ✓
+     */
+    {
+      const base = mk([[0.9, 10], [0.1, 12], [0.9, 30]]);
+      const withNaN = (i) => (i === 16 ? NaN : base(i));
+      if (SR.planPauseSplit(withNaN, { ...O, fromIdx: 0, toIdx: 51 }) !== null) {
+        throw new Error('停顿中间夹一个 NaN 还被当成整整 12 帧停顿 —— 会凭一个坏帧切错');
+      }
+    }
+    /** ⑦ 脏输入一律不切、不崩 ✓ */
+    for (const bad of [
+      { fromIdx: '0', toIdx: 4 },
+      { fromIdx: 0, toIdx: 4, threshold: '0.5' },
+      { fromIdx: 5, toIdx: 2 },
+      {},
+    ]) {
+      if (SR.planPauseSplit(mk([[0.9, 10]]), { ...O, ...bad }) !== null) {
+        throw new Error(`脏参数（${JSON.stringify(bad)}）必须返回 null`);
+      }
+    }
+    if (SR.planPauseSplit(null, { ...O, fromIdx: 0, toIdx: 5 }) !== null) {
+      throw new Error('get 不是函数时必须返回 null');
+    }
+    /**
+     * ⑧ 探针**纯只读**：传不传 `probe`，返回值逐字相同 ✓
+     *    （"探针改了行为"这一族今天栽过 ✓）
+     */
+    {
+      const g = mk([[0.9, 10], [0.1, 12], [0.9, 30]]);
+      const a = SR.planPauseSplit(g, { ...O, fromIdx: 0, toIdx: 51 });
+      const p = {};
+      const b = SR.planPauseSplit(g, { ...O, fromIdx: 0, toIdx: 51, probe: p });
+      if (a.splitIdx !== b.splitIdx) throw new Error('探针改了返回值（必须纯只读）');
+      if (p.reason !== 'found' || p.splitIdx !== 22) throw new Error('探针没记下"切在哪"');
+    }
+  });
+
+  /**
+   * ⭐ 文本按时间比例切 —— **绝不丢字** ✗
+   *
+   * 服务端不支持词级时间戳（`timestamp_granularities[]=word` 实测解析失败）
+   * ⇒ 没有"词在哪个时刻"这个信息 ⇒ 只能按比例分配到字符 ✓
+   *
+   * ⚠️ 两条不变量：
+   *   ① **两段拼起来必须等于原文**（一个字都不许丢 ✗）
+   *   ② **绝不产生空的一半**（空文本上屏会变成看不见的字幕，而那会把前一句顶掉 ✗）
+   */
+  check('段内切分的文本切分：一个字都不许丢，绝不产生空的一半', () => {
+    if (typeof SR.splitTextByFraction !== 'function') throw new Error('speech-run.js 没有 splitTextByFraction');
+    /** ① 默认比例 0.5 ⇒ 两半拼起来等于原文 ✓ */
+    {
+      const t = 'する可能性だってあったりする';
+      const r = SR.splitTextByFraction(t, 0.5);
+      if (!r) throw new Error('15 字按 0.5 必须切得开');
+      if (r[0] + r[1] !== t) throw new Error(`丢字了：${r[0]} + ${r[1]} ≠ ${t}`);
+    }
+    /** ② 极端比例被夹到 [0.15, 0.85] ⇒ 两边都不是"几个字" ✓，而**仍然不丢字** ✓ */
+    {
+      const t = 'あいうえおかきくけこ';
+      for (const f of [0, 0.01, 0.99, 1, -5, 5]) {
+        const r = SR.splitTextByFraction(t, f);
+        if (!r) throw new Error(`比例 ${f} 不该切不开`);
+        if (r[0] + r[1] !== t) throw new Error(`比例 ${f} 丢字了`);
+        if (Array.from(r[0]).length < 1 || Array.from(r[1]).length < 1) {
+          throw new Error(`比例 ${f} 切出了空的一半`);
+        }
+      }
+    }
+    /** ③ 单字 / 空 / 非字符串 ⇒ null（**不切**）✓ */
+    for (const bad of ['あ', '   ', '', null, undefined, 123]) {
+      if (SR.splitTextByFraction(bad, 0.5) !== null) {
+        throw new Error(`文本是 ${JSON.stringify(bad)} 时不许切（会切出空的一半）`);
+      }
+    }
+    /** ④ 比例非法 ⇒ 退化成 0.5（不是 0、也不是 NaN）✓ */
+    {
+      const t = 'あいうえおかきくけこ';
+      const a = SR.splitTextByFraction(t, NaN);
+      const b = SR.splitTextByFraction(t, undefined);
+      const c = SR.splitTextByFraction(t, 0.5);
+      if (!a || !b) throw new Error('比例非法时不许返回 null（应退化成 0.5）');
+      if (a[0] !== c[0] || b[0] !== c[0]) throw new Error('非法比例必须退化成 0.5');
+    }
+    /**
+     * ⑤ **按码点切**，不按 UTF-16 码元切 ✗
+     *    否则 emoji（代理对）会被劈成两半，输出两个半个字符 ✓
+     */
+    {
+      const t = 'あ😀いうえおかきく';
+      const r = SR.splitTextByFraction(t, 0.5);
+      if (!r) throw new Error('含 emoji 的文本应当能切');
+      if (r[0] + r[1] !== t) throw new Error('含 emoji 时丢字了');
+      /**
+       * ⚠️ 判"半个代理对"要按**孤立代理**判，不能判 `ch.length !== Array.from(ch).length` ✗
+       *    后者会把**正常**的代理对（`'😀'.length === 2`、`Array.from('😀').length === 1`）判成错 ✓
+       *    —— 我第一版就是这么写的，红在**断言错**、不是代码错 ✓（"改准判据，不是放宽"）
+       */
+      for (const part of r) {
+        for (let i = 0; i < part.length; i += 1) {
+          const code = part.charCodeAt(i);
+          if (code >= 0xd800 && code <= 0xdbff) {
+            const next = part.charCodeAt(i + 1);
+            if (!(next >= 0xdc00 && next <= 0xdfff)) throw new Error('切出了半个代理对（高代理没有低代理）');
+            i += 1;
+          } else if (code >= 0xdc00 && code <= 0xdfff) {
+            throw new Error('切出了半个代理对（低代理没有高代理）');
+          }
+        }
+      }
+    }
+  });
+
+  /**
+   * ⭐ **接线上线**：那四个门槛必须真的被 `vad.js` 用起来 ✗
+   *
+   * 🔴 这是"变异抓出来的缺口"那一族（今天栽过三次）：
+   *    只钉「`planPauseSplit` 收到 X 时会不会切」是不够的 ——
+   *    真正决定线上行为的是 `vad.js` **传进去的那几个数** 和 **有没有调用它** ✓
+   *
+   * ⚠️ 钉**不变量**，不钉字面量：
+   *   · 段长门槛 ≥ 2 秒（两句话加停顿不可能更短 ✓）
+   *   · 停顿门槛 > 开口门槛（`FIRST_SPEECH_MIN_RUN_FRAMES` 的 280ms）——
+   *     否则会把"开口前那点静音"误当成句间停顿 ✗
+   *   · 四个常量**必须导出**（在闭包里就只能靠源码正则 ✗）
+   */
+  check('段内切分：四个门槛必须导出，且真的被 vad.js 接上线', () => {
+    const vv = loaded['lib/asr/vad.js'];
+    const seg = vv.PAUSE_SPLIT_MIN_SEG_SEC;
+    const gap = vv.PAUSE_SPLIT_MIN_GAP_MS;
+    const lead = vv.PAUSE_SPLIT_MIN_LEAD_MS;
+    const tail = vv.PAUSE_SPLIT_MIN_TAIL_MS;
+    for (const [name, v] of Object.entries({ SEG_SEC: seg, GAP_MS: gap, LEAD_MS: lead, TAIL_MS: tail })) {
+      if (typeof v !== 'number' || !Number.isFinite(v) || !(v > 0)) {
+        throw new Error(`PAUSE_SPLIT_MIN_${name} 必须是正数（实际 ${String(v)}）`);
+      }
+    }
+    if (!(seg >= 2)) throw new Error(`段长门槛 ${seg} 秒太小 —— 短句本来就不会被合并，会误切`);
+    /** 停顿门槛必须**明显大于**开口门槛（280ms），否则段首静音会被当成句间停顿 ✗ */
+    if (!(gap > 280)) throw new Error(`停顿门槛 ${gap}ms 不大于开口门槛 280ms —— 段首静音会被当成句间停顿`);
+    if (!(tail >= 500)) throw new Error(`尾部门槛 ${tail}ms 太小 —— 会切出看不见的第二句`);
+
+    const src = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
+    /** ① 必须真的调用 `planPauseSplit`，并把三个帧数门槛传进去 ✓ */
+    if (!/planPauseSplit\(/.test(src)) {
+      throw new Error('vad.js 没有调用 planPauseSplit —— 段内切分没接上线');
+    }
+    for (const k of ['PAUSE_SPLIT_MIN_GAP_MS', 'PAUSE_SPLIT_MIN_LEAD_MS', 'PAUSE_SPLIT_MIN_TAIL_MS']) {
+      if (!new RegExp(`min\\w*Frames:[^\\n]*${k}\\b`).test(src)) {
+        throw new Error(`${k} 没有被传进 planPauseSplit —— 门槛有两份真相`);
+      }
+    }
+    if (!/splitTextByFraction\(/.test(src)) {
+      throw new Error('vad.js 没有调用 splitTextByFraction —— 切开之后文本从哪来？');
+    }
+    /**
+     * ② 段长门槛必须真的参与判断（不能算出来不用）✗
+     *    —— "判据存在但从不消费"这一族今天栽过（`tooShort` 算了没人读 ✓）
+     */
+    if (!/dur\s*>=\s*PAUSE_SPLIT_MIN_SEG_SEC/.test(src)) {
+      throw new Error('PAUSE_SPLIT_MIN_SEG_SEC 没有参与判断 —— 短句也会被扫，更容易误切');
+    }
+    /**
+     * ③ 切开的**第二条**也要过排期夹紧 ✗
+     *    —— 否则两条撞在同一个 `at` 上，前一条又被秒顶 ✓
+     */
+    if (!/for \(const raw of rawPieces\)[\s\S]{0,400}?clampShownAt\(/.test(src)) {
+      throw new Error('切开的每一条没有逐条过 clampShownAt —— 两条会撞在同一个 at 上');
+    }
+  });
 }
 assertSpeechRun();
 
