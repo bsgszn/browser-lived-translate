@@ -10759,6 +10759,112 @@ function assertSpeechRun() {
   });
 
   /**
+   * ⭐ **开口锚探针** —— 回答「为什么没动」✗（`probe` 只读，不改行为 ✓）
+   *
+   * ## 为什么必须有这一条
+   *
+   * `null` 在调用方眼里只有一种意思：**不挪** ✓ —— 而它至少有**六种**原因 ✗
+   * （`no-frame-over` / `run-too-short` / `peak-low` / `window-too-short` /
+   *   `invalid-args` / VAD 侧 `no-history` 等）
+   * ⇒ 而这几种要**改的方向完全不同** ✗（不动 / 放宽帧数 / 加回落 / 不动 / 不动）
+   *
+   * 实测代价：`xhsp-ab6-B` 里 19 条段诊断有 4 条「锚没动」，
+   * 而它们在日志里**和"正常"长得一模一样** ✗ ⇒ 只能靠猜 ⇒ 今天猜错两次 ✓
+   * （"看不见"这一族已栽过六次 ✗）
+   *
+   * ⚠️ 断言要钉住**三件事**：
+   *   ① 六种原因**分得开**（否则探针等于没做 ✓）
+   *   ② 探针**纯只读**：传不传 `probe`，返回值**逐字相同** ✓
+   *   ③ 统计字段是真的（`run` / `peak` / `overThr` / `frames`）—— 它们决定"改哪里" ✓
+   */
+  check('开口锚探针：六种「没开口」的原因分得开，且纯只读', () => {
+    // ① 一帧都没过阈值 ⇒ no-frame-over（纯静音/纯音乐 ⇒ 动不了）
+    {
+      const p = {};
+      const flatLow = Array.from({ length: 12 }, () => 0.2);
+      if (SR.findSpeechRun(SR.arrayGetter(flatLow), {
+        fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75, probe: p,
+      }) !== null) throw new Error('全低不该算开口');
+      if (p.reason !== 'no-frame-over') throw new Error(`应是 no-frame-over，实际 ${p.reason}`);
+      if (p.overThr !== 0) throw new Error(`overThr 应是 0，实际 ${p.overThr}`);
+      if (p.frames !== 12) throw new Error(`frames 应是 12，实际 ${p.frames}`);
+    }
+    // ② 过了阈值但连续不够 ⇒ run-too-short（该放宽帧数）
+    {
+      const p = {};
+      const short = [0.9, 0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.1];
+      if (SR.findSpeechRun(SR.arrayGetter(short), {
+        fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75, probe: p,
+      }) !== null) throw new Error('连续 3 帧不该算开口');
+      if (p.reason !== 'run-too-short') throw new Error(`应是 run-too-short，实际 ${p.reason}`);
+      if (p.run !== 3) throw new Error(`最长连续应是 3，实际 ${p.run}`);
+      if (p.overThr !== 9) throw new Error(`过阈值帧数应是 9，实际 ${p.overThr}`);
+    }
+    // ③ 连续够了但峰值不够 ⇒ peak-low（音乐床贴阈值 ⇒ 该加回落/抬峰值）
+    {
+      const p = {};
+      const flatPeak = Array.from({ length: 12 }, () => 0.55);
+      if (SR.findSpeechRun(SR.arrayGetter(flatPeak), {
+        fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75, probe: p,
+      }) !== null) throw new Error('贴阈值的持续底噪不该算开口');
+      if (p.reason !== 'peak-low') throw new Error(`应是 peak-low，实际 ${p.reason}`);
+      if (p.run !== 12) throw new Error(`连续应是 12，实际 ${p.run}`);
+      if (Math.abs(p.peak - 0.55) > 1e-6) throw new Error(`峰值应是 0.55，实际 ${p.peak}`);
+      if (p.need !== 7) throw new Error(`need 应是 7，实际 ${p.need}`);
+    }
+    // ④ 窗口凑不满 need 帧 ⇒ window-too-short（批太短 ⇒ 不动）
+    {
+      const p = {};
+      if (SR.findSpeechRun(SR.arrayGetter([0.9, 0.9, 0.9]), {
+        fromIdx: 0, toIdx: 2, threshold: 0.5, minRunFrames: 7, probe: p,
+      }) !== null) throw new Error('3 帧窗口凑不满 7 帧');
+      if (p.reason !== 'window-too-short') throw new Error(`应是 window-too-short，实际 ${p.reason}`);
+    }
+    // ⑤ 参数非法 ⇒ invalid-args（不是"没有语音"，别混 ✓）
+    {
+      const p = {};
+      if (SR.findSpeechRun(SR.arrayGetter([0.9]), { fromIdx: 'a', toIdx: 2, threshold: 0.5, probe: p }) !== null) {
+        throw new Error('非法 fromIdx 应返回 null');
+      }
+      if (p.reason !== 'invalid-args') throw new Error(`应是 invalid-args，实际 ${p.reason}`);
+    }
+    // ⑥ 找到时 reason 必须是 found，并带上那一段的 run / peak / 首帧 ✓
+    {
+      const p = {};
+      const probs = Array.from({ length: 12 }, () => 0.55);
+      probs[9] = 0.98;
+      const got = SR.findSpeechRun(SR.arrayGetter(probs), {
+        fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75, probe: p,
+      });
+      if (got !== 0) throw new Error(`应返回首帧 0，实际 ${got}`);
+      if (p.reason !== 'found') throw new Error(`应是 found，实际 ${p.reason}`);
+      if (p.startFrame !== 0) throw new Error(`startFrame 应是 0，实际 ${p.startFrame}`);
+      // ⚠️ 命中那一刻已经扫到第 10 帧（0..9），所以 run 是 10 —— 不是 12 ✗
+      //    （`run` 记的是"发现时已连续多少帧"，不是"整段窗口最长多少帧"✓）
+      if (p.run !== 10) throw new Error(`run 应是命中时的 10，实际 ${p.run}`);
+      if (Math.abs(p.peak - 0.98) > 1e-6) throw new Error(`peak 应是 0.98，实际 ${p.peak}`);
+    }
+    // ⑦ ⭐ **纯只读**：传不传 probe，返回值必须逐字相同（否则探针本身就是新行为 ✗）
+    {
+      const cases = [
+        Array.from({ length: 12 }, () => 0.55),
+        Array.from({ length: 12 }, () => 0.2),
+        [0.9, 0.9, 0.9, 0.1, 0.9, 0.9, 0.9, 0.1],
+        [0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.98],
+      ];
+      for (const cs of cases) {
+        const a = SR.findSpeechRun(SR.arrayGetter(cs), {
+          fromIdx: 0, toIdx: cs.length - 1, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75,
+        });
+        const b = SR.findSpeechRun(SR.arrayGetter(cs), {
+          fromIdx: 0, toIdx: cs.length - 1, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75, probe: {},
+        });
+        if (a !== b) throw new Error(`探针改了返回值：${a} ≠ ${b}（探针必须纯只读）`);
+      }
+    }
+  });
+
+  /**
    * ⭐ 峰值门槛的**接线值**（v2.66.83）—— 上面那条只钉了「`findSpeechRun` 收到 0.75 时会不会判」
    *
    * 🔴 这一条是**变异抓出来的缺口**：把 `vad.js` 的 `FIRST_SPEECH_PEAK` 从 0.75 改成 0.5，
@@ -11360,6 +11466,125 @@ assertSpeechRun();
       });
       if (cb.calls !== 0) {
         throw new Error(`首段 seg.start=1.5 已携带位置信息，不许问 VAD，实际 ${cb.calls} 次`);
+      }
+    }
+
+    /**
+     * ③b ⭐ **影子测量**（`probe.shadowRequested`）—— 只测量、不吃结果 ✓
+     *
+     * ## 为什么要有它
+     *
+     * 实测 `xhsp-ab6-B`：4 条「锚没动」里 **3 条是首段 `start` = 1.74 / 2.00 / 3.74** ✗
+     * ⇒ 它们**根本没问 VAD**（`start` 超过 1 秒信任窗口）✓
+     * 而"放宽窗口有没有用"这件事，**没有数据可判** ✗ ⇒ 只能猜 ⇒ 今天猜错两次 ✓
+     *
+     * 所以影子测量：**照常问一次**（只在调用方要求时 ✗），把"如果放宽会挪多少"记下来，
+     * 而**返回值绝不受影响** ✓ —— 这样下一轮闭环就能用数据回答"要不要放宽" ✓✓✓
+     *
+     * ⚠️ **必须由调用方显式要求**：不要求时**一次都不许多问** ✓
+     *   —— 那是纯诊断的额外扫描，不该悄悄改变"谁被调用了几次" ✗
+     */
+    {
+      const seg = { start: 1.5, end: 4.5, text: 'ああああああ' };
+      /**
+       * ⚠️ 不能用上面那个 `mk()`：它返回的是**外层 `base`（20）+ shift**，
+       *    而 `shownStartOf` 内部的 `base` 是 `20 + seg.start = 21.5` ✗
+       *    ⇒ 用 `mk(0.5)` 会返回 20.5，落在窗口外 ⇒ 拿到 `null`，测不到"差多少" ✓
+       * 所以这里用**相对窗口起点**的 delta，判据清楚 ✓
+       */
+      const mkDelta = (delta) => {
+        const box = { calls: 0 };
+        box.fn = (a, b, thr, pr) => {
+          box.calls += 1;
+          if (pr && typeof pr === 'object') pr.reason = 'mocked';
+          const t = a + delta;
+          return t > a && t < b ? t : null;
+        };
+        return box;
+      };
+      // ⓐ 没要求影子 ⇒ 一次都不问
+      {
+        const cb = mkDelta(1.0);
+        const probe = {};
+        WB.shownStartOf({
+          offsetSec: base, seg, pcm, sampleRate: SR,
+          firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst: true, probe,
+        });
+        if (cb.calls !== 0) throw new Error(`未要求影子时不许问 VAD，实际 ${cb.calls} 次`);
+        if (probe.decision !== 'skipped-start-real') {
+          throw new Error(`首段 start>1 未要求影子，decision 应是 skipped-start-real，实际 ${probe.decision}`);
+        }
+        if (probe.shadow === true) throw new Error('未要求影子时不许标 shadow');
+      }
+      // ⓑ 要求影子：差 0.05s（< MIN_ANCHOR_SHIFT 0.1）⇒ 本不可采信，而返回值不变
+      {
+        const cb = mkDelta(0.05);
+        const probe = { shadowRequested: true };
+        const got = WB.shownStartOf({
+          offsetSec: base, seg, pcm, sampleRate: SR,
+          firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst: true, probe,
+        });
+        const plain = WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR });
+        if (cb.calls !== 1) throw new Error(`要求影子时应问 VAD 一次，实际 ${cb.calls} 次`);
+        if (got !== plain) throw new Error(`影子测量绝不许改返回值：${got} ≠ ${plain}`);
+        if (probe.shadow !== true) throw new Error('要求影子时应标 shadow');
+        if (probe.shadowWould !== false) {
+          throw new Error(`差 0.05s 不够 0.1，应判"不可采信"，实际 shadowWould=${probe.shadowWould}`);
+        }
+        if (Math.abs(probe.shadowShift - 0.05) > 1e-6) {
+          throw new Error(`shadowShift 应是 0.05，实际 ${probe.shadowShift}`);
+        }
+        if (probe.shadowReason !== 'mocked') {
+          throw new Error(`影子必须把 VAD 的 reason 带出来（否则查不出原因），实际 ${probe.shadowReason}`);
+        }
+      }
+      // ⓒ 要求影子且差 1.5s（≥ 0.1）⇒ 本可采信；返回值仍必须是"未锚"的原值
+      {
+        const cb = mkDelta(1.5);
+        const probe = { shadowRequested: true };
+        const got = WB.shownStartOf({
+          offsetSec: base, seg, pcm, sampleRate: SR,
+          firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst: true, probe,
+        });
+        if (got !== WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR })) {
+          throw new Error('要求影子时返回值仍必须是"未锚"的原值');
+        }
+        if (probe.shadowWould !== true) {
+          throw new Error(`影子点晚 1.5s 应判"本可采信"，实际 shadowWould=${probe.shadowWould}`);
+        }
+        if (probe.decision !== 'skipped-start-real') {
+          throw new Error(`影子不该改 decision（仍是"没问"），实际 ${probe.decision}`);
+        }
+      }
+      // ⓓ `clamped` 分支：探针必须拿到 VAD 的 reason（否则"为什么没动"又看不见）✗
+      {
+        const seg0 = { start: 0, end: 3, text: 'ああああ' };
+        const cb = mkDelta(0.05); // 差不够 0.1 ⇒ 被拒
+        const probe = {};
+        WB.shownStartOf({
+          offsetSec: base, seg: seg0, pcm, sampleRate: SR,
+          firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst: true, probe,
+        });
+        if (probe.consulted !== true) throw new Error('首段 start≈0 必须真的问 VAD');
+        if (probe.decision !== 'vad-rejected') {
+          throw new Error(`差 0.05s 应被拒（vad-rejected），实际 ${probe.decision}`);
+        }
+        if (probe.reason !== 'mocked') {
+          throw new Error(`被拒时必须带出 VAD 的 reason，实际 ${probe.reason}`);
+        }
+      }
+      // ⓔ 非首段且 start 是真实边界 ⇒ decision 必须是 skipped-not-first（不许被当成"没动"）
+      {
+        const probe = {};
+        const cb = mkDelta(1.0);
+        WB.shownStartOf({
+          offsetSec: base, seg: { start: 0.5, end: 3, text: 'ああ' }, pcm, sampleRate: SR,
+          firstSpeechAt: cb.fn, speechThreshold: 0.5, probe,
+        });
+        if (cb.calls !== 0) throw new Error('非首段 start=0.5 不许问 VAD');
+        if (probe.decision !== 'skipped-not-first') {
+          throw new Error(`应为 skipped-not-first，实际 ${probe.decision}`);
+        }
       }
     }
 
