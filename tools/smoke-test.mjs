@@ -10246,6 +10246,67 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     const p2 = loop.next(SR * 20);
     if (!p2) throw new Error('apply([]) 之后应当能再开批（否则出错就永久停住）');
   });
+
+  /**
+   * ⚠️ 兜底的 `waitedSec` 曾经**永远不涨** ⇒ `force` 是死代码 ✗
+   *
+   * 原来写的是 `waitedSec += pending.start - (nextStart / sampleRate)`，
+   * 而 `pending.start` 是**相对批起点**、`nextStart/sampleRate` 是**绝对** ✗ —— 两者相减没意义。
+   * 更要紧的是 stall 时 `pending.start` 恰好 0（那句话从批首说到批尾）⇒ 每次 `+= 0` ✗。
+   *
+   * 实测（离线仿真，素材 `火圣害羞了yp.wav` 的 16k 版，186 秒）:
+   *   修之前:每批 12.0s / 1 段 / `tail-unconfirmed` / 推进到 0.00s，**连续 400 批、采纳 0 段** ✗
+   *   修之后:42 批、采纳 42 段、推进 0 → 185.83 ✓
+   *
+   * 这个用例造出"一直整批一句"的局面，钉住"等满 maxBatchSec 后必须强制采纳" ✓
+   */
+  check('批次引擎：整批都是一句时，兜底会强制采纳（waitedSec 必须真的增长）', () => {
+    const loop = WB.createSegmentLoop({
+      takeRange: (s, e) => new Int16Array(Math.max(0, e - s)), // 内容无所谓：boundary 模式不看
+      transcribe: async () => [],
+      sampleRate: SR,
+    });
+    // 批 1 = 6 秒：整批一句 ⇒ 不确认 ⇒ 推进点不动（这是对的，还没等够）
+    const p1 = loop.next(SR * 60);
+    if (!p1) throw new Error('首批应当开批');
+    const len1 = p1.pcm.length / SR;
+    const o1 = loop.apply([{ start: 0, end: len1, text: '一' }]);
+    if (o1.accepted.length !== 0) throw new Error('整批贴批尾时不该采纳');
+    if (o1.reason !== 'tail-unconfirmed') throw new Error(`reason = ${o1.reason}`);
+    if (Math.abs(loop.state().nextStartSec) > 1e-6) throw new Error('推进点不该动');
+
+    // 批 2 = 尾巴 + 5 秒：再整批一句 ⇒ 累计等够 maxBatchSec ⇒ 必须 force 推上去 ✗ 否则永久卡死
+    const p2 = loop.next(SR * 60);
+    if (!p2) throw new Error('第二批应当开批');
+    const len2 = p2.pcm.length / SR;
+    const o2 = loop.apply([{ start: 0, end: len2, text: '二' }]);
+    if (o2.accepted.length !== 1) throw new Error(`兜底应强制采纳 1 段，实际 ${o2.accepted.length}`);
+    if (o2.reason !== 'force-accepted') throw new Error(`reason = ${o2.reason}，应是 force-accepted`);
+    if (o2.forced !== true) throw new Error('forced 应为 true');
+    // ⚠️ 关键：推进点必须真的往前走（= 批 2 的末尾），否则下一批会重认同一段
+    if (loop.state().nextStartSec < len2 - 0.01) {
+      throw new Error(`推进点只到 ${loop.state().nextStartSec}，应当 ≥${len2}（否则下一批会重认同一段）`);
+    }
+  });
+
+  /**
+   * ⚠️ 批长比 `tailMarginSec` 还短时，"不贴批尾"这个条件**永远不成立** ⇒ 一个都不采纳 ✗
+   * 实测：186 秒跑完时最后剩 1.0s，然后 0.2s，各**空转 50~60 次**才等到兜底
+   * ⇒ 浏览器里那是上百次白跑的请求 ✗
+   */
+  check('批次引擎：批太短时视为整批可听见（否则尾部会空转）', () => {
+    const loop = WB.createSegmentLoop({
+      takeRange: (s, e) => new Int16Array(Math.max(0, e - s)),
+      transcribe: async () => [],
+      sampleRate: SR,
+    });
+    // 开局只给 0.5 秒（远小于 tailMarginSec 0.35 的两倍）
+    const plan = loop.next(SR * 0.5, { allowShort: true });
+    if (!plan) throw new Error('短批也该能开');
+    const out = loop.apply([{ start: 0, end: 0.5, text: '尾' }]);
+    if (out.accepted.length !== 1) throw new Error(`短批应直接采纳，实际 ${out.accepted.length}`);
+    if (out.reason !== 'all-accepted') throw new Error(`reason = ${out.reason}，应是 all-accepted`);
+  });
 }
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
