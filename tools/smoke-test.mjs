@@ -10711,6 +10711,90 @@ function assertSpeechRun() {
       }
     }
   });
+
+  /**
+   * ⭐ 峰值门槛（v2.66.83）—— 光靠「连续 7 帧 ≥ 0.5」还不够
+   *
+   * 实测（`xhsp-anchor1` 闭环）那 2 条「锚 +0.00」的，正是跨度过长最严重的
+   * （`1.2 字/秒` / `0.1 字/秒`）：窗口里**音乐床贴着 0.5 浮动**，连续 7 帧达标 ✗
+   * ⇒ 必须再要求「这一段里至少一帧真的高」（默认 0.75）✓
+   *
+   * ⚠️ 而不传 `peakThreshold` 时**必须与旧行为逐字相同**（默认 = threshold）✗
+   */
+  check('开口锚：贴着阈值的持续底噪不算开口（峰值门槛）', () => {
+    /** 7 帧都是 0.55 —— 连续 7 帧 ≥0.5 成立，而峰值只有 0.55 < 0.75 */
+    const flat = Array.from({ length: 12 }, () => 0.55);
+    if (SR.findSpeechRun(SR.arrayGetter(flat), {
+      fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75,
+    }) !== null) {
+      throw new Error('贴着阈值的持续底噪被当成开口了 —— 音乐床能连续 7 帧 ≥0.5');
+    }
+    /** 同一段，中间有一帧真的高 ⇒ 开口成立，且返回的是**那段的首帧** ✓ */
+    const peaked = flat.slice();
+    peaked[9] = 0.98;
+    if (SR.findSpeechRun(SR.arrayGetter(peaked), {
+      fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75,
+    }) !== 0) {
+      throw new Error('峰值达标之后应返回那段连续帧的首帧（0），不是峰值那一帧');
+    }
+    /** 回归：不传 peakThreshold ⇒ 和旧版逐字相同（flat 也应返回 0）✓ */
+    if (SR.findSpeechRun(SR.arrayGetter(flat), {
+      fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7,
+    }) !== 0) {
+      throw new Error('不传 peakThreshold 时必须等价于旧行为（flat 应返回 0）');
+    }
+    /** `Number(null) === 0` 那个坑：null 必须退化成默认值，而不是 0 */
+    if (SR.findSpeechRun(SR.arrayGetter(flat), {
+      fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: null,
+    }) !== 0) {
+      throw new Error('peakThreshold = null 必须退化成默认值（= threshold），不能变成 0');
+    }
+    /** 峰值达标但连续段断了 ⇒ 仍然是 null ✓ */
+    const broken = [0.55, 0.55, 0.55, 0.1, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55, 0.55];
+    if (SR.findSpeechRun(SR.arrayGetter(broken), {
+      fromIdx: 0, toIdx: 11, threshold: 0.5, minRunFrames: 7, peakThreshold: 0.75,
+    }) !== null) {
+      throw new Error('峰值和连续长度分别成立、但不在同一段里 ⇒ 不该算开口');
+    }
+  });
+
+  /**
+   * ⭐ 「跨度 ≥ 6 秒而字数极少」⇒ 这段**几乎没人说话**（v2.66.83）
+   *
+   * 实测：`1 字 / 8.00s = 0.1 字/秒` —— 那 1 个字是 Whisper 在非语音上编的，
+   * 而它的锚只能取批起点 ⇒ 字幕提前 8 秒 ✗
+   * 而 `9 字 / 5.5s = 1.64` / `17 字 / 5.4s = 3.15` 是**真的在慢慢说** ⇒ 必须保住 ✓
+   */
+  check('跨度极长而字数极少 ⇒ 判为「几乎没人说话」', () => {
+    const vv = loaded['lib/asr/vad.js'];
+    const S = vv.looksTooSlowForAudio;
+    if (typeof S !== 'function') throw new Error('vad.js 没有导出 looksTooSlowForAudio');
+    /** 必须拦：那条 1 字 / 8 秒 */
+    if (S('あ', 8000) !== true) throw new Error('1 字 / 8 秒必须判为没人说话');
+    /** 必须拦：10 秒只有 ♪（剥离符号之后字数 = 0）*/
+    if (S('♪♪♪♪♪♪♪♪', 10000) !== true) throw new Error('只有 ♪ 的 10 秒段必须判为没人说话');
+    if (S('', 8000) !== true) throw new Error('空文本的 8 秒段必须判为没人说话');
+    /** 必须保住：真的在慢慢说 */
+    if (S('そこにいるとめっちゃ悩むの', 5500) !== false) throw new Error('9 字 / 5.5 秒是真话，不许拦');
+    if (S('こういう話を最近できてなかったし私も', 5400) !== false) throw new Error('17 字 / 5.4 秒是真话，不许拦');
+    /** 跨度不够 6 秒 ⇒ 不判（短应答本来就短）*/
+    if (S('はい', 3000) !== false) throw new Error('跨度 < 6 秒不许判');
+    if (S('えー', 5900) !== false) throw new Error('跨度 < 6 秒不许判（边界 5.9s）');
+    /** 拿不到时长 ⇒ 不判（`null` / `undefined` / `NaN`，`Number(...)` 之后都非有限）*/
+    for (const bad of [null, undefined, NaN]) {
+      if (S('あ', bad) !== false) throw new Error(`时长非法（${String(bad)}）时必须不判`);
+    }
+    /**
+     * ⚠️ `'8000'` **不是**非法值 —— `Number('8000') === 8000` ✓
+     *    和 `looksTooFastForAudio` 的 `Number(...)` 归一化一致（两个函数不许两套规矩 ✗）
+     *
+     * ⭐ 我第一版把它列进"非法"里 ⇒ 断言红 —— 而**红在断言写错了，不是代码错** ✓
+     *    （"改准判据、不是放宽"：把 `'8000'` 当 8000 处理，然后钉住这个行为 ✓）
+     */
+    if (S('あ', '8000') !== true) {
+      throw new Error('时长是数字字符串时必须照 8000 处理（和 looksTooFastForAudio 同一套归一化）');
+    }
+  });
 }
 assertSpeechRun();
 
