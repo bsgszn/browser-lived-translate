@@ -12077,6 +12077,27 @@ assertSpeechRun();
     if (!/schedule\.items\.unshift\(\.\.\.rest\)/.test(batchBlock)) {
       throw new Error('刷完没有把 `rest` 放回队首 —— 它们会永远不上屏 ✗');
     }
+    /**
+     * ⑬ 🔴 **按批分支的两条出口都必须 `return`** —— 真机实测漏过 ✗
+     *
+     * 事故：我用脚本批量替换 `setTimeout(pumpSubtitles, 100); return;` →
+     * `pumpLater(); return;`，而替换串里的 `$1` 被 shell 吃掉 ⇒ **`return` 变成了 `;`** ✗
+     * ⇒ 批分支 flush 完**继续落到旧路的 for 循环** ⇒
+     *    · `屏上批量` 与 `屏上合并` 同时出现（本该互斥 ✗）
+     *    · `batch[0]` 已被写长，旧路再拿它合并 ⇒ **每次 ×3** ⇒ 原文涨到 390 万字 ✗
+     *    · 连带 `lastShownChars` 被污染 ⇒ 阅读速度算成 541237 字/秒 ✗
+     */
+    if ((batchBlock.match(/pumpLater\(\);\s*\n\s*return;/g) || []).length !== 2) {
+      throw new Error('按批分支的两条出口必须各自 `pumpLater(); return;` —— 漏了 return 就会落到旧路循环（实测会指数放大原文 ✗）');
+    }
+    // ⑭ ⭐ flush 前必须给**每一条**打 `shownAt`（幂等保护 —— 同一条不许被反复 flush ✗）
+    if (!/for \(const b of batch\) b\.shownAt = now;/.test(batchBlock)) {
+      throw new Error('flush 前没有给整批打 `shownAt` 消费标记 —— 同一条可能被反复 flush ✗');
+    }
+    // 而 `pickShownBatch` 必须真的滤掉带标记的（否则标记没用 ✗）
+    if (P([{ at: 0, original: 'A', shownAt: 1 }, { at: 0, original: 'B' }]).batch.length !== 1) {
+      throw new Error('`pickShownBatch` 没有滤掉 `shownAt` 已置的条目 —— 幂等保护失效');
+    }
   });
 
   check('上屏时刻：`minShowHoldMs` 每条「待够再换」（按自己的字数/跨度算，不是固定 0.5s）', () => {
