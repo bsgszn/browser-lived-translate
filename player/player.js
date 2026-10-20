@@ -209,6 +209,22 @@ let lastShowSwitchAt = 0;
 /** 被「屏上让位」挡下来的次数（进心跳/诊断，否则这事在日志里看不见 ✗） */
 let showHeldCount = 0;
 /**
+ * 上一条**真的上屏**的时刻 + 它有多少字（`performance.now()` 基准）。
+ *
+ * ⚠️ 存在的理由是一个**测量缺口**（实测发现）：
+ *   「字幕上屏」那行原来**只在 `item.late` 时才打印** ✗，而 `item.late` 是**推入时**
+ *   算的（`at <= Date.now()`），**不是上屏时重算** ✗
+ *   ⇒ 被让位、但推入时"还没晚"的条目**根本不打印** ⇒ 日志里没有真实上屏时刻 ✗
+ *   ⇒ 于是「在屏时长」只能拿 `at + 比排期晚` **反推**，而那对这批条目全是错的 ✗
+ *     （实测：在屏<跨度 12/45、最短 0.14s —— 那些数**不可信** ✗）
+ *
+ * ⇒ 现在每一条真的上屏都打一行，并且**直接给出**上一条的真实在屏时长和阅读速度 ✓
+ *   而"在屏时长"只能在下一条上屏时才算得出来 ⇒ 所以记在这里、由**下一条**报出来 ✓
+ */
+let lastShownPerf = 0;
+/** 上一条上屏时它的字数（用来算**上一条**的阅读速度，不是这一条的 ✓） */
+let lastShownChars = 0;
+/**
  * 被「屏上合并」并进上一条的次数（和 `showHeldCount` 同一个理由：看不见就查不到 ✓）。
  *
  * 合并**不推迟任何东西** —— 它只是把"两句挤在一起、后一句把前一句顶掉"换成"一行显示两句" ✓
@@ -1723,7 +1739,7 @@ function scheduleUtterance(u) {
     v === null || v === undefined || !Number.isFinite(Number(v))
       ? `?${suffix}`
       : `${Number(v).toFixed(digits)}${suffix}`;
-  // 记下这一句的识别文本；显示文本等它真的上屏时再回填（见 diagLate）。
+  // 记下这一句的识别文本；显示文本等它真的上屏时再回填（见 diagShown）。
   // ⚠️ 用上面刚生成的局部 `id`，不要用 `item.id` —— L1193 判过 `if (item)`，
   //    也就是说 `item` 可能是 undefined（排期没接住这个条目），而 `id` 一定在。
   subLog.push({ t: performance.now(), id, asr: String(text || ''), shown: null });
@@ -2346,7 +2362,14 @@ function pumpSubtitles() {
       schedule.items.unshift(...dueItems.slice(di));
       break;
     }
-    if (item.late) diagLate(item, now);
+    /**
+     * 🔴 **无条件**记录"这一条真的上屏了" ✗ —— 不再看 `item.late`。
+     *
+     * 原来写的是 `if (item.late) diagLate(item, now)`，而 `item.late` 是**推入时**算的 ✗
+     * ⇒ 被让位、但推入时"还没晚"的条目既不打印、也不记录 `subLog.dt` ✗
+     * ⇒ 导出里那些句子的"上屏时刻"是**缺的**，而"在屏时长"只能反推 ⇒ 那些数不可信 ✗
+     */
+    diagShown(item, now);
     if (!item.translation) diag('翻译没赶上 · 先显示原文', true);
     // 存引用而不是拷贝：译文晚到时才能直接改到已经上屏的这一条
     rendered.set(item.id, item);
@@ -2387,20 +2410,36 @@ function renderable(now) {
 }
 
 /**
- * 字幕晚到了多少 —— 相对**排期时刻**，那才是用户感知到的量。
+ * 这一条**真的上屏了** —— 记下真实时刻，并把它和上一条的**在屏时长/阅读速度**打进日志。
  *
- * 排期时刻 at = 画面播到这句「开口」的那一刻（由实测延迟算出来）。
- * 所以 `now − at` 就是"比应该出现的时刻晚了多少"。
+ * ⚠️ 名字原来是 `diagLate`（只报"晚了多少"），而它有个**测量缺口** ✗：
+ *    它只在 `item.late` 时被调用，而 `item.late` 是**推入时**算的 ⇒
+ *    被让位、但推入时"还没晚"的条目**既不打印、也不记 `subLog.dt`** ✗
+ *    ⇒ 导出里那些句子的上屏时刻是**缺的**，"在屏时长"只能反推 ⇒ 那些数不可信 ✗
+ *
+ * `比排期晚` 的基准仍是**排期时刻**（那才是用户感知到的量）：
+ * 排期时刻 `at` = 画面播到这句「开口」的那一刻（由实测延迟算出来）
+ * ⇒ `now − at` 就是"比应该出现的时刻晚了多少" ✓
  *
  * ⚠️ 别拿 `now − (firstAudioAt + start*1000)` 当滞后：那是相对**实况**的，
  * 而画面本来就晚了 D 秒，那个数会把 D 加进去（D=8 时报"晚 8.6 秒"，实际只晚 0.6 秒）。
  * 这正是我上一次犯的错。
  */
-function diagLate(item, now) {
+function diagShown(item, now) {
   const lateMs = now - item.at;
   const saidMs = Number.isFinite(item.start) && Number.isFinite(item.end) ? (item.end - item.start) * 1000 : 0;
   // 画面把这句说完的时刻 ≈ at + 句长（at 已经含了延迟），所以这句还在放 = lateMs <= saidMs
   const inside = saidMs > 0 && lateMs <= saidMs;
+  /**
+   * ⭐ **上一条在屏上待了多久 / 它有多少字 ⇒ 它的阅读速度** ✗
+   *
+   * 「在屏时长」只能在下一条上屏时才算得出来 ⇒ 由**下一条**替上一条报出来 ✓
+   * `字/秒` 用的是**上一条**的字数（那才是"它在屏上那段时间的阅读速度"）✓
+   * 正常中文阅读 5~8 字/秒；实测出现过 **20~210 字/秒**（= 根本没时间读 ✗）
+   */
+  const shownPerf = performance.now();
+  const dwellMs = lastShownPerf > 0 ? Math.max(0, shownPerf - lastShownPerf) : 0;
+  const prevCps = dwellMs > 0 && lastShownChars > 0 ? lastShownChars / (dwellMs / 1000) : 0;
   // 回填"这一句实际显示的是什么"。
   // ⚠️ 取 `translation || original` —— 译文没赶上时字幕显示的是**原文**，
   //    所以要记的是真正显示出去的那一版，不是"本该显示什么"。
@@ -2447,11 +2486,36 @@ function diagLate(item, now) {
    */
   const heldSec = item.heldSince ? Math.max(0, (now - item.heldSince) / 1000) : 0;
   const heldNote = heldSec >= 0.01 ? ` · 屏上让位 +${heldSec.toFixed(2)}s` : '';
+  /**
+   * ⭐ **无条件**一行，且必须能**自己算出来**在屏时长/阅读速度 ✓
+   *
+   * 每一格都有理由：
+   *   · `at=`        原排期时刻（和「整句上屏」那行**同一个数**，可对账 ✓）
+   *   · `真 +X.XXXs` 这一条**真的**上屏的时刻，和 `at=` 同刻度（`DIAG_T0`）✓
+   *   · `上条待 X.XXs/Y 字 = Z 字/秒` —— ⭐ **上一条**的真实在屏时长和阅读速度 ✓
+   *     ⇒ 正常 5~8 字/秒；>8 说明"还没读完就被换掉" ✗（实测见过 20~210 ✗）
+   *   · `切`          这段音频**怎么被切出来的**（新路 `whisper-segment` / 旧路 `utterance-end`…）
+   *     ⇒ 一眼分得出"这一条是新路还是旧路" ✓
+   *   · `屏上让位`    被闸门挡了多久（否则会把闸门的锅算到缓冲头上 ✗）
+   */
+  const realSec = Math.round(((shownPerf - DIAG_T0) / 1000) * 1000) / 1000;
+  const realStamp = `真 ${realSec < 0 ? '-' : '+'}${Math.abs(realSec).toFixed(3)}s`;
+  const chars = String(item.translation || item.original || '').length;
+  // ⚠️ 第一句没有上一条（`dwellMs = 0`）⇒ 印 `—`，不许印 0（0 会被当成"没待"✗）
+  const dwellNote =
+    dwellMs > 0
+      ? ` · 上条待 ${(dwellMs / 1000).toFixed(2)}s/${lastShownChars} 字 = ${prevCps.toFixed(1)} 字/秒${prevCps > 8 ? ' ⚠ 读不完' : ''}`
+      : ' · 上条待 —';
   diag(
-    `字幕上屏 · ${atNote}比排期晚 ${(lateMs / 1000).toFixed(2)}s · 这句说了 ${(saidMs / 1000).toFixed(1)}s${inside ? ' · 仍在句内' : ''}${heldNote}`,
-    // 晚得还在句内 = 观感可接受，不用报警
-    !inside,
+    `屏上 · ${atNote}${realStamp} · 比排期晚 ${(lateMs / 1000).toFixed(2)}s` +
+      ` · ${chars} 字${saidMs > 0 ? ` / 说了 ${(saidMs / 1000).toFixed(1)}s` : ''}` +
+      `${inside ? ' · 仍在句内' : ''}${dwellNote}${heldNote} · 切 ${item.cut || '?'}`,
+    // 晚得还在句内 = 观感可接受；而"读不完"（>8 字/秒）要报警 ✓
+    !inside || prevCps > 8,
   );
+  // 记在**这一条**头上：下一条上屏时用它算"上一条待了多久" ✓
+  lastShownPerf = shownPerf;
+  lastShownChars = chars;
 }
 
 /**
