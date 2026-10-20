@@ -1425,7 +1425,16 @@ function handleAsrEvent(ev) {
      * 所以按识别服务判断：只有走本地 Whisper 的那两个才给这个提示。
      */
     const provider = settings?.asr?.provider;
-    const isLocal = provider === 'vad' || provider === 'whisper-chunked';
+    /**
+     * ⚠️ 名单要和 `asrReadiness()` 里那组「共用本地 Whisper 服务地址」的服务**保持一致**
+     * （`lib/settings.js` 里 `whisper-chunked` / `vad` / `vad-segments` 同一支）。
+     *
+     * 不一致的后果是静默的：本地服务没跑时，`vad-segments` 的用户只会看到一条光秃秃的
+     * 识别出错，**没有任何地方提示他去检查服务地址** —— 而那正是他唯一要改的东西。
+     * （`dashscope` 刚接进来时就是这个问题：404 模型名不对，提示却让他查本地地址，
+     * 方向完全反了。所以这里按"是否走本地 Whisper"判，不是按"是不是 vad"。）
+     */
+    const isLocal = provider === 'vad' || provider === 'whisper-chunked' || provider === 'vad-segments';
     const hint = isLocal ? '\n（本地服务没在跑？看设置页那一栏的服务地址）' : '';
     // 直接进诊断面板（不再有画面横幅）
     warn(`识别出错：${ev.message}${hint}`);

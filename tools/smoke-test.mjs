@@ -7995,6 +7995,33 @@ await checkAsync('新断句路径是「识别服务」里的一整项，老用�
   if (!/provider\s*===\s*'vad-segments'/.test(fn.slice(0, 900))) {
     throw new Error('effectiveDelaySec 不认 vad-segments —— 选它之后延迟还是 7 秒左右，新路会一直超预算');
   }
+
+  // ⑧ ⭐ 两份名单必须一致：**共用本地 Whisper 地址**的服务（asrReadiness 那一支）
+  //    和 player.js 里"识别出错时提示去查本地服务地址"的那份（isLocal）。
+  //    不一致的后果是静默的：本地服务没跑时，新服务的人只看到一条光秃秃的报错，
+  //    **没有任何地方提示他去检查服务地址** —— 而那正是他唯一要改的东西。
+  //    ⚠️ 不从写死的名单比，而是**从两边源码各抽一份**再比：写死的名单会和现实脱节。
+  const readIds = (src, re) => {
+    const m = src.match(re);
+    if (!m) return null;
+    return [...m[0].matchAll(/'([a-z0-9-]+)'/g)].map((x) => x[1]).sort();
+  };
+  const settingsSrc = stripComments(
+    fs.readFileSync(new URL('../lib/settings.js', import.meta.url), 'utf8'),
+  );
+  const readinessIds = readIds(settingsSrc, /if \(p === 'whisper-chunked'[^{]*\{/);
+  const isLocalIds = readIds(pjs2, /const isLocal = [^;]+;/);
+  if (!readinessIds || !isLocalIds) {
+    throw new Error('没能从源码抽出那两份名单（判据失效了，得重新审视这条断言）');
+  }
+  if (readinessIds.join(',') !== isLocalIds.join(',')) {
+    throw new Error(
+      '「共用本地 Whisper 地址」的服务名单和 player.js 的 isLocal 名单不一致：\n' +
+        `  asrReadiness: ${readinessIds.join(' / ')}\n` +
+        `  player.js isLocal: ${isLocalIds.join(' / ')}\n` +
+        '  ⇒ 少的那一方，出错时不会提示"去检查服务地址"',
+    );
+  }
 });
 
 check('画面延迟下限必须是 3 秒，而且老用户 storage 里的旧值绕不过去', () => {
