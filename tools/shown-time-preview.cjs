@@ -67,6 +67,16 @@ function runOnce(offsetMs, utterance) {
     settings: { capture: { delaySec: 6.6, syncOffsetMs: 0 } },
     DELAY_MIN_SEC: 3,
     firstAudioAt: Date.now(),
+    /**
+     * ⚠️ `scheduleUtterance` 现在读的是 `effectiveDelaySec(settings)`，不再是裸的
+     * `Number(settings.capture.delaySec)` —— 因为打开「让 Whisper 自己断句」时要在**运行时**
+     * 把延迟抬到 10 秒（不写 storage）。少了这个就是 `ReferenceError`，
+     * 而那三条「整句上屏」断言正是跑在这里的，会一起红。
+     *
+     * 这里给 6.6 = 和上面 `settings.capture.delaySec` 一致，也照应 `currentDelayMs` 的 6600。
+     * ⚠️ 「抬到 10 秒」那段逻辑**不在这里**验 —— 它在 player.js 里，靠它自己的断言。
+     */
+    effectiveDelaySec: () => 6.6,
     currentDelayMs: () => 6600,
     diag: (line) => printed.push(line),
     refineEnabled: () => false,
