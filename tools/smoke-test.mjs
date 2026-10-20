@@ -10928,6 +10928,104 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
       if (Math.abs(got - 3) > 1e-9) throw new Error(`pcm=${JSON.stringify(bad)} 时应原样返回 3，实际 ${got}`);
     }
   });
+
+  /**
+   * ⭐ 开口锚用 **VAD 概率**，不用音频电平 ✗
+   *
+   * 真机实测（`livedtranslate-20261020-143232`）：批起点 26.84，而人真正开口在 30.5
+   * —— 中间那 3.66 秒是**音乐床**（RMS 0.008~0.019，而语音 0.064，只差 3~6 倍 ✗）。
+   * 老路（相对 RMS）在那一窗里**挪不动** ⇒ `at` 停在 26.84 ⇒ 字幕提前 3.16 秒 ✗
+   * ⇒ 它一上屏就把上一句顶掉（"只闪一下"）✓ · 而它自己"过一会才说" ✓
+   *
+   * 而 VAD 概率分得开：同一份日志里那段窗口的采样是 0.199 / 0.007（都 < 0.5），
+   * 开口之后是 0.978 ✓ —— 而**旧路正是靠它切句**，旧路的时机是用户认可的 ✓
+   */
+  check('上屏时刻：`seg.start≈0` 时用 VAD 概率当开口锚（音乐床那 3.66 秒必须让掉）', () => {
+    const base = 26.84;
+    const seg = { start: 0, end: 5.44, text: '皆さんも今一度' };
+    // 造 5.44 秒的"音乐床"（0.0128 电平 ≈ 真机那段）+ 让 VAD 说 30.52 才开口
+    const pcm = new Int16Array(Math.round(5.44 * SR));
+    const amp = 0.0128 * Math.SQRT2 * 32768;
+    for (let i = 0; i < pcm.length; i += 1) {
+      pcm[i] = Math.round(amp * Math.sin((2 * Math.PI * 180 * i) / SR));
+    }
+
+    // ① 老路（不传回调）⇒ 相对 RMS 在这段上挪不动（音乐床太"响"）✗
+    const oldAt = WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR });
+    if (oldAt - base > 0.5) {
+      throw new Error(`音乐床上相对 RMS 不该挪得动（实测真机挪不动），实际挪了 ${(oldAt - base).toFixed(2)}s`);
+    }
+
+    // ② 新路：VAD 在 30.52 第一次 >= 阈值 ⇒ 锚到那里
+    // ⚠️ 阈值故意取 **0.62 而不是 0.5** —— 0.5 是 `vadThreshold` 的默认值，
+    //    若实现里把它写死，用 0.5 测是测不出来的 ✗（"断言看着有、抓不到"这一族）
+    const THR = 0.62;
+    const seen = [];
+    const newAt = WB.shownStartOf({
+      offsetSec: base,
+      seg,
+      pcm,
+      sampleRate: SR,
+      firstSpeechAt: (a, b, thr) => {
+        seen.push([a, b, thr]);
+        return a <= 30.52 && 30.52 < b ? 30.52 : null;
+      },
+      speechThreshold: THR,
+    });
+    if (Math.abs(newAt - 30.52) > 1e-6) throw new Error(`新路应锚到 30.52，实际 ${newAt}`);
+    if (newAt - oldAt < 3) throw new Error(`应把提前量吃掉 ≥3s，实际只挪了 ${(newAt - oldAt).toFixed(2)}s`);
+    // ③ 回调拿到的窗口必须是 [段起点, 段终点] 且阈值原样透传
+    if (seen.length !== 1) throw new Error(`firstSpeechAt 应被调 1 次，实际 ${seen.length}`);
+    const [fromArg, toArg, thrArg] = seen[0];
+    if (Math.abs(fromArg - base) > 1e-9) throw new Error(`from 应是 ${base}，实际 ${fromArg}`);
+    if (Math.abs(toArg - (base + 5.44)) > 1e-9) throw new Error(`to 应是 ${base + 5.44}，实际 ${toArg}`);
+    if (thrArg !== THR) throw new Error(`阈值必须原样透传（两个阈值就是两份真相 ✗），实际 ${thrArg}`);
+
+    /**
+     * ④ 回归：以下五种**必须和改之前逐字一样**
+     *    —— 这是"不许把本来正确的段挪歪"的防线（今天 `lullRatio 0.50` 就是挪歪了 2 条 ✗）
+     */
+    const plain = WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR });
+    const cases = [
+      ['找不到语音（VAD 全低）', () => null],
+      ['回调抛错', () => { throw new Error('boom'); }],
+      ['找到的语音在本段之外', (a, b) => b + 1],
+      ['找到的位置不比段起点晚', () => base],
+      ['返回脏值', () => NaN],
+    ];
+    for (const [name, fn] of cases) {
+      const got = WB.shownStartOf({
+        offsetSec: base, seg, pcm, sampleRate: SR, firstSpeechAt: fn, speechThreshold: 0.5,
+      });
+      if (got !== plain) throw new Error(`${name} ⇒ 必须原样返回 ${plain}，实际 ${got}`);
+    }
+
+    // ⑤ `seg.start > 0.02` ⇒ Whisper 给了真实边界，**不许**被 VAD 覆盖
+    //    ⚠️ 判据用「回调**根本没被调用**」而不是「值没变」——
+    //       后者在"调了但结果碰巧相等"时会漏判 ✗（这一族今天栽过）
+    const segMoved = { start: 1.5, end: 5.44, text: 'x' };
+    const plainMoved = WB.shownStartOf({ offsetSec: base, seg: segMoved, pcm, sampleRate: SR });
+    let movedCalls = 0;
+    const keptMoved = WB.shownStartOf({
+      offsetSec: base,
+      seg: segMoved,
+      pcm,
+      sampleRate: SR,
+      firstSpeechAt: () => { movedCalls += 1; return base + 0.1; },
+      speechThreshold: THR,
+    });
+    if (movedCalls !== 0) {
+      throw new Error(`seg.start=${segMoved.start} 时不该问 VAD（它会覆盖真实边界），实际调了 ${movedCalls} 次`);
+    }
+    if (keptMoved !== plainMoved) {
+      throw new Error(`seg.start=1.5 时不许被 VAD 覆盖：${keptMoved} ≠ ${plainMoved}`);
+    }
+
+    // ⑥ 完全不传回调（旧路 / 离线仿真）⇒ 逐字一样
+    if (WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR }) !== plain) {
+      throw new Error('不传 firstSpeechAt 时行为必须和改之前一样');
+    }
+  });
 }
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
