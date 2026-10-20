@@ -38,6 +38,9 @@ import {
   MIN_SHOW_GAP_SEC,
   shouldMergeShown,
   joinShownText,
+  pickShownBatch,
+  mergeShownBatch,
+  SHOW_BATCH_TOLERANCE_SEC,
 } from '../lib/asr/whisper-batch.js';
 import { JA_LIVE_HOTWORD_LIST } from '../lib/hotwords/ja-live.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
@@ -2079,6 +2082,15 @@ let history = [];
 function pumpSubtitles() {
   if (!running) return;
   const now = Date.now();
+  /**
+   * ⚠️ 拍子收尾抽成函数 —— 让 `setTimeout(pumpSubtitles, 100)` 在文件里**只剩一处** ✓
+   *
+   * 为什么要这样（实测）：把 `between('schedule.due(', 'setTimeout(pumpSubtitles')` 当
+   * "渲染循环"的那条断言，用的是**第一个**终点锚点 ✗ ⇒ 按批分支里的提前退出会把窗口截短
+   * （981 字符），于是 `lastShownAt = Date.now()` / `shownCount += …` 落到窗口外
+   * ⇒ **在完全正确的代码上先红** ✗（这一族今天栽过两次）
+   */
+  const pumpLater = () => setTimeout(pumpSubtitles, 100);
 
   // 兜底：ASR 迟迟不发 utteranceEnd 时，别让这一句永远不上屏
   const stalled = utterances.tick(now);
@@ -2263,6 +2275,83 @@ function pumpSubtitles() {
    */
   const dueItems = schedule.due(now, renderable(now));
   const holdEnabled = String(settings?.asr?.provider || '') === 'vad-segments';
+
+  /**
+   * ⭐ **按批刷新（新路）** ✗ —— 一批的几句**同时出现**,而不是一条一条换 ✓
+   *
+   * 用户定的规矩（原话）：
+   * > 「同时出现 都放一行就行 不行再折叠换行,我不信几秒延迟能说太多话导致挡画面」
+   *
+   * 为什么（实测）：延迟窗口里平均能完成 **2 句**（在屏中位 3.5s/句）；
+   * 而一条一条换时，**同步到的两句会互相顶掉** ⇒ 观众看到"闪一下" ✗
+   * ⇒ 改成"队首 `at` 到点就刷，把容差内已完成的**一起**带上，合并成一行" ✓
+   *
+   * ⚠️ 容差 1.5 秒（`SHOW_BATCH_TOLERANCE_SEC`）—— **不是**整个延迟窗口 ✗
+   *    取 7 秒会让后一句提前 7 秒，那正是这一整天在治的病 ✗
+   * ⚠️ **只改显示层**：`at` / 排期 / 识别一个字不动 ✓（「比排期晚」仍诚实 ✓）
+   * ⚠️ **旧路不进这里**（`holdEnabled` 只对 `vad-segments` 为真 ✓）⇒ 旧路逐字不变 ✓
+   */
+  if (holdEnabled && dueItems.length) {
+    const { batch, rest } = pickShownBatch(dueItems);
+    /**
+     * 屏上那一条的最小在屏时长（按**它自己**算：跨度剩余 / 读完要多久 / 0.6s 下限）。
+     * ⚠️ 按"批"算 —— 一批整体算一条，因为它们**同时出现** ✓
+     */
+    let minHoldMs = MIN_SHOW_HOLD_MS;
+    if (history.length) {
+      const onScreen = rendered.get(history[history.length - 1]);
+      if (onScreen) {
+        const onStart = Number(onScreen.start);
+        const onEnd = Number(onScreen.end);
+        minHoldMs = minShowHoldMs({
+          chars: String(onScreen.original || '').length,
+          spanSec: Number.isFinite(onStart) && Number.isFinite(onEnd) ? onEnd - onStart : 0,
+          elapsedMs: lastShowSwitchAt > 0 ? now - lastShowSwitchAt : 0,
+        });
+      }
+    }
+    if (holdSwitchForGap({ now, lastSwitchAt: lastShowSwitchAt, minHoldMs, enabled: true })) {
+      // 整批让位（记在队首头上）—— 全部放回队首，保持原序 ✗（不放回就是丢字幕 ✗）
+      if (!batch[0].heldSince) batch[0].heldSince = now;
+      showHeldCount += 1;
+      schedule.items.unshift(...dueItems);
+      pumpLater();
+;
+    }
+    const item = batch[0];
+    if (batch.length > 1) {
+      const merged = mergeShownBatch(batch);
+      if (merged) {
+        item.original = merged.original;
+        item.translation = merged.translation;
+        if (Number.isFinite(merged.end)) item.end = merged.end;
+        if (Number.isFinite(merged.start) && !Number.isFinite(Number(item.start))) item.start = merged.start;
+        item.mergedCount = batch.length;
+      }
+      diag(
+        `屏上批量 · ${batch.length} 条一起上屏 · 合计 ${String(item.original || '').length} 字` +
+          ` · 排期跨度 ${((batch[batch.length - 1].at - item.at) / 1000).toFixed(2)}s` +
+          `（容差 ${SHOW_BATCH_TOLERANCE_SEC}s ⇒ 它们本来会一条顶一条）`,
+        false,
+      );
+    }
+    diagShown(item, now);
+    if (!item.translation) diag('翻译没赶上 · 先显示原文', true);
+    rendered.set(item.id, item);
+    history.push(item.id);
+    if (history.length > 3) {
+      const drop = history.shift();
+      rendered.delete(drop);
+    }
+    shownCount += batch.length;
+    lastShownAt = Date.now();
+    lastShowSwitchAt = now;
+    if (rest.length) schedule.items.unshift(...rest);
+    renderSubs();
+    pumpLater();
+;
+  }
+
   for (let di = 0; di < dueItems.length; di += 1) {
     const item = dueItems[di];
     /**
