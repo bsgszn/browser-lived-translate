@@ -11032,6 +11032,101 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
       throw new Error('不传 firstSpeechAt 时行为必须和改之前一样');
     }
   });
+
+  check('上屏时刻：`clampShownAt` 夹住排期倒退与过近（播放器同一刻只显示一条）', () => {
+    // ⚠️ 病根：播放器同一时刻只显示一条字幕 ⇒「上一条显示了多久」**完全等于**
+    //    两条 `at` 之间的距离。所以只要新路的 `at` 有一处**倒退**、或前进得只差
+    //    几十毫秒，那一条就被"秒顶"—— 用户报的「上一句只闪了一下」就是它 ✗
+    //
+    // 实测（同一份素材、两轮闭环、都延迟 10）：
+    //   旧路 `at` 倒退 0/41 ✓ · 停留 <0.5s 1/42（2.4%）✓
+    //   新路 `at` 倒退 3/72 ✗（−0.454 / −0.034 / −0.350）+ 4 处过近 ⇒ 7/73（9.7%）✗
+
+    if (WB.MIN_SHOW_GAP_SEC !== 0.5) {
+      throw new Error(`最小间隔应是 0.5 秒（人眼能看清一短句的下限），实际 ${WB.MIN_SHOW_GAP_SEC}`);
+    }
+
+    // ① ⭐ **第一条原样返回** —— `lastAt = null` 不能被当成"上一条在 0.0 秒" ✗
+    //    （`Number(null) === 0` 这个坑今天在 `sanitizeSegments` 上踩过一次 ✓）
+    if (WB.clampShownAt({ raw: 16.1, lastAt: null }) !== 16.1) {
+      throw new Error('第一条（lastAt=null）必须原样返回 —— 不许被推到 0.5');
+    }
+    if (WB.clampShownAt({ raw: 0.1, lastAt: null }) !== 0.1) {
+      throw new Error('第一条哪怕很小也必须原样返回（0.1 被推成 0.5 就是把开头改坏）');
+    }
+
+    // ② 倒退：夹到「上一条 + 最小间隔」
+    const back = WB.clampShownAt({ raw: 145.504, lastAt: 145.958 });
+    if (Math.abs(back - 146.458) > 1e-6) {
+      throw new Error(`倒退 0.454 应被夹到 146.458，实际 ${back}`);
+    }
+
+    // ③ 前进但过近（0.02 秒）⇒ 同样夹到 0.5
+    const near = WB.clampShownAt({ raw: 16.12, lastAt: 16.1 });
+    if (Math.abs(near - 16.6) > 1e-6) {
+      throw new Error(`相距 0.02 秒应被夹到 16.6，实际 ${near}`);
+    }
+
+    // ④ ⭐ **正常的句子间隔必须原样返回**（回归：这一刀不许把正常的往后拖 ✗）
+    if (WB.clampShownAt({ raw: 19.0, lastAt: 16.0 }) !== 19.0) {
+      throw new Error('相距 3 秒的正常句子不许被推动');
+    }
+
+    // ⑤ 正好等于最小间隔 ⇒ **不算过近**，原样返回（边界用 `>=` 而不是 `>` ✗）
+    //    ⚠️ 容差必须是 1e-12 级别，**不能是 1e-6** ✗ ——
+    //       变异「加 1e-9」在 1e-6 的容差下是全绿的（这一族今天栽过一次 ✓）
+    const atGap = WB.clampShownAt({ raw: 16.6, lastAt: 16.1 });
+    if (Math.abs(atGap - 16.6) > 1e-12) {
+      throw new Error(`正好相距 0.5 秒不许被推动，实际 ${atGap}`);
+    }
+    // ⑤b ⭐ **绝不许越过 `raw`**（夹紧只会往后推，不会推到 raw 之外 ✗）
+    //     这条不依赖任何容差，直接把「多推一点点」钉死 ✓
+    for (const [raw, lastAt] of [[16.6, 16.1], [19.0, 16.0], [100.0, 0.0], [3.0, 2.5]]) {
+      const got = WB.clampShownAt({ raw, lastAt });
+      if (got > raw + 1e-12) {
+        throw new Error(`raw=${raw} lastAt=${lastAt} 时输出 ${got} 越过了 raw（只会往后推，不该多推）`);
+      }
+    }
+
+    // ⑥ 脏输入：**原样返回，绝不发明数字**（别把 NaN / null / '' 变成 0 ✗）
+    //    ⚠️ 断言必须用 `typeof === 'number'` 判，不能写 `Number(got)` ——
+    //       `Number(null) === 0` 会让同一条断言自己也掉进同一个坑 ✗（本条的教训 ✓）
+    for (const raw of [NaN, undefined, null, 'x', '', false]) {
+      const got = WB.clampShownAt({ raw, lastAt: 16.1 });
+      if (typeof got === 'number' && Number.isFinite(got)) {
+        throw new Error(`脏 raw=${JSON.stringify(raw)} 不许被算成一个时刻，实际 ${String(got)}`);
+      }
+    }
+    // 脏 `lastAt` ⇒ 等于"还没有上一条" ⇒ 原样返回
+    for (const lastAt of [NaN, undefined, null, Infinity, 'x']) {
+      const got = WB.clampShownAt({ raw: 20, lastAt });
+      if (got !== 20) throw new Error(`脏 lastAt=${String(lastAt)} 时应原样返回 20，实际 ${got}`);
+    }
+    // 脏 `minGap` ⇒ 不夹（别拿 0 当"没有间隔" ✗）
+    for (const minGap of [0, -1, NaN]) {
+      const got = WB.clampShownAt({ raw: 16.1, lastAt: 16.0, minGap });
+      if (got !== 16.1) throw new Error(`minGap=${String(minGap)} 时不该夹，实际 ${got}`);
+    }
+
+    // ⑦ ⭐ **链条**：一串倒退喂进来，输出必须严格递增且每条间隔 ≥ 最小间隔
+    const rawSeq = [16.1, 15.7, 15.6, 15.65, 20.0];
+    let last = null;
+    const out = [];
+    for (const raw of rawSeq) {
+      last = WB.clampShownAt({ raw, lastAt: last });
+      out.push(last);
+    }
+    for (let i = 1; i < out.length; i += 1) {
+      const gap = out[i] - out[i - 1];
+      if (gap < 0.5 - 1e-6) {
+        throw new Error(`第 ${i} 条间隔只有 ${gap.toFixed(3)}s（应 ≥0.5）—— 链条夹紧失效`);
+      }
+    }
+    // 而**末尾那条离得很远的仍然原样**（链条不许无端累积 ✗）
+    if (out[out.length - 1] !== 20.0) {
+      throw new Error(`相距很远的那条不许被推动，实际 ${out[out.length - 1]}`);
+    }
+  });
 }
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
