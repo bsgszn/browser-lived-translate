@@ -8,7 +8,7 @@
 
 ```bash
 node tools/manifest-check.mjs   # 104 项：manifest / 路径 / DOM id / 硬约束 静态完整性
-node tools/smoke-test.mjs       # 575 项：模块加载 / 音频前端数值 / 断句状态机 / Whisper 分段决策 / 预设 / 术语表 / 内置热词 / 签名
+node tools/smoke-test.mjs       # 582 项：模块加载 / 音频前端数值 / 断句状态机 / Whisper 分段决策 / 预设 / 术语表 / 内置热词 / 签名
 node tools/pipeline-test.mjs    # 126 项：音频引擎全链路（桩对象驱动）
 node tools/worker-test.mjs      # 60 项：service worker 状态机与消息路由
 ```
@@ -19,7 +19,7 @@ node tools/worker-test.mjs      # 60 项：service worker 状态机与消息路�
 npm test
 ```
 
-不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **865 项断言**。
+不需要 `npm install` —— 脚本只用 Node 内置能力。合计 **872 项断言**。
 
 ### `manifest-check.mjs`
 

@@ -10221,6 +10221,59 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     if (SS.pickPct([1, 2, 3, 4, 5], 0) !== 1) throw new Error('p0 应是最小值');
     if (SS.pickPct([1, 2, 3, 4, 5], 1) !== 5) throw new Error('p1 应是最大值');
   });
+
+  // ---- 「这一段开头有多长的静音」—— 新路的**上屏时刻**靠它（见 `leadingSilenceMs` 的文件头） ----
+  // ⭐ 用户实测：「旧路时机还好，新的提前问题很明显」⇒ 批起点落在换气里 ⇒ 字幕在人开口前就上屏。
+  //    真机素材（把 0.8 秒数字静音插到 `xhsp_1_16k.wav` 前面）实测：修之前上屏 0.00s、真语音 0.80s ✗
+
+  check('开头静音：真换气（1.2 秒）抓得到，而短于 400ms 的一律不动', () => {
+    const long = SS.leadingSilenceMs(cat(blk(QUIET, 1200), blk(SOFT, 1000)));
+    if (long !== 1200) throw new Error(`1.2 秒换气 → ${long}ms，应 1200`);
+    // ⚠️ 400ms 这一侧钉的是 `LEADING_MIN_MS`：320ms 的安静分不清是换气还是气声 ⇒ 不许挪 ✗
+    const short = SS.leadingSilenceMs(cat(blk(QUIET, 320), blk(SOFT, 1000)));
+    if (short !== 0) throw new Error(`只有 320ms 安静 → ${short}ms，应 0（短于 400ms 门槛）`);
+  });
+
+  check('开头静音：**段从语音开始**时必须返回 0（回归保护）', () => {
+    // ⚠️ 这条是"不许把上屏时刻改坏"的唯一防线。
+    //    实测原素材 `xhsp_1_16k.wav` 第 1 段开头 280ms 是**软起音**（0.0005~0.0015），不是停顿 ✗
+    //    门槛还是 200ms 时这里会挪 280ms ⇒ 字幕变晚 280ms ✗（那是回归，不是修 bug）
+    for (const lvl of [SOFT, MID, LOUD]) {
+      const got = SS.leadingSilenceMs(cat(blk(QUIET, 80), blk(lvl, 1200)));
+      if (got !== 0) throw new Error(`开头 80ms 安静 + ${lvl} 说话 → ${got}ms，应 0（那是气声，不是停顿）`);
+    }
+  });
+
+  check('开头静音：数字零之后那截**软起音要被削掉**（否则多吞 ~240ms）', () => {
+    // `p90 × 0.1` 会把软起音也算进静音；真静音比软起音低一个数量级，所以第二刀能削掉它 ✓
+    // ⚠️ 只有"安静确实接近 0"（麦克风真的没声音）时这一刀才生效 ✗ —— 见文件头「残余偏差」
+    const zero = new Int16Array(Math.round((SR * 1200) / 1000)); // 1.2 秒数字零
+    const pcm = cat(zero, blk(0.0012, 240), blk(MID, 1000));
+    const got = SS.leadingSilenceMs(pcm);
+    if (got !== 1200) throw new Error(`1.2s 静音 + 240ms 软起音 → ${got}ms，应 1200（软起音没被削掉？）`);
+  });
+
+  check('开头静音：上限 3000ms（一次误判不许把字幕推到荒谬的位置）', () => {
+    const got = SS.leadingSilenceMs(cat(blk(QUIET, 4000), blk(MID, 1000)));
+    if (got !== 3000) throw new Error(`4 秒静音 → ${got}ms，应被夹到 3000`);
+    // 全程静音同样是 0（判不了 ⇒ 不挪；它本来也不该被采纳）
+    if (SS.leadingSilenceMs(cat(blk(QUIET, 2000))) !== 0) throw new Error('全程静音应返回 0');
+  });
+
+  check('开头静音：脏输入一律返回 0（不是 null —— 不确定就不挪）', () => {
+    for (const bad of [null, undefined, new Int16Array(0), {}, 'abc', new Int16Array(10)]) {
+      const got = SS.leadingSilenceMs(bad);
+      if (got !== 0) throw new Error(`leadingSilenceMs(${JSON.stringify(bad)}) = ${got}，应 0`);
+    }
+  });
+
+  check('开头静音：常量是预期值', () => {
+    if (SS.LEADING_SILENCE_MAX_MS !== 3000) {
+      throw new Error(`LEADING_SILENCE_MAX_MS = ${SS.LEADING_SILENCE_MAX_MS}`);
+    }
+    if (SS.LEADING_MIN_MS !== 400) throw new Error(`LEADING_MIN_MS = ${SS.LEADING_MIN_MS}`);
+    if (SS.LEADING_TRIM_RATIO !== 4) throw new Error(`LEADING_TRIM_RATIO = ${SS.LEADING_TRIM_RATIO}`);
+  });
 }
 
 // 批次引擎（lib/asr/whisper-batch.js）—— 新断句路径「按 Whisper 的边界推进」
@@ -10537,6 +10590,40 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     }
     // 而下一批还能开（`apply([])` 必须释放 inflight，否则永久停住 ✗）
     if (!loop.next(SR * 40)) throw new Error('apply([]) 之后应当还能开下一批');
+  });
+
+  check('上屏时刻：`shownStartOf` 把开头那段换气让掉（段内没停顿就原样返回）', () => {
+    // ⚠️ 这是 `vad.js` 真正调的那个函数，**离线仿真也调它** —— 两条路因此不会漂 ✓
+    //    真机实测（把 0.8 秒数字静音插到素材前面）：修之前上屏 0.00s 而真语音 0.80s ✗
+    const nQuiet = Math.round(1.2 * SR);
+    const nSpeak = Math.round(2.0 * SR);
+    const pcm = new Int16Array(nQuiet + nSpeak);
+    const amp = 0.0416 * Math.SQRT2 * 32768;
+    for (let i = 0; i < nSpeak; i += 1) {
+      pcm[nQuiet + i] = Math.round(amp * Math.sin((2 * Math.PI * 220 * i) / SR));
+    }
+    const seg = { start: 0, end: (nQuiet + nSpeak) / SR, text: 'x' };
+
+    // offsetSec = 10 ⇒ 段音频起点 10.00，而人真正开口在 11.20
+    const shown = WB.shownStartOf({ offsetSec: 10, seg, pcm, sampleRate: SR });
+    if (Math.abs(shown - 11.2) > 0.05) {
+      throw new Error(`上屏时刻 ${shown.toFixed(2)}，应 ≈11.20（段起点 10.00 + 开头静音 1.20）`);
+    }
+
+    // ⚠️ 段**从语音开始**时必须**原样返回** —— 这条是"不许把旧素材的时机改坏"
+    const same = WB.shownStartOf({
+      offsetSec: 10,
+      seg: { start: 0, end: nSpeak / SR, text: 'x' },
+      pcm: pcm.subarray(nQuiet),
+      sampleRate: SR,
+    });
+    if (Math.abs(same - 10) > 1e-9) throw new Error(`段从语音开始时上屏时刻应仍是 10.00，实际 ${same}`);
+
+    // 拿不到 PCM / 脏输入 ⇒ 原样返回（不确定就不改行为 ✓）
+    for (const bad of [null, undefined, {}, 'abc']) {
+      const got = WB.shownStartOf({ offsetSec: 3, seg, pcm: bad, sampleRate: SR });
+      if (Math.abs(got - 3) > 1e-9) throw new Error(`pcm=${JSON.stringify(bad)} 时应原样返回 3，实际 ${got}`);
+    }
   });
 }
 
