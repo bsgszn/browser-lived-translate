@@ -10307,6 +10307,65 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     if (out.accepted.length !== 1) throw new Error(`短批应直接采纳，实际 ${out.accepted.length}`);
     if (out.reason !== 'all-accepted') throw new Error(`reason = ${out.reason}，应是 all-accepted`);
   });
+
+  /**
+   * ⭐ **音频到底之后的碎渣不开批** —— 否则 `next()` 会被反复调用、一直空转 ✗
+   *
+   * 实测（离线仿真，`xhsp_1_16k.wav` 101.4 秒）:
+   *   音频放完之后 `next(total)` 仍会被调，而当时只剩 `0.1s` ⇒
+   *   `takeN` 取 0.1s ⇒ Whisper 对 0.1s **给 0 段** ⇒ 推进点不动 ⇒ 下一轮又取同一段 ✗
+   *   日志:批 22~400 全是 `0.1s @101.32 → 0 段 · no-segments · 推进到 101.32`
+   *   ⇒ **377 批空转**，每批一次 HTTP 请求 ✗
+   */
+  check('批次引擎：音频到底后的碎渣不开批（否则会空转到天荒地老）', () => {
+    let taken = 0;
+    const loop = WB.createSegmentLoop({
+      takeRange: (s, e) => { taken += 1; return new Int16Array(Math.max(0, e - s)); },
+      transcribe: async () => [],
+      sampleRate: SR,
+    });
+    // 1) 只剩 0.1 秒 ⇒ 不开批。⚠️ **收尾也不开** —— 0.1 秒送进去同样是 0 段 ✓
+    if (loop.next(SR * 0.1, { allowShort: true })) throw new Error('0.1 秒的碎渣不该开批');
+    if (taken !== 0) throw new Error('不开批就不该 takeRange');
+    // 2) 状态要能看出"不够一批"
+    const st = loop.state();
+    if (st.starved !== true) throw new Error('starved 应为 true');
+    if (Math.abs(st.leftSec - 0.1) > 1e-6) throw new Error(`leftSec = ${st.leftSec}，应是 0.1`);
+    /**
+     * 3) ⚠️ **"不够"不等于"结束了"** ✗ —— 引擎不许据此收尾，
+     *    否则直播中途一卡顿，字幕就永久停住 ✗（比多跑几批严重得多）
+     *    ⇒ `state()` 不提供 `drained`，只提供 `starved`，收尾必须由调用方 `stop()` 触发 ✓
+     */
+    if (!('starved' in st)) throw new Error('state() 应有 starved');
+    // 4) 再多给一点（0.5 秒）就能开 ⇒ 门是"够长到值得送"，不是"没音频了"
+    if (!loop.next(SR * 0.5, { allowShort: true })) throw new Error('0.5 秒应当能开批');
+  });
+
+  /**
+   * ⭐ 连续 0 段要**看得见**，而**不许**跳过音频 ✗
+   *
+   * 为什么"跳过"是错的：`apply([])` 既可能来自"Whisper 什么都没给"，
+   * 也可能来自**识别失败**（`vad.js` 出错时正是用 `apply([])` 释放 inflight ✓）。
+   * 后者跳过音频就是**真的丢内容** ✗ —— 而这一条实测数据只覆盖了前者 ✗
+   */
+  check('批次引擎：连续 0 段只计数，绝不跳过音频', () => {
+    const loop = WB.createSegmentLoop({
+      takeRange: (s, e) => new Int16Array(Math.max(0, e - s)),
+      transcribe: async () => [],
+      sampleRate: SR,
+    });
+    const p = loop.next(SR * 20);
+    if (!p) throw new Error('应当能开首批');
+    const out = loop.apply([]);
+    if (out.accepted.length !== 0) throw new Error('0 段不该采纳任何东西');
+    if (loop.state().emptyBatches !== 1) throw new Error('emptyBatches 应为 1');
+    // ⚠️ 关键：推进点**不许**动（动了就等于跳过这段音频）✗
+    if (Math.abs(loop.state().nextStartSec) > 1e-6) {
+      throw new Error(`0 段时推进点不许动，实际 ${loop.state().nextStartSec}`);
+    }
+    // 而下一批还能开（`apply([])` 必须释放 inflight，否则永久停住 ✗）
+    if (!loop.next(SR * 40)) throw new Error('apply([]) 之后应当还能开下一批');
+  });
 }
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
