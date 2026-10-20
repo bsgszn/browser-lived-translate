@@ -893,6 +893,43 @@ check('字幕排期：clear() 清空', () => {
     }
   });
 
+  /**
+   * ⚠️ `text-untrusted`（Whisper 说完了、而认出来的是垃圾）**绝不能**并进上一句。
+   *
+   * 它和 `watchdog` 一样"短"✗ —— 所以**唯一的区分就是 `reason`** ✓：
+   *   · `watchdog`       = 音频没被切，ASR 一直不发收句信号 → 那条短文本是真的，**该并** ✓
+   *   · `text-untrusted` = 文本本身就是垃圾（幻觉）→ **并进去会把上一句弄坏** ✗
+   *
+   * 而这条现在**还没有下游消费者**（新路没接），所以它是**死路也要锁住** ——
+   * 否则哪天有人把它归进 watchdog 那条，这个坑就会悄悄长回来。
+   */
+  check('`text-untrusted` 的短段**不许**并进上一句（它和 watchdog 只差 reason，而后果相反）', () => {
+    // 上一句"没说完"（末尾无标点）—— 对 watchdog 来说这是"该并"的条件
+    const open = { cut: 'silence', original: '今日はいい天気ですね', end: 4.2 };
+    const junk = { text: 'あ'.repeat(6), duration: 1.2, start: 4.3, reason: 'text-untrusted' };
+    // ① 同样的段，reason=watchdog → 该并（对照组，证明这一段本来够格被并）
+    const asWatchdog = { ...junk, reason: 'watchdog' };
+    if (dp.tailMergeTrigger(open, asWatchdog, { smartCut: false }) !== 'watchdog') {
+      throw new Error('对照组失败：reason=watchdog 时这一段本来就该被并');
+    }
+    // ② 换成 text-untrusted → 必须不并（垃圾不许污染上一句）
+    for (const smartCut of [false, true]) {
+      const got = dp.tailMergeTrigger(open, junk, { smartCut });
+      if (got !== '') {
+        throw new Error(`text-untrusted 的段被并了（smartCut=${smartCut}，触发源=${JSON.stringify(got)}）`);
+      }
+    }
+    // ③ 上一句"说完了"时同样不并（两道都挡住，不靠碰巧）
+    const done = { cut: 'silence', original: '今日はいい天気ですね。', end: 4.2 };
+    if (dp.tailMergeTrigger(done, junk, { smartCut: false }) !== '') {
+      throw new Error('上一句说完了 → text-untrusted 的段更不该并');
+    }
+    // ④ 而它**不是**新加的触发源：返回永远是 ''，不是 'text-untrusted'
+    if (dp.tailMergeTrigger(open, junk, { smartCut: true }) === 'text-untrusted') {
+      throw new Error('tailMergeTrigger 不该把 text-untrusted 当触发源返回');
+    }
+  });
+
   check('合并文本：和累积器拼分片用同一条规则（空格分隔），空的一侧不留下多余空格', () => {
     if (dp.mergeTailText('あい', 'うえ') !== 'あい うえ') throw new Error(dp.mergeTailText('あい', 'うえ'));
     if (dp.mergeTailText('', 'うえ') !== 'うえ') throw new Error('空的前一段');
