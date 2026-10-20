@@ -4510,11 +4510,11 @@ check('排期延迟必须包含「录音/编码滞后」—— 字幕恒偏早�
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   if (!/function recorderLagMs/.test(src)) throw new Error('没有 recorderLagMs 辅助函数');
   const fn = src.slice(src.indexOf('function currentDelayMs'), src.indexOf('function recorderLagMs'));
-  if (!/actual \* 1000 \+ recorderLagMs\(\)/.test(fn)) {
+  if (!/actual \* 1000\) \+ lag/.test(fn)) {
     throw new Error('排期延迟没有加上录音滞后 —— 只算 bufferedEnd−currentTime 会让字幕恒偏早');
   }
   // 未知时不能瞎补
-  if (!/if \(!Number\.isFinite\(actual\) \|\| actual <= 0\) return target \+ recorderLagMs\(\)/.test(fn)) {
+  if (!/if \(!Number\.isFinite\(actual\) \|\| actual <= 0\) return target \+ lag/.test(fn)) {
     throw new Error('实测延迟未知时也要把录音滞后算上');
   }
   const helper = src.slice(src.indexOf('function recorderLagMs'), src.indexOf('function recorderLagMs') + 500);
@@ -4524,6 +4524,129 @@ check('排期延迟必须包含「录音/编码滞后」—— 字幕恒偏早�
   // 提示文案要改成"已补进排期"，否则用户还会去拧同步微调
   if (!/已补进排期，所以字幕不再因此偏早/.test(src)) {
     throw new Error('诊断文案还停留在"会偏早这么多"，和实际行为不一致');
+  }
+});
+
+check('排期延迟有下限：新模式要 10 秒，缓冲只填到 7 秒时也不许按 7 秒排', () => {
+  /**
+   * ⚠️ 为什么这条要单独守（v2.66.83）：
+   *
+   *   `actualDelaySec` 量的是**缓冲领先播放头多少**，而缓冲没填满时它比目标值小。
+   *   新模式（`vad-segments`）要 ≈10 秒（首批音频 6 秒 + 一次往返 + 确认），
+   *   而只填到 7.1 秒时排期会算成 7.1 + 录音滞后 ≈ 8.3 秒
+   *   ⇒ 字幕排在 8.3 秒，画面到 10 秒才播到那一帧 ⇒ **字幕提前 (10 − 8.3) 秒**。
+   *
+   *   用户实测「新路提前很明显、旧路时机还好」—— 正是这个数。
+   *   ⇒ 排期必须取 `max(target, actual)`：实测更小就按目标值排（宁可晚，不许早）。
+   *   ⚠️ **只 max 不 min**：actual 更大时用 target 压下来会让字幕迟到，那是另一个 bug。
+   *
+   * 这里用**真源码**（抠出三个函数 eval），不是切片正则 —— 正则只能证明"写了什么"，
+   * 证明不了"算出来多少"。本项目为"判据存在但算错"栽过太多次。
+   */
+  const rawsrc = fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8');
+  const src = stripComments(rawsrc);
+  const sliceFn = (name, endAnchor) => {
+    const start = src.indexOf(`function ${name}`);
+    if (start < 0) throw new Error(`player.js 里找不到 function ${name}（判据失效，得重新审视这条断言）`);
+    if (endAnchor) {
+      const e = src.indexOf(endAnchor, start);
+      if (e < 0) throw new Error(`找不到 ${name} 的结束锚 ${endAnchor}`);
+      return src.slice(start, e);
+    }
+    const e = src.indexOf('\n}\n', start);
+    if (e < 0) throw new Error(`找不到 function ${name} 的结尾`);
+    return src.slice(start, e + 2);
+  };
+  const minSecM = /const WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*(\d+)\s*;/.exec(src);
+  if (!minSecM) throw new Error('源码里没有 WHISPER_SEGMENTS_MIN_DELAY_SEC');
+  const MIN_SEC = Number(minSecM[1]);
+  if (MIN_SEC < 10) throw new Error('新模式的最小延迟不到 10 秒，新路必然超预算：' + MIN_SEC);
+  const DELAY_MIN_SEC = 3; // 与 lib/delayed-player.js 的 DELAY_MIN_SEC 一致
+
+  /** 在假作用域里跑真源码：settings / playback 注入，EMA 可以预置 */
+  const runOnce = (settingsIn, actual, recLag, ema0) => {
+    const body = `
+      const DELAY_MIN_SEC = ${DELAY_MIN_SEC};
+      const WHISPER_SEGMENTS_MIN_DELAY_SEC = ${MIN_SEC};
+      ${sliceFn('effectiveDelaySec')}
+      ${sliceFn('recorderLagMs')}
+      ${sliceFn('currentDelayMs', 'function recorderLagMs')}
+      return { eff: effectiveDelaySec(settings), ms: currentDelayMs() };
+    `;
+    let ema = ema0;
+    const fn = new Function(
+      'settings',
+      'playback',
+      'getEma',
+      'setEma',
+      `let actualDelayEma = getEma();\n${body}\n`,
+    );
+    return fn(
+      settingsIn,
+      { actualDelaySec: actual, recorderLagSec: recLag },
+      () => ema,
+      (v) => {
+        ema = v;
+      },
+    );
+  };
+
+  const neu = { capture: { delaySec: 7.1 }, asr: { provider: 'vad-segments' } };
+  const old = { capture: { delaySec: 7.1 }, asr: { provider: 'vad' } };
+  const EPS = 1e-6;
+
+  // ① 下限：新模式 + 实测只有 7.1 秒 ⇒ 至少 target(10) + 录音滞后(1.2)
+  const a = runOnce(neu, 7.1, 1.2, null);
+  if (Math.abs(a.eff - MIN_SEC) > EPS) throw new Error(`新模式的生效延迟应是 ${MIN_SEC}，实际 ${a.eff}`);
+  if (!(a.ms >= (MIN_SEC + 1.2) * 1000 - EPS)) {
+    throw new Error(
+      `缓冲区只填到 7.1 秒时排期只用了 ${(a.ms / 1000).toFixed(2)}s，` +
+        `而新模式要 ${MIN_SEC}s ⇒ 字幕会提前 ${(MIN_SEC + 1.2 - a.ms / 1000).toFixed(2)}s`,
+    );
+  }
+
+  // ② 只 max 不 min：实测比目标大时不许被压回目标值（那会让字幕迟到）
+  const b = runOnce(neu, 12, 1.2, null);
+  if (!(b.ms >= 12 * 1000 + 1200 - EPS)) {
+    throw new Error(`实测 12 秒时排期被压到 ${(b.ms / 1000).toFixed(2)}s —— 会把字幕推晚`);
+  }
+
+  // ③ 旧路不受影响：7.1 + 1.2
+  const c = runOnce(old, 7.1, 1.2, null);
+  if (Math.abs(c.ms / 1000 - 8.3) > 0.02) {
+    throw new Error(`旧路排期变了：期望 8.30s，实际 ${(c.ms / 1000).toFixed(2)}s`);
+  }
+
+  // ④ 平滑也不能把值拉到下限以下（EMA 里可能残留上一个更小的估计）
+  let ema = 8300; // 比下限 11200 低
+  let worst = Infinity;
+  for (let i = 0; i < 8; i += 1) {
+    const r = runOnce(neu, 7.1, 1.2, ema);
+    ema = r.ms;
+    worst = Math.min(worst, r.ms);
+  }
+  if (!(worst >= (MIN_SEC + 1.2) * 1000 - EPS)) {
+    throw new Error(`平滑后仍有拍低于下限：最低 ${(worst / 1000).toFixed(2)}s`);
+  }
+
+  // ⑤ 源里必须是 max(target, actual) —— 正则只是复核，行为由上面四条钉
+  const fnText = sliceFn('currentDelayMs', 'function recorderLagMs');
+  if (!/Math\.max\(target, actual \* 1000\)/.test(fnText)) {
+    throw new Error('currentDelayMs 没有对实测值取下限（Math.max(target, actual*1000)）');
+  }
+
+  // ⑥ 两处 setDelay 不许再裸读 delaySec（那会把正在跑的延迟从 10 拉回 7.1）
+  const setDelaySites = [...src.matchAll(/playback\?\.setDelay\(([^)]*)\)/g)].map((m) => m[1].trim());
+  if (setDelaySites.length < 2) {
+    throw new Error('setDelay 的调用点少于 2 处（storage 变化 / 滑块）—— 判据失效了，得重新审视');
+  }
+  // 滑块那处必须过 effectiveDelaySec（拖到 10 以下会被弹回）
+  if (!/playback\?\.setDelay\(v\)/.test(src) || !/effectiveDelaySec\(\{ \.\.\.settings, capture:/.test(src)) {
+    throw new Error('滑块没走 effectiveDelaySec —— 拖到 10 秒以下会"滑块 8 而实际按 10 排"');
+  }
+  // storage 那处必须比生效值，否则"只切了识别服务"不会触发延迟更新
+  if (!/const d = effectiveDelaySec\(settings\);/.test(src) || !/playback\?\.setDelay\(d\)/.test(src)) {
+    throw new Error('storage 变化时裸读 delaySec —— 切到新模式不会把正在跑的延迟抬到 10');
   }
 });
 
@@ -4571,8 +4694,15 @@ check('「变速纠偏」要能整体关掉 —— 关掉后速率恒为 1，画
   const html = fs.readFileSync(path.join(process.cwd(), 'player', 'player.html'), 'utf8');
   if (!/id="smoothRate"/.test(html)) throw new Error('没有开关，用户没法验证');
   // 关掉纠偏的前提是：字幕排期用的是**实测**延迟，而不是目标值
-  if (!/const ms = actual \* 1000 \+ recorderLagMs\(\)/.test(player)) {
-    throw new Error('排期必须用实测延迟 —— 否则关掉纠偏后字幕会跟着漂');
+  //
+  // ⚠️ v2.66.83 起排期是 `Math.max(target, actual*1000) + lag`（加了「不许低于目标值」的下限，
+  //    因为新模式要 10 秒而缓冲没填满时实测只有 7.1 ⇒ 字幕提前 2.9 秒）。
+  //    **实测值仍然参与**：它比目标大时按它排 —— 否则关掉纠偏后字幕会跟着漂。
+  if (!/Math\.max\(target, actual \* 1000\) \+ lag/.test(player)) {
+    throw new Error('排期必须用实测延迟（actual 要比 target 大时说了算）—— 否则关掉纠偏后字幕会跟着漂');
+  }
+  if (/const ms = target \+ lag;/.test(player)) {
+    throw new Error('排期只用目标值了 —— 关掉纠偏后字幕会跟着漂');
   }
 });
 
@@ -7887,10 +8017,17 @@ check('「让 Whisper 自己断句」的延迟预算：滑块与 clamp 上限都
   const bare = [
     /Number\(settings\.capture\.delaySec\)\s*\|\|\s*DELAY_MIN_SEC/,
     /Number\(settings\.capture\.delaySec\s*\?\?\s*DELAY_MIN_SEC\)/,
+    // v2.66.83 起：`setDelay` 也不许拿裸值（那会把正在跑的延迟从 10 拉回 7.1）
+    /playback\?\.setDelay\((?:Number\(settings|raw)\b/,
   ].find((re) => re.test(pjs));
   if (bare) throw new Error('player.js 里还有绕开 effectiveDelaySec 的裸读：' + bare);
-  const calls = (pjs.match(/effectiveDelaySec\(settings\)/g) || []).length;
-  if (calls < 6) throw new Error('effectiveDelaySec 只被调了 ' + calls + ' 处，应有 6 处（构造/诊断/排期/滑块/标签/UI 跳动）');
+  // 减去 `function effectiveDelaySec(settings)` 这一处定义，剩下的是真正的调用点
+  const calls = (pjs.match(/effectiveDelaySec\(settings\)/g) || []).length - 1;
+  if (calls < 7) {
+    throw new Error(
+      `effectiveDelaySec 只被调了 ${calls} 处，应有 7 处（构造/诊断/排期/标签×2/UI 跳动/resync 兜底/storage 变化）`,
+    );
+  }
 });
 
 await checkAsync('新断句路径是「识别服务」里的一整项，老用户那个勾选框会被迁过去并清掉', async () => {
