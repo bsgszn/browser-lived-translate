@@ -10759,6 +10759,34 @@ function assertSpeechRun() {
   });
 
   /**
+   * ⭐ 峰值门槛的**接线值**（v2.66.83）—— 上面那条只钉了「`findSpeechRun` 收到 0.75 时会不会判」
+   *
+   * 🔴 这一条是**变异抓出来的缺口**：把 `vad.js` 的 `FIRST_SPEECH_PEAK` 从 0.75 改成 0.5，
+   *    上面那条照样全绿 ✗ —— 因为它把 `peakThreshold: 0.75` **写死在测试里**，
+   *    而真正决定线上行为的是 `vad.js` 传进去的那个值 ✓
+   *    ⇒ 于是「音乐床又能骗过开口锚」这个回归**没有任何断言能拦** ✗
+   *    （同一族今天栽过多次：`tooShort` 没人消费、`prompt` 在日志里看不见、
+   *      以及这条 —— **判据存在，而接线的那个数没人看** ✗）
+   *
+   * ⚠️ 钉的是**不变量**（严格高于基础阈值），不是字面量 0.75：
+   *    基础阈值 0.5 + 连续 7 帧 ⇒ 贴着 0.5 的底噪能过，所以峰值**必须**严格更大 ✓
+   *    这样将来把 0.75 调成 0.8 / 0.7 仍然合法，而调回 0.5（= 关掉这个门槛）会红 ✓
+   */
+  check('开口锚：峰值门槛必须真的接进 firstSpeechAt，且严格高于基础阈值', () => {
+    const src = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
+    if (!/peakThreshold:\s*FIRST_SPEECH_PEAK\b/.test(src)) {
+      throw new Error('firstSpeechAt 没收到 `peakThreshold: FIRST_SPEECH_PEAK` —— 峰值门槛没接上线');
+    }
+    const m = src.match(/const FIRST_SPEECH_PEAK\s*=\s*([\d.]+)/);
+    if (!m) throw new Error('vad.js 里找不到 FIRST_SPEECH_PEAK 常量');
+    const peak = Number(m[1]);
+    if (!(peak > 0.5)) {
+      throw new Error(`FIRST_SPEECH_PEAK = ${peak} 必须严格大于基础阈值 0.5，`
+        + '否则「连续 7 帧 ≥0.5」的持续底噪又会被当成开口（音乐床回归）');
+    }
+  });
+
+  /**
    * ⭐ 「跨度 ≥ 6 秒而字数极少」⇒ 这段**几乎没人说话**（v2.66.83）
    *
    * 实测：`1 字 / 8.00s = 0.1 字/秒` —— 那 1 个字是 Whisper 在非语音上编的，
