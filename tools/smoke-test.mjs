@@ -8568,7 +8568,7 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
   const renderLoop = between('schedule.due(', 'setTimeout(pumpSubtitles');
   check(
     '看门狗的基准是「字幕真的上屏」：上屏时刻必须打在真正的渲染循环里',
-    renderLoop.length > 100 && /lastShownAt\s*=\s*Date\.now\(\)/.test(renderLoop) && /shownCount\s*\+=\s*1/.test(renderLoop),
+    renderLoop.length > 100 && /lastShownAt\s*=\s*Date\.now\(\)/.test(renderLoop) && /shownCount\s*\+=\s*(?:1|batch\.length)/.test(renderLoop),
     '⚠️ 不能只打在 diagShown 里 —— 那个函数虽然现在**无条件**被调用（原来是 `if (item.late) diagLate(...)` ✗），' +
       '但它仍然不是"上屏"的唯一信号。断言的锚点是渲染循环（schedule.due → pumpSubtitles 之间），' +
       `切出 ${renderLoop.length} 字符（守卫要求 > 100）。`,
@@ -11970,6 +11970,115 @@ assertSpeechRun();
     }
   });
 
+  check('上屏时刻：`pickShownBatch` 按批刷新 —— 容差内的几句**同时出现**（而不是一条顶一条）', () => {
+    // ## 用户定的规矩（原话）
+    //   「同时出现 都放一行就行 不行再折叠换行,我不信几秒延迟能说太多话导致挡画面」
+    //
+    // ## 为什么要它（实测）
+    //   延迟窗口里平均能完成 **2 句**（在屏中位 3.5s/句）；而一条一条换时，
+    //   **只差一口气的两句会互相顶掉** ⇒ 观众看到"闪一下" ✗
+    //   （`xhsp-hold2-B` 真实上屏时刻里，<0.5s 的相邻上屏是 0 处 ✓，但那是靠"让位"换来的，
+    //     代价是「比排期晚」中位涨到 1.20s ✗）
+    //
+    // ⚠️ 容差**不能**取成整个延迟窗口（7 秒）—— 那会让后一句提前 7 秒，那正是要治的病 ✗
+    const P = WB.pickShownBatch;
+    const M = WB.mergeShownBatch;
+    if (typeof P !== 'function') throw new Error('whisper-batch.js 没有导出 pickShownBatch');
+    if (typeof M !== 'function') throw new Error('whisper-batch.js 没有导出 mergeShownBatch');
+    if (!(WB.SHOW_BATCH_TOLERANCE_SEC > 0 && WB.SHOW_BATCH_TOLERANCE_SEC <= 2)) {
+      throw new Error(`SHOW_BATCH_TOLERANCE_SEC = ${WB.SHOW_BATCH_TOLERANCE_SEC} 不合理（应 >0 且 ≤2：取大了就是"提前"✗）`);
+    }
+    if (!(WB.SHOW_BATCH_MAX_ITEMS >= 2 && WB.SHOW_BATCH_MAX_ITEMS <= 6)) {
+      throw new Error(`SHOW_BATCH_MAX_ITEMS = ${WB.SHOW_BATCH_MAX_ITEMS} 不合理（应 2~6）`);
+    }
+    const mk = (at, o, t) => ({ at, original: o, translation: t, start: at / 1000, end: at / 1000 + 1 });
+
+    // ① 容差内（1.19s）⇒ 同一批；超出（2.27s）⇒ 不进
+    let r = P([mk(24640, 'A', 'a'), mk(25830, 'B', 'b'), mk(26910, 'C', 'c'), mk(30270, 'D', 'd')]);
+    if (r.batch.map((x) => x.original).join('') !== 'AB') {
+      throw new Error(`容差 1.5s 应只带 A、B，实际 ${r.batch.map((x) => x.original).join('')}`);
+    }
+    if (r.rest.map((x) => x.original).join('') !== 'CD') {
+      throw new Error(`没进这一批的必须原样留下（要放回队首 ✗），实际 ${r.rest.map((x) => x.original).join('')}`);
+    }
+    // ② 都在容差内 ⇒ 受上限约束（不许把 5 条并成字幕墙 ✗）
+    r = P([mk(0, 'A', 'a'), mk(100, 'B', 'b'), mk(200, 'C', 'c'), mk(300, 'D', 'd'), mk(400, 'E', 'e')]);
+    if (r.batch.length !== WB.SHOW_BATCH_MAX_ITEMS) {
+      throw new Error(`应受上限 ${WB.SHOW_BATCH_MAX_ITEMS} 约束，实际带了 ${r.batch.length} 条`);
+    }
+    // ③ 容差 0 ⇒ 只带队首（= 退回"一条一条换"，这是可回退的底线 ✓）
+    r = P([mk(0, 'A', 'a'), mk(1, 'B', 'b')], { toleranceSec: 0 });
+    if (r.batch.length !== 1) throw new Error('toleranceSec=0 时只能带队首');
+    // ④ 倒序/相邻很近的也要按顺序带（`due()` 给的是升序 ✓）
+    r = P([mk(5000, 'A', 'a'), mk(4000, 'B', 'b')]);
+    if (r.batch[0].original !== 'A') throw new Error('不许重排：队首必须是第一条');
+    // ⑤ 脏输入一律不崩
+    for (const bad of [null, undefined, [], [null], [{}, {}], [mk(NaN, 'A', 'a'), mk(NaN, 'B', 'b')]]) {
+      const out = P(bad);
+      if (!out || !Array.isArray(out.batch) || !Array.isArray(out.rest)) {
+        throw new Error(`脏输入 ${JSON.stringify(bad)} 时返回结构不对`);
+      }
+      if (out.batch.length + out.rest.length !== (Array.isArray(bad) ? bad.filter((x) => x && typeof x === 'object').length : 0)) {
+        throw new Error(`脏输入 ${JSON.stringify(bad)} 时条目数对不上（不许丢条目 ✗）`);
+      }
+    }
+
+    // ⑥ 合并：原文/译文都用空格连成**一行**；译文缺的退化成原文
+    const mg = M([mk(1000, 'あい', '甲乙'), { at: 2000, original: 'うえ', translation: '', start: 2, end: 3 }]);
+    if (mg.original !== 'あい うえ') throw new Error(`原文合并不对：${JSON.stringify(mg.original)}`);
+    if (mg.translation !== '甲乙 うえ') throw new Error(`译文合并不对（缺译文要退化成原文）：${JSON.stringify(mg.translation)}`);
+    if (mg.count !== 2) throw new Error(`count 应为 2，实际 ${mg.count}`);
+    if (!(mg.chars === 4)) throw new Error(`chars 应按原文数（4），实际 ${mg.chars}`);
+    // ⑦ 跨度取首尾（`minShowHoldMs` 用它算"还没说完"）
+    if (mg.start !== 1 || mg.end !== 3) throw new Error(`跨度应取首尾 1~3，实际 ${mg.start}~${mg.end}`);
+    // ⑧ 空/脏 ⇒ null（不许返回半个对象 ✗）
+    for (const bad of [[], null, undefined, [null]]) {
+      if (M(bad) !== null) throw new Error(`mergeShownBatch(${JSON.stringify(bad)}) 应返回 null`);
+    }
+
+    // ⑨ ⭐ **接线反证**：`player.js` 的按批分支必须真的用这两个函数，且必须早于旧路循环
+    // ⚠️ 必须 `stripComments` 后再查 —— 注释里也写着这些名字，会把"没接线"掩盖掉 ✗
+    const src = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
+    const iPick = src.indexOf('pickShownBatch(dueItems)');
+    if (iPick < 0) throw new Error('player.js 没有调用 `pickShownBatch(dueItems)` —— 按批刷新没接线');
+    const iMergeFn = src.indexOf('mergeShownBatch(batch)');
+    if (iMergeFn < 0) throw new Error('player.js 没有调用 `mergeShownBatch(batch)` —— 合并没接线');
+    const iOldLoop = src.indexOf('for (let di = 0; di < dueItems.length; di += 1) {');
+    if (iOldLoop < 0) throw new Error('找不到旧路的 `for (let di = 0; …dueItems.length…` 循环（它不该被删掉 ✗）');
+    if (!(iPick < iOldLoop)) {
+      throw new Error('按批分支必须在旧路循环**之前** —— 否则新路又走回一条一条换 ✗');
+    }
+    // ⑩ ⭐ 按批分支里**不许改 `at`**（排期值一个都不许动 ——「比排期晚」必须仍然诚实 ✗）
+    const batchBlock = (() => {
+      const start = src.indexOf('if (holdEnabled && dueItems.length) {');
+      if (start < 0) return '';
+      // ⚠️ 按花括号结构截（别截固定长度 / 别用"下一个 continue;"——今天栽过两次 ✗）
+      let depth = 0;
+      for (let i = src.indexOf('{', start); i < src.length; i += 1) {
+        if (src[i] === '{') depth += 1;
+        else if (src[i] === '}') {
+          depth -= 1;
+          if (depth === 0) return src.slice(start, i + 1);
+        }
+      }
+      return src.slice(start);
+    })();
+    if (!batchBlock.includes('pickShownBatch(dueItems)')) {
+      throw new Error('`pickShownBatch(dueItems)` 不在 `if (holdEnabled && dueItems.length) {` 块里');
+    }
+    if (/\.at\s*=/.test(batchBlock)) {
+      throw new Error('按批分支里改了 `at` —— 排期值不许被显示层动');
+    }
+    // ⑪ ⭐ 让位时**整批放回队首**（不放回就是丢字幕 ✗ —— 比"闪一下"严重得多）
+    if (!/schedule\.items\.unshift\(\.\.\.dueItems\)/.test(batchBlock)) {
+      throw new Error('让位时没有把**整批**放回队首 —— 那会永久丢字幕 ✗');
+    }
+    // ⑫ ⭐ 没进这一批的必须放回（否则它们永远不上屏 ✗）
+    if (!/schedule\.items\.unshift\(\.\.\.rest\)/.test(batchBlock)) {
+      throw new Error('刷完没有把 `rest` 放回队首 —— 它们会永远不上屏 ✗');
+    }
+  });
+
   check('上屏时刻：`minShowHoldMs` 每条「待够再换」（按自己的字数/跨度算，不是固定 0.5s）', () => {
     // ⚠️ 为什么固定 0.5 秒不够（用户实测报的）✗:
     //    7/56 条**在屏时长 < 它自己的跨度**（还没说完就被换 ✗）· 阅读速度 **20~210 字/秒** ✗
@@ -12240,8 +12349,20 @@ assertSpeechRun();
     const iHold = playerSrc.indexOf('holdSwitchForGap({');
     if (iMerge < 0) throw new Error('player.js 没有调用 shouldMergeShown —— 合并闸没接线');
     if (iHold < 0) throw new Error('player.js 没有调用 holdSwitchForGap —— 让位闸没接线');
-    if (iMerge > iHold) {
-      throw new Error('合并闸排在让位闸**之后** —— 那两条会先被让位挡下，永远走不到合并');
+    /**
+     * ⭐ **顺序要求从「合并闸先于让位闸」改成了「按批收拢先于让位闸」** ✗
+     *
+     * 为什么可以改（而不是放宽）：
+     *   · 新路现在改成**按批刷新**⇒「两句撞车」在 `pickShownBatch` 那一步就被收拢成一批，
+     *     根本走不到 `shouldMergeShown`（新路在旧路循环**之前**就 `return` 了 ✓）
+     *   · ⇒ 原来那条"合并闸必须排在让位之前"的顺序要求，在新结构下**指向了一个不可达的分支** ✗
+     *     （它仍留在旧路循环里，作为旧数据形态的兜底 ✓）
+     *   · ⇒ 现在真正要守的顺序是：**收拢先于让位** —— 否则先被让位挡下，永远走不到刷新 ✗
+     */
+    const iPick = playerSrc.indexOf('pickShownBatch(dueItems)');
+    if (iPick < 0) throw new Error('player.js 没有调用 pickShownBatch(dueItems) —— 按批刷新没接线');
+    if (iPick > iHold) {
+      throw new Error('按批收拢排在让位闸**之后** —— 那几条会先被让位挡下，永远走不到按批刷新');
     }
     /**
      * ⚠️ **不许"接线了但被关掉"** ✗ —— `if (false && holdEnabled) { … }` 里那句调用
