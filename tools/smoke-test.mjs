@@ -7852,6 +7852,44 @@ check('遮罩要说清「解不出帧」，不能给用户一个零提示的黑�
 });
 
 
+check('「让 Whisper 自己断句」的延迟预算：滑块与 clamp 上限都得够 10 秒，且读取必须走同一个函数', () => {
+  /**
+   * ⚠️ 为什么这条要单独守：打开新断句路径之后，首批音频 6 秒 + 一次往返 + 确认
+   * ⇒ 需要 ≈10 秒延迟。而这条路径上线时，**两处上限都还是旧的**：
+   *   · player/player.html 的滑块 `max="8"`   ⇒ 10 秒根本拉不到
+   *   · lib/delayed-player.js `DELAY_MAX_SEC = 12` ⇒ 更大的值被 clampDelay 夹回去
+   * 于是用户勾上开关、文案说「自动提到 10 秒」，而实际永远到不了 —— 这种"设置页说了
+   * 而代码做不到"的缺口，本项目栽过不止一次（改了默认值没迁移、有设置没控件）。
+   *
+   * 还有一处更隐蔽的：player.js 里读 delaySec 的地方原本各写一遍
+   * `Number(settings.capture.delaySec) || DELAY_MIN_SEC`（六处），散着改必然漏一处，
+   * 漏了就会出现「滑块 10 而标签 3.0s」。所以收敛到 effectiveDelaySec，并在这里守死。
+   */
+  const dp = loaded['lib/delayed-player.js'];
+  if (dp.DELAY_MAX_SEC < 10) throw new Error('DELAY_MAX_SEC 不到 10，新路要的延迟设不出来：' + dp.DELAY_MAX_SEC);
+
+  const html = fs.readFileSync(new URL('../player/player.html', import.meta.url), 'utf8');
+  const slider = html.match(/<input[^>]*id="delay"[^>]*>/);
+  if (!slider) throw new Error('player.html 里找不到 id="delay" 的滑块');
+  const maxM = slider[0].match(/max="(\d+(?:\.\d+)?)"/);
+  if (!maxM) throw new Error('延迟滑块没有 max');
+  if (Number(maxM[1]) < 10) throw new Error('延迟滑块 max=' + maxM[1] + '，拉不到新路要的 10 秒');
+
+  const pjs = fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8');
+  if (!/function effectiveDelaySec\s*\(/.test(pjs)) throw new Error('player.js 里没有 effectiveDelaySec');
+  if (!/WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*10\b/.test(pjs)) {
+    throw new Error('WHISPER_SEGMENTS_MIN_DELAY_SEC 不是 10 —— 新路的延迟预算写着 10');
+  }
+  // ⭐ 核心：不许再有裸读（否则漏一处就是「滑块 10 而标签 3.0s」）
+  const bare = [
+    /Number\(settings\.capture\.delaySec\)\s*\|\|\s*DELAY_MIN_SEC/,
+    /Number\(settings\.capture\.delaySec\s*\?\?\s*DELAY_MIN_SEC\)/,
+  ].find((re) => re.test(pjs));
+  if (bare) throw new Error('player.js 里还有绕开 effectiveDelaySec 的裸读：' + bare);
+  const calls = (pjs.match(/effectiveDelaySec\(settings\)/g) || []).length;
+  if (calls < 6) throw new Error('effectiveDelaySec 只被调了 ' + calls + ' 处，应有 6 处（构造/诊断/排期/滑块/标签/UI 跳动）');
+});
+
 check('画面延迟下限必须是 3 秒，而且老用户 storage 里的旧值绕不过去', () => {
   const dp = loaded['lib/delayed-player.js'];
   /**
@@ -7870,7 +7908,7 @@ check('画面延迟下限必须是 3 秒，而且老用户 storage 里的旧值�
   }
   // 区间内 / 超过上限 → 原样或截到上限
   if (dp.clampDelay(6.6) !== 6.6) throw new Error('clampDelay(6.6) 不该被改');
-  if (dp.clampDelay(12) !== 12) throw new Error('clampDelay(12) 应等于上限');
+  if (dp.clampDelay(12) !== 12) throw new Error('clampDelay(12) 不该被改（12 在 20 秒上限之内）');
   if (dp.clampDelay(99) !== dp.DELAY_MAX_SEC) throw new Error('超过上限应截到 DELAY_MAX_SEC');
 
   // ★ 关键：模拟"老用户 storage 里存着 1.5" —— 实际用到的必须仍是 3
@@ -7884,7 +7922,7 @@ check('画面延迟下限必须是 3 秒，而且老用户 storage 里的旧值�
   if (std !== 3) throw new Error('storage 里 1.5 没有被抬到 3 —— 老用户会绕过下限');
 
   // 默认值不能低于下限（否则全新安装一上来就违规）
-  const d = settings.DEFAULT_SETTINGS.capture.delaySec;
+const d = settings.DEFAULT_SETTINGS.capture.delaySec;
   if (d < dp.DELAY_MIN_SEC) throw new Error('默认 delaySec ' + d + ' 低于下限 ' + dp.DELAY_MIN_SEC);
 
   // 预设里也不许有低于下限的
