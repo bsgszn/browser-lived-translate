@@ -135,6 +135,7 @@ const MODULES = [
   'lib/asr/vad.js',
   'lib/asr/vad-gate.js',
   'lib/asr/hallucination.js',
+  'lib/asr/whisper-segments.js',
   'lib/asr/index.js',
   'lib/hotwords/ja-live.js',
   'lib/translate/index.js',
@@ -9536,6 +9537,155 @@ check('丢弃过短片段：配置判法是 `=== true`（**缺省即关**）—�
 });
 
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Whisper 先断句 · 静音只做确认 —— 决策层（lib/asr/whisper-segments.js）
+//
+// 这一层是**纯函数**，所以真的能驱动它断言（不像 trimAudio / dropShort 那些在
+// createSession 闭包里、只能靠源码检查或真机日志）。
+//
+// ⚠️ 这些断言验的是**返回值**，不是"函数存在"。而这个家族的教训是：
+//    `tooShort` 算了没人消费 · `Math.min` 上限永不生效 · `framesFedToGate` 同 tick 无变化 ·
+//    `分片>0` 正则永远匹配不到 —— 全都是"判据存在但到不了"。
+//    所以这一节的重点是 **branch 到不到**，而不是形状。
+// ─────────────────────────────────────────────────────────────────────────────
+const WSEG = loaded['lib/asr/whisper-segments.js'];
+const wseg = (s, e, t = '') => ({ start: s, end: e, text: t });
+
+check('Whisper 分段决策：每段都确认 → 全采纳，nextStart = 已采纳段里**最大**的 end', () => {
+  const r = WSEG.decideAdvance([wseg(0, 4, 'A'), wseg(4, 8, 'B')], { hasSilenceAfter: () => true, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.ALL_ACCEPTED) throw new Error(`reason = ${r.reason}`);
+  if (r.accepted.length !== 2) throw new Error(`accepted = ${r.accepted.length}`);
+  if (r.nextStart !== 8) throw new Error(`nextStart = ${r.nextStart}（应为 8）`);
+  if (r.pending !== null) throw new Error(`pending = ${JSON.stringify(r.pending)}`);
+});
+
+check('Whisper 分段决策：中间某段没静音 → 前面的采纳，nextStart = **那一段的 start**（重采而不是拼接）', () => {
+  // end < 5 才算"确认" ⇒ 第一段(4)确认、第二段(8)不确认
+  const r = WSEG.decideAdvance([wseg(0, 4, 'A'), wseg(4, 8, 'B')], { hasSilenceAfter: (t) => t < 5, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.TAIL_UNCONFIRMED) throw new Error(`reason = ${r.reason}`);
+  if (r.accepted.length !== 1 || r.accepted[0].end !== 4) throw new Error(`accepted = ${JSON.stringify(r.accepted)}`);
+  if (r.nextStart !== 4) throw new Error(`nextStart = ${r.nextStart}（应为 4 = 没采纳那段的 start）`);
+  if (!r.pending || r.pending.start !== 4 || r.pending.end !== 8) throw new Error(`pending = ${JSON.stringify(r.pending)}`);
+});
+
+check('Whisper 分段决策：第一段就没静音 → **一个都不采纳**，nextStart 不动', () => {
+  const r = WSEG.decideAdvance([wseg(0, 4, 'A'), wseg(4, 8, 'B')], { hasSilenceAfter: () => false, from: 0 });
+  if (r.accepted.length !== 0) throw new Error(`accepted = ${JSON.stringify(r.accepted)}`);
+  if (r.nextStart !== 0) throw new Error(`nextStart = ${r.nextStart}（应为 0）`);
+  if (r.reason !== WSEG.DECIDE_REASONS.TAIL_UNCONFIRMED) throw new Error(`reason = ${r.reason}`);
+});
+
+check('Whisper 分段决策：兜底 force + 一段都没确认 → 采纳到**最后一个段的 end**（用 Whisper 的边界，不用 VAD）', () => {
+  const r = WSEG.decideAdvance([wseg(0, 4, 'A'), wseg(4, 8, 'B')], { hasSilenceAfter: () => false, force: true, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.FORCE_ACCEPTED) throw new Error(`reason = ${r.reason}`);
+  if (r.accepted.length !== 2) throw new Error(`accepted = ${r.accepted.length}（兜底要采纳到最后一个段）`);
+  if (r.nextStart !== 8) throw new Error(`nextStart = ${r.nextStart}（应为最后一段的 end = 8）`);
+});
+
+check('Whisper 分段决策：force 但**已经确认过一段** → 不许硬推没确认的尾巴 ✗', () => {
+  // 这一条是"兜底别过头"的守门：只要有进展，就不该把半句推上屏
+  const r = WSEG.decideAdvance([wseg(0, 4, 'A'), wseg(4, 8, 'B')], { hasSilenceAfter: (t) => t < 5, force: true, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.TAIL_UNCONFIRMED) throw new Error(`reason = ${r.reason}（不该是 force-accepted）`);
+  if (r.accepted.length !== 1) throw new Error(`accepted = ${r.accepted.length}（只该采纳已确认的那一段）`);
+});
+
+check('Whisper 分段决策：空 / null → no-segments，nextStart 原样返回（表示"别推进"）', () => {
+  for (const input of [[], null, undefined, 'not-an-array', 42]) {
+    const r = WSEG.decideAdvance(input, { hasSilenceAfter: () => true, from: 7 });
+    if (r.reason !== WSEG.DECIDE_REASONS.NO_SEGMENTS) throw new Error(`输入 ${JSON.stringify(input)} → reason = ${r.reason}`);
+    if (r.nextStart !== 7) throw new Error(`输入 ${JSON.stringify(input)} → nextStart = ${r.nextStart}（应为 from=7）`);
+    if (r.accepted.length !== 0 || r.pending !== null) throw new Error(`输入 ${JSON.stringify(input)} → 不该有 accepted/pending`);
+  }
+});
+
+check('Whisper 分段决策：全是脏段 → no-segments，且 dropped 计数对得上', () => {
+  const dirty = [wseg(null, 3), wseg(5, 5), wseg(-1, 2), { start: 'x', end: 2 }, {}, null, 'nope'];
+  const r = WSEG.decideAdvance(dirty, { hasSilenceAfter: () => true, from: 7 });
+  if (r.reason !== WSEG.DECIDE_REASONS.NO_SEGMENTS) throw new Error(`reason = ${r.reason}`);
+  if (r.dropped !== dirty.length) throw new Error(`dropped = ${r.dropped}（应为 ${dirty.length}）`);
+  if (r.nextStart !== 7) throw new Error(`nextStart = ${r.nextStart}（应为 from=7）`);
+});
+
+check('Whisper 分段决策：脏段和好段混在一起 → 只用好的，其余丢掉', () => {
+  const r = WSEG.decideAdvance([wseg(null, 1), wseg(2, 6, 'ok'), wseg(9, 9)], { hasSilenceAfter: () => true, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.ALL_ACCEPTED) throw new Error(`reason = ${r.reason}`);
+  if (r.accepted.length !== 1 || r.accepted[0].start !== 2) throw new Error(`accepted = ${JSON.stringify(r.accepted)}`);
+  if (r.dropped !== 2) throw new Error(`dropped = ${r.dropped}（应为 2）`);
+  if (r.nextStart !== 6) throw new Error(`nextStart = ${r.nextStart}（应为 6）`);
+});
+
+check('Whisper 分段决策：相邻段重叠 → nextStart 取**最大** end，不许倒退', () => {
+  // Whisper 偶尔给重叠边界。若取"最后一段的 end"就会倒退，所以必须取 max。
+  // 这里故意让后一段的 end(8) 大于前一段(6) 但 start(4) 小于前一段的 end(6)。
+  const r = WSEG.decideAdvance([wseg(0, 6, 'A'), wseg(4, 8, 'B')], { hasSilenceAfter: () => true, from: 0 });
+  if (r.nextStart !== 8) throw new Error(`nextStart = ${r.nextStart}（应为 8 = 最大 end）`);
+  // 再来一个"后一段 end 更小"的，必须还是取 max（6）而不是 5
+  const r2 = WSEG.decideAdvance([wseg(0, 6, 'A'), wseg(4, 5, 'B')], { hasSilenceAfter: () => true, from: 0 });
+  if (r2.nextStart !== 6) throw new Error(`重叠时 nextStart = ${r2.nextStart}（应为 6 = 最大 end，不许倒退到 5）`);
+});
+
+check('Whisper 分段决策：`start: null` 必须**丢掉**（`Number(null) === 0` 那个坑）', () => {
+  // ⚠️ 若只判 Number.isFinite(Number(x))，{start:null,end:3} 会变成 0~3 被悄悄收下 ✗
+  //    这个坑在本项目踩过两次（exitThreshold 的 Number(null)、speechMs 的守卫），所以显式钉住
+  const r = WSEG.decideAdvance([{ start: null, end: 3, text: 'x' }], { hasSilenceAfter: () => true, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.NO_SEGMENTS) throw new Error(`reason = ${r.reason}（null 的 start 不该被当成 0）`);
+  if (r.dropped !== 1) throw new Error(`dropped = ${r.dropped}`);
+  // '' 和 false 同理
+  for (const bad of ['', false, NaN, Infinity, -Infinity]) {
+    const rr = WSEG.decideAdvance([{ start: bad, end: 3 }], { hasSilenceAfter: () => true, from: 0 });
+    if (rr.dropped !== 1) throw new Error(`start = ${String(bad)} 没被丢掉（dropped = ${rr.dropped}）`);
+  }
+});
+
+check('Whisper 分段决策：`hasSilenceAfter` 抛异常 → 当作"没静音"（保守），且不崩', () => {
+  // 理由：不确定就别上屏。反过来会把半句推上去 —— 而"半句上屏"比"晚一句"难查得多。
+  //      真卡住了还有 force 兜底，不会永久不出字幕。
+  let calls = 0;
+  const r = WSEG.decideAdvance([wseg(0, 4, 'A'), wseg(4, 8, 'B')], {
+    hasSilenceAfter: () => {
+      calls++;
+      throw new Error('boom');
+    },
+    from: 0,
+  });
+  if (r.accepted.length !== 0) throw new Error(`抛异常后不该采纳任何段（accepted = ${r.accepted.length}）`);
+  if (r.reason !== WSEG.DECIDE_REASONS.TAIL_UNCONFIRMED) throw new Error(`reason = ${r.reason}`);
+  if (calls !== 1) throw new Error(`回调被调用 ${calls} 次（抛异常后应立刻停，只调 1 次）`);
+});
+
+check('Whisper 分段决策：不传 `hasSilenceAfter` → 一律不确认（只有 force 能推上去）', () => {
+  const r = WSEG.decideAdvance([wseg(0, 4, 'A')], { from: 0 });
+  if (r.accepted.length !== 0) throw new Error(`没给回调却采纳了 ${r.accepted.length} 段`);
+  const rf = WSEG.decideAdvance([wseg(0, 4, 'A')], { force: true, from: 0 });
+  if (rf.reason !== WSEG.DECIDE_REASONS.FORCE_ACCEPTED || rf.nextStart !== 4) {
+    throw new Error(`force 时 reason=${rf.reason} nextStart=${rf.nextStart}（应为 force-accepted / 4）`);
+  }
+});
+
+check('Whisper 分段决策：`sanitizeSegments` 按 start 升序，并保留额外字段（诊断要用）', () => {
+  const out = WSEG.sanitizeSegments([
+    { start: 8, end: 10, text: 'c', no_speech_prob: 0.1 },
+    { start: 0, end: 4, text: 'a' },
+    { start: 4, end: 8, text: 'b' },
+  ]);
+  const got = out.map((s) => `${s.start}~${s.end}`).join(',');
+  if (got !== '0~4,4~8,8~10') throw new Error(`排序结果 ${got}`);
+  if (out[2].no_speech_prob !== 0.1) throw new Error('额外字段（no_speech_prob）被丢掉了 —— 诊断要用它 ✗');
+  if (WSEG.sanitizeSegments('nope').length !== 0) throw new Error('非数组应返回空数组');
+});
+
+check('Whisper 分段决策：`reason` 只是这四种，且都是小写连字符（以后 delayed-player 要 switch 它）', () => {
+  const R = WSEG.DECIDE_REASONS;
+  const vals = Object.values(R);
+  if (vals.length !== 4) throw new Error(`reason 有 ${vals.length} 种：${vals.join(',')}`);
+  for (const v of vals) {
+    if (typeof v !== 'string' || !/^[a-z]+(-[a-z]+)*$/.test(v)) throw new Error(`reason「${v}」不是小写连字符格式`);
+  }
+  if (!Object.isFrozen(R)) throw new Error('DECIDE_REASONS 必须被冻结（不许运行时被改）');
+  // 四个取值互不相同
+  if (new Set(vals).size !== 4) throw new Error('reason 有重复值');
+});
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
 process.exit(failures === 0 ? 0 : 1);
