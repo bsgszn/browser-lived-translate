@@ -29,6 +29,9 @@ import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote, formatAtSt
 //    所以这里再加一条 import 不增加加载开销；而它的顶层依赖也只有 util / vad-gate /
 //    hallucination / glossary / hotwords（onnxruntime 是运行时才动态取）。
 import { buildWhisperPrompt } from '../lib/asr/vad.js';
+// ⚠️ 只取两个**纯函数**（不引整条识别链）—— 它们和「什么时候该上屏」有关，
+//    和 `shownStartOf` / `clampShownAt` 是同一族，放在同一个模块里 ✓
+import { holdSwitchForGap, MIN_SHOW_HOLD_MS } from '../lib/asr/whisper-batch.js';
 import { JA_LIVE_HOTWORD_LIST } from '../lib/hotwords/ja-live.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
 import {
@@ -187,6 +190,17 @@ let asrRequestsDone = 0;
  */
 let shownCount = 0;
 let lastShownAt = 0;
+/**
+ * 上一次**换屏**的时刻（毫秒，与 `pumpSubtitles` 的 `now` 同基准）。
+ *
+ * ⚠️ 和 `lastShownAt` 不是一回事：那是 `Date.now()`（看门狗的基准），
+ *    而这个是排期循环里的 `now`。**混用两个时钟**正是今天"晚多少对不上"的根 ✗
+ *
+ * `0` = 还没换过屏（不许当成"刚换过" ✗）
+ */
+let lastShowSwitchAt = 0;
+/** 被「屏上让位」挡下来的次数（进心跳/诊断，否则这事在日志里看不见 ✗） */
+let showHeldCount = 0;
 /** 上次刷新"没有识别结果"提示的时刻（要持续刷新，不能只报一次） */
 let lastNoticeAt = 0;
 /** 上次报告「缓冲落后实况多久」的时刻（每 10 秒报一次，免得刷屏） */
@@ -2211,7 +2225,37 @@ function pumpSubtitles() {
     now,
   });
 
-  for (const item of schedule.due(now, renderable(now))) {
+  /**
+   * ⚠️ `schedule.due()` 是**从队列里 `shift()` 弹出**的（`lib/delayed-player.js:1948`）✗
+   *    ⇒ 绝不能 `break` 一走了之 —— 那样弹出来的条目就**永远丢了** ✗✗
+   *    （症状：字幕莫名少一句，而日志里什么都没有 —— 比"闪一下"严重得多 ✓）
+   * ⇒ 让位时把**这一条和后面还没处理的**放回队首（`unshift` 一整个块保持原序 ✓）
+   */
+  const dueItems = schedule.due(now, renderable(now));
+  const holdEnabled = String(settings?.asr?.provider || '') === 'vad-segments';
+  for (let di = 0; di < dueItems.length; di += 1) {
+    const item = dueItems[di];
+    /**
+     * 🔴 **屏上让位闸** ✗ —— 上一条还没在屏上待够 `MIN_SHOW_HOLD_MS`，
+     *    这一拍先别换屏，下一拍（100ms 后）再来 ✓
+     *
+     * 为什么必须在这一层（实测）：
+     *   `clampShownAt` 夹的是**音频时间**，而 `at` 里还有会变的 `delayMs` ✗
+     *   ⇒ `xhsp-ab3-B` 里「夹紧推后」**一次都没触发**（0 次），而导出日志里仍有
+     *     `73.512 → 72.992（−0.52）` / `91.146 → 91.046（−0.10）` 这种倒退 ✗
+     *   ⇒ 那几条推入时的 `usedDelayMs` 不同，于是排期在音频时间之外又倒了过来 ✓
+     *
+     * ⚠️ **只对新路启用** —— 旧路的时机用户认可，动它就是回归 ✗
+     * ⚠️ **不改排期值** ⇒「比排期晚」仍然诚实；让位出去的时间单独印出来 ✗
+     */
+    if (holdSwitchForGap({ now, lastSwitchAt: lastShowSwitchAt, enabled: holdEnabled })) {
+      // 记在**这一条**头上：它到点上屏却被让位，诊断里要看得见这多少毫秒 ✗
+      if (!item.heldSince) item.heldSince = now;
+      showHeldCount += 1;
+      // 🔴 **放回队首**（保持原顺序）—— 不放回就是丢字幕 ✗
+      schedule.items.unshift(...dueItems.slice(di));
+      break;
+    }
     if (item.late) diagLate(item, now);
     if (!item.translation) diag('翻译没赶上 · 先显示原文', true);
     // 存引用而不是拷贝：译文晚到时才能直接改到已经上屏的这一条
@@ -2224,6 +2268,8 @@ function pumpSubtitles() {
     // ⚠️ 这里才是"字幕真的上屏" —— 看门狗要的是这个，不是"识别回来了"。
     shownCount += 1;
     lastShownAt = Date.now();
+    // 换屏基准用排期循环的 `now`（和 `holdSwitchForGap` 同一个时钟 ✗）
+    lastShowSwitchAt = now;
     renderSubs();
   }
   setTimeout(pumpSubtitles, 100);
@@ -2303,8 +2349,16 @@ function diagLate(item, now) {
     t0: DIAG_T0,
   });
   const atNote = atStamp ? `${atStamp} · ` : '';
+  /**
+   * ⭐ 被「屏上让位」挡了多久 —— **必须印** ✗
+   *
+   * 否则「比排期晚」会因为闸门而变大，而读日志的人会以为那是缓冲/排期的锅 ✗
+   * （"看不见"这一族今天已栽过五次 ✓）
+   */
+  const heldSec = item.heldSince ? Math.max(0, (now - item.heldSince) / 1000) : 0;
+  const heldNote = heldSec >= 0.01 ? ` · 屏上让位 +${heldSec.toFixed(2)}s` : '';
   diag(
-    `字幕上屏 · ${atNote}比排期晚 ${(lateMs / 1000).toFixed(2)}s · 这句说了 ${(saidMs / 1000).toFixed(1)}s${inside ? ' · 仍在句内' : ''}`,
+    `字幕上屏 · ${atNote}比排期晚 ${(lateMs / 1000).toFixed(2)}s · 这句说了 ${(saidMs / 1000).toFixed(1)}s${inside ? ' · 仍在句内' : ''}${heldNote}`,
     // 晚得还在句内 = 观感可接受，不用报警
     !inside,
   );
