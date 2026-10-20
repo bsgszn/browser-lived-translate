@@ -12087,8 +12087,19 @@ assertSpeechRun();
      *    · `batch[0]` 已被写长，旧路再拿它合并 ⇒ **每次 ×3** ⇒ 原文涨到 390 万字 ✗
      *    · 连带 `lastShownChars` 被污染 ⇒ 阅读速度算成 541237 字/秒 ✗
      */
-    if ((batchBlock.match(/pumpLater\(\);\s*\n\s*return;/g) || []).length !== 2) {
-      throw new Error('按批分支的两条出口必须各自 `pumpLater(); return;` —— 漏了 return 就会落到旧路循环（实测会指数放大原文 ✗）');
+    // ⚠️ 判据写成"**每一次** `pumpLater();` 后面都必须紧跟 `return;`"，而不是钉死 2 处 ✗
+    //    （后来又加了"宽限等待"那条出口 ⇒ 3 处。钉数字会让**加一条正确出口**也变红 ✗）
+    const calls = (batchBlock.match(/pumpLater\(\);/g) || []).length;
+    const withReturn = (batchBlock.match(/pumpLater\(\);\s*\n\s*return;/g) || []).length;
+    if (calls < 2 || withReturn !== calls) {
+      throw new Error(
+        `按批分支的**每一条**出口都必须 \`pumpLater(); return;\`（现有 ${calls} 处调用、${withReturn} 处带 return）` +
+          ' —— 漏了 return 就会落到旧路循环（实测会指数放大原文 ✗）',
+      );
+    }
+    // ⑮ ⭐ 宽限等待：队首到点后要等一小会儿把后续到期的收进来（否则凑不出批 —— 实测只 3 次/51 条 ✗）
+    if (!/waitedMs < graceMs/.test(batchBlock)) {
+      throw new Error('没有宽限等待 —— `due()` 每拍几乎只到期一条 ⇒ 批凑不出来（实测 3 次/51 条 ✗）');
     }
     // ⑭ ⭐ flush 前必须给**每一条**打 `shownAt`（幂等保护 —— 同一条不许被反复 flush ✗）
     if (!/for \(const b of batch\) b\.shownAt = now;/.test(batchBlock)) {
