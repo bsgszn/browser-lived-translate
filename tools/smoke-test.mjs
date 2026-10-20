@@ -11928,6 +11928,56 @@ assertSpeechRun();
     }
   });
 
+  check('上屏时刻：`minShowHoldMs` 每条「待够再换」（按自己的字数/跨度算，不是固定 0.5s）', () => {
+    // ⚠️ 为什么固定 0.5 秒不够（用户实测报的）✗:
+    //    7/56 条**在屏时长 < 它自己的跨度**（还没说完就被换 ✗）· 阅读速度 **20~210 字/秒** ✗
+    //    例:`21 字 / 2s` 在 0.1 秒后就被换掉 ⇒ 观众一个字都没读进去 ✗
+    const F = WB.minShowHoldMs;
+    if (typeof F !== 'function') throw new Error('whisper-batch.js 没有导出 minShowHoldMs');
+    if (WB.MIN_READ_CHARS_PER_SEC !== 6) {
+      throw new Error(`阅读速度下限应是 6 字/秒，实际 ${WB.MIN_READ_CHARS_PER_SEC}`);
+    }
+    if (WB.MIN_SHOW_SEC !== 0.6) {
+      throw new Error(`绝对下限应是 0.6 秒，实际 ${WB.MIN_SHOW_SEC}`);
+    }
+
+    // ① **还没说完** ⇒ 取「跨度剩余」（22 字 / 5 秒、才待 0.2 秒 ⇒ 还剩 4.8 秒 ✗）
+    if (F({ chars: 22, spanSec: 5, elapsedMs: 200 }) !== 4800) {
+      throw new Error(`还没说完时应取跨度剩余 4800ms，实际 ${F({ chars: 22, spanSec: 5, elapsedMs: 200 })}`);
+    }
+    // ② **字数多、跨度已过** ⇒ 取「读完要多久」（30 字 ÷ 6 = 5000ms ✗）
+    if (F({ chars: 30, spanSec: 2, elapsedMs: 3000 }) !== 5000) {
+      throw new Error(`30 字应取 5000ms，实际 ${F({ chars: 30, spanSec: 2, elapsedMs: 3000 })}`);
+    }
+    // ③ **字数少、跨度已过** ⇒ 落到下限 600ms（不许 0 ✗ —— 0 等于不挡）
+    if (F({ chars: 3, spanSec: 1, elapsedMs: 5000 }) !== 600) {
+      throw new Error(`短句应落到下限 600ms，实际 ${F({ chars: 3, spanSec: 1, elapsedMs: 5000 })}`);
+    }
+    // ④ **脏输入一律不崩、且不低于下限** —— `Number(null) === 0` 那一族 ✗
+    for (const bad of [undefined, null, {}, { chars: null, spanSec: null, elapsedMs: null },
+      { chars: NaN, spanSec: NaN, elapsedMs: NaN }, { chars: -9, spanSec: -9, elapsedMs: -9 },
+      { chars: 'abc', spanSec: 'abc', elapsedMs: 'abc' }]) {
+      const v = F(bad);
+      if (!(Number.isFinite(v) && v >= 600)) {
+        throw new Error(`脏输入必须给出 ≥600ms 的有限值，实际 ${v}（输入 ${JSON.stringify(bad)}）`);
+      }
+    }
+
+    // ⑤ ⭐ **接线反证**：`player.js` 必须把 `minHoldMs` 真的传进去 ✗
+    //    —— 只导出函数、不接线 = 这条改动完全没生效（今天那一族栽过多次 ✓）
+    const playerSrc = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
+    if (!/holdSwitchForGap\(\{[^}]*minHoldMs/.test(playerSrc)) {
+      throw new Error('player.js 调 holdSwitchForGap 时没传 minHoldMs —— 每条的「待够」没接线');
+    }
+    if (!/minShowHoldMs\(\{/.test(playerSrc)) {
+      throw new Error('player.js 没有调用 minShowHoldMs');
+    }
+    // 旧路必须保持原样：`MIN_SHOW_HOLD_MS` 仍要作为默认值出现 ✓
+    if (!/let minHoldMs = MIN_SHOW_HOLD_MS/.test(playerSrc)) {
+      throw new Error('player.js 的 minHoldMs 默认值必须仍是 MIN_SHOW_HOLD_MS（旧路不许被改 ✗）');
+    }
+  });
+
   check('上屏时刻：`holdSwitchForGap` 屏上让位（上一条没待够就别换屏，只对新路）', () => {
     // ⚠️ 为什么夹在**排期时刻**上不够（实测）：`at` 里含会变的 `delayMs` ✗
     //    `xhsp-ab3-B` 里「夹紧推后」**一次都没触发**（0 次），而导出日志里仍有
@@ -11992,6 +12042,167 @@ assertSpeechRun();
     let n = 0;
     for (let t = 1000; H({ now: t, lastSwitchAt: 1000 }) && n < 50; t += 100) n += 1;
     if (n > 5) throw new Error(`最多该挡 5 拍（0.5s / 100ms），实际挡了 ${n} 拍`);
+  });
+
+  check('上屏时刻：`shouldMergeShown` 屏上合并（一批出两句时**并成一行**，不是顶掉也不是推迟）', () => {
+    // ## 用户定的规矩（原话）
+    //   「如果句子比较短,且第一句不超排期的话,两句或者多句一起送出可以」
+    //   「注意是最后上字幕一起送出来,**不是说改变识别方式**」
+    //
+    // ⇒ 它是**显示层**的合并：识别结果、`at`、排期一个都不改 ✓
+    //
+    // ## 为什么必须有它（实测）
+    //   `段内切分` 一批出两条，而两条的 `at` 只差几十毫秒：
+    //     `xhsp-seg25-B`：91.092 → 91.013（**−0.079s**，倒退）
+    //     `xhsp-rep1`   ：48.063 → 47.664（−0.399s）· 56.648 → 56.984（+0.336s）
+    //   ⇒ 后一条一到就**顶掉**前一条 ✗；而"让位"只能把它**推迟** 0.5s（那是"晚"✗）
+
+    if (WB.MERGE_SHOWN_MAX_CHARS !== 30) {
+      throw new Error(`合并的字数上限应是 30（屏幕两行），实际 ${WB.MERGE_SHOWN_MAX_CHARS}`);
+    }
+    if (WB.MERGE_SHOWN_MAX_PREV_AGE_MS !== 1500) {
+      throw new Error(`前一条最多在屏上待 1500ms 才允许再并，实际 ${WB.MERGE_SHOWN_MAX_PREV_AGE_MS}`);
+    }
+    const M = WB.shouldMergeShown;
+    const J = WB.joinShownText;
+
+    /** 造一对：默认"都短、都有译文、排期倒退 79ms、前一条刚上屏 100ms" */
+    const prevOf = (o = {}) => ({ at: 91013, original: 'あああ', translation: '啊啊啊', ...o });
+    const nextOf = (o = {}) => ({ at: 91092, original: 'いいい', translation: '咦咦咦', ...o });
+    const base = { prev: prevOf(), next: nextOf(), now: 91200, prevShownAt: 91100 };
+
+    // ① ⭐ 排期撞在一起（**倒退** 79ms）且都短 ⇒ 并
+    //    ⚠️ 倒退是"闪"的**直接来源**（后一条比前一条还早 ✗）—— 它必须能并，否则就是顶掉
+    if (M(base) !== true) {
+      throw new Error('两句排期倒退 79ms、都短 ⇒ 应当合并（否则后一条会把前一条顶掉）');
+    }
+    // ② 前进但只差 336ms（< 0.5s）⇒ 也并（实测里那 4 处"前进但过近"同样会秒顶 ✓）
+    if (M({ ...base, next: nextOf({ at: 91013 + 336 }) }) !== true) {
+      throw new Error('前后只差 336ms（< 0.5s）⇒ 应当合并');
+    }
+
+    // ③ ⭐ **正好 0.5s ⇒ 不并** —— 边界必须是 `<`：0.5s 是"两条正常字幕的最小间隔"，
+    //    那时前一条已经能看清，再并进去就变成"一行塞两句"✗
+    if (M({ ...base, next: nextOf({ at: 91013 + 500 }) }) !== false) {
+      throw new Error('正好相隔 0.5s 时不该合并（那时前一条已经能看清）');
+    }
+    // ④ 相隔 1s ⇒ 不并
+    if (M({ ...base, next: nextOf({ at: 92013 }) }) !== false) {
+      throw new Error('相隔 1s 时不该合并');
+    }
+
+    // ⑤ ⭐ 合计字数超上限 ⇒ 不并（屏幕上就是两行了 ✗）
+    if (
+      M({ ...base, prev: prevOf({ original: 'あ'.repeat(20) }), next: nextOf({ original: 'い'.repeat(11) }) }) !== false
+    ) {
+      throw new Error('两句合计 31 字（> 30）时不该合并 —— 会挡住画面');
+    }
+    // ⑥ 合计正好 30 字 ⇒ 并（边界要能过 ✓）
+    if (
+      M({ ...base, prev: prevOf({ original: 'あ'.repeat(20) }), next: nextOf({ original: 'い'.repeat(10) }) }) !== true
+    ) {
+      throw new Error('两句合计正好 30 字时应当合并');
+    }
+
+    // ⑦ ⭐ **任一条没有译文 ⇒ 不许并** ✗
+    //    否则并进去的半句会**永远显示原文**（译文晚到时只更新它自己那一份，不在屏上 ✗）
+    if (M({ ...base, prev: prevOf({ translation: '' }) }) !== false) {
+      throw new Error('前一条还没译文时不许合并（那半句会永远显示原文）');
+    }
+    if (M({ ...base, next: nextOf({ translation: '' }) }) !== false) {
+      throw new Error('新一条还没译文时不许合并（那半句会永远显示原文）');
+    }
+
+    // ⑧ ⭐ **"第一句不超排期"**：前一条已经在屏上待了 2 秒 ⇒ 不并
+    //    （它是一句正常停留够久的字幕、用户已经读完了；再塞会让屏幕"突然多出半句" ✗）
+    if (M({ ...base, now: 91100 + 2000 }) !== false) {
+      throw new Error('前一条已在屏上 2 秒（> 1.5s）时不许再往里塞');
+    }
+    // ⑨ 正好 1500ms ⇒ 仍可并（边界用 `>`）
+    if (M({ ...base, now: 91100 + 1500 }) !== true) {
+      throw new Error('前一条在屏上正好 1.5s 时应当仍可合并');
+    }
+
+    // ⑩ 脏输入一律**不并**（并了就是把不相干的两句粘在一起 ✗）
+    for (const bad of [
+      { ...base, prev: null },
+      { ...base, next: null },
+      { ...base, prev: prevOf({ at: NaN }) },
+      { ...base, next: nextOf({ at: undefined }) },
+      { ...base, prevShownAt: 0 },
+      { ...base, prevShownAt: null },
+      { ...base, prevShownAt: NaN },
+      { ...base, now: NaN },
+      { ...base, minGap: 0 },
+      { ...base, maxChars: 0 },
+      { ...base, maxPrevAgeMs: 0 },
+      { ...base, next: nextOf({ original: '' }) },
+    ]) {
+      if (M(bad) !== false) {
+        throw new Error(`脏输入 ${JSON.stringify(bad)} 时不许合并`);
+      }
+    }
+
+    // ⑪ `joinShownText`：空值安全 + **一个字都不许丢** ✓
+    if (J('あ', 'い') !== 'あ い') throw new Error('joinShownText 应用一个空格接起来');
+    if (J('', 'い') !== 'い') throw new Error('前一半为空时应原样返回后一半');
+    if (J('あ', '') !== 'あ') throw new Error('后一半为空时应原样返回前一半');
+    if (J('あ', undefined) !== 'あ') throw new Error('undefined 应被当成空');
+    if (J(null, 'い') !== 'い') throw new Error('null 应被当成空');
+    const j = J('あああ', 'いいい');
+    if (!j.includes('あああ') || !j.includes('いいい')) {
+      throw new Error('joinShownText 把某一半弄丢了');
+    }
+
+    // ⑫ ⭐ 接线反证：`player.js` 里必须**真的调**它，而且**排在"让位"之前** ✗
+    //    （顺序反了 ⇒ 先被让位挡下 ⇒ 永远走不到合并；那两条就又变成"分别推送"✗）
+    const playerSrc = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
+    const iMerge = playerSrc.indexOf('shouldMergeShown({');
+    const iHold = playerSrc.indexOf('holdSwitchForGap({');
+    if (iMerge < 0) throw new Error('player.js 没有调用 shouldMergeShown —— 合并闸没接线');
+    if (iHold < 0) throw new Error('player.js 没有调用 holdSwitchForGap —— 让位闸没接线');
+    if (iMerge > iHold) {
+      throw new Error('合并闸排在让位闸**之后** —— 那两条会先被让位挡下，永远走不到合并');
+    }
+    /**
+     * ⚠️ **不许"接线了但被关掉"** ✗ —— `if (false && holdEnabled) { … }` 里那句调用
+     *    文本上还在、`indexOf` 也找得到，可它**永远不执行** ⇒ 必须钉住**分支窗口**里的事实 ✓
+     *    （本轮变异 M6 就是这么全绿的 ✓）
+     *
+     * ⚠️ 这里**不要**去正则匹配那句 `/**` 注释 ✗ —— `stripComments` 会先把注释删掉
+     *    ⇒ 正则必然落空、断言在**正确代码上**先红（第一版就是这么红的 ✓）。
+     *    ⇒ 判据只用"删掉注释后仍在的代码事实"（调用在不在这个分支里、守卫有没有被 `false &&` 短路）✓
+     */
+    const branchWin = playerSrc.slice(Math.max(0, iMerge - 1600));
+    const branchMatch = branchWin.match(/if \(holdEnabled\) \{[\s\S]*?\n    \}/);
+    if (!branchMatch) {
+      throw new Error('找不到 `if (holdEnabled) { … }` 那个合并分支 —— 结构变了，请重看这段断言');
+    }
+    const mergeBlock = branchMatch[0];
+    if (!mergeBlock.includes('shouldMergeShown({')) {
+      throw new Error('`shouldMergeShown({` 的调用不在 `if (holdEnabled) {` 块里 —— 它可能被挪到别处了');
+    }
+    if (/if \(false/.test(mergeBlock)) {
+      throw new Error('合并闸被短路了（`if (false && …)`）—— 接线了却永不执行');
+    }
+    // ⑬ ⭐ 合并分支必须 `continue` —— 否则它还会往下走、push 进 `history` ⇒ 又变成两行 ✗
+    //
+    // ⚠️ 分支窗口**必须按花括号结构截** ✗ —— 踩过两次：
+    //    ① 截固定 2400 字 ⇒ 把下面正常的 `rendered.set` / `history.push` 也算进来 ⇒
+    //       断言自己先红（而代码是对的 ✗）
+    //    ② 用"下一个 `continue;`"当终点 ⇒ 文件后面**还有别的 `continue;`**（别的循环），
+    //       于是窗口延伸到 `history.push` 之后 ⇒ 报错报在**错的那条**上 ✗
+    //    ⇒ 正确做法：`if (holdEnabled) {` 开头 + 第一个 **4 空格缩进的 `}`** 收尾（= 这个 if 的右括号）✓
+    if (!/\bcontinue;/.test(mergeBlock)) {
+      throw new Error('合并分支里没有 continue —— 它会继续 push history，又变成两行');
+    }
+    if (/history\.push\(/.test(mergeBlock)) {
+      throw new Error('合并分支里不许 push history（那就是"分别推送"✗）');
+    }
+    // ⑭ ⭐ 合并**不许改排期值**（`at` 一个都不许动 ——「比排期晚」必须仍然诚实 ✗）
+    if (/\.at\s*=/.test(mergeBlock)) {
+      throw new Error('合并分支里改了 `at` —— 排期值不许被显示层动，否则「比排期晚」就是假话');
+    }
   });
 }
 

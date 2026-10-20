@@ -33,6 +33,7 @@ import { buildWhisperPrompt } from '../lib/asr/vad.js';
 //    和 `shownStartOf` / `clampShownAt` 是同一族，放在同一个模块里 ✓
 import {
   holdSwitchForGap,
+  minShowHoldMs,
   MIN_SHOW_HOLD_MS,
   MIN_SHOW_GAP_SEC,
   shouldMergeShown,
@@ -2312,7 +2313,32 @@ function pumpSubtitles() {
      * ⚠️ **只对新路启用** —— 旧路的时机用户认可，动它就是回归 ✗
      * ⚠️ **不改排期值** ⇒「比排期晚」仍然诚实；让位出去的时间单独印出来 ✗
      */
-    if (holdSwitchForGap({ now, lastSwitchAt: lastShowSwitchAt, enabled: holdEnabled })) {
+    /**
+     * ⭐ **每条「待够再换」** ✗ —— 而不是固定 0.5 秒。
+     *
+     * 实测（用户报 "5 秒内两句连跳 / 句子还是短,还是很快被顶下去"）:
+     *   · 7/56 条**在屏时长 < 它自己的跨度**（还没说完就被换 ✗）
+     *   · 阅读速度 **20~210 字/秒**（正常 5~8 ✗）—— 例:`21 字 / 2s` 在 0.1s 后被换 ✗
+     *
+     * ⇒ 每条的最小在屏时长按它**自己**算（`minShowHoldMs`）：
+     *   ① 还没说完的部分 ② 读完它要多久 ③ 0.6 秒下限 ✓
+     * ⚠️ 只在**新路**算；旧路仍用 `MIN_SHOW_HOLD_MS`（时机用户认可，动它就是回归 ✗）
+     * ⚠️ 不改 `at` ⇒「比排期晚」仍然诚实 ✓
+     */
+    let minHoldMs = MIN_SHOW_HOLD_MS;
+    if (holdEnabled && history.length) {
+      const onScreen = rendered.get(history[history.length - 1]);
+      if (onScreen) {
+        const onStart = Number(onScreen.start);
+        const onEnd = Number(onScreen.end);
+        minHoldMs = minShowHoldMs({
+          chars: String(onScreen.original || '').length,
+          spanSec: Number.isFinite(onStart) && Number.isFinite(onEnd) ? onEnd - onStart : 0,
+          elapsedMs: lastShowSwitchAt > 0 ? now - lastShowSwitchAt : 0,
+        });
+      }
+    }
+    if (holdSwitchForGap({ now, lastSwitchAt: lastShowSwitchAt, minHoldMs, enabled: holdEnabled })) {
       // 记在**这一条**头上：它到点上屏却被让位，诊断里要看得见这多少毫秒 ✗
       if (!item.heldSince) item.heldSince = now;
       showHeldCount += 1;
