@@ -9700,20 +9700,125 @@ check('Whisper 分段决策：`sanitizeSegments` 按 start 升序，并保留额
   if (WSEG.sanitizeSegments('nope').length !== 0) throw new Error('非数组应返回空数组');
 });
 
-check('Whisper 分段决策：`reason` 只是这五种，且都是小写连字符（以后 delayed-player 要 switch 它）', () => {
+check('Whisper 分段决策：`reason` 只是这六种，且都是小写连字符（以后 delayed-player 要 switch 它）', () => {
   const R = WSEG.DECIDE_REASONS;
   const vals = Object.values(R);
-  if (vals.length !== 5) throw new Error(`reason 有 ${vals.length} 种：${vals.join(',')}`);
+  if (vals.length !== 6) throw new Error(`reason 有 ${vals.length} 种：${vals.join(',')}`);
   for (const v of vals) {
     if (typeof v !== 'string' || !/^[a-z]+(-[a-z]+)*$/.test(v)) throw new Error(`reason「${v}」不是小写连字符格式`);
   }
   if (!Object.isFrozen(R)) throw new Error('DECIDE_REASONS 必须被冻结（不许运行时被改）');
-  // 五个取值互不相同
-  if (new Set(vals).size !== 5) throw new Error('reason 有重复值');
+  // 六个取值互不相同
+  if (new Set(vals).size !== 6) throw new Error('reason 有重复值');
   // ⚠️ EMPTY_ONLY 和 NO_SEGMENTS 的语义必须分开 ✗：
   //    NO_SEGMENTS = 别推进（原样返回 from）· EMPTY_ONLY = 要推进（跳过空段）
   //    搞混的话静音段会让推进点卡住，整条链停在那儿
   if (!R.EMPTY_ONLY || R.EMPTY_ONLY === R.NO_SEGMENTS) throw new Error('EMPTY_ONLY 和 NO_SEGMENTS 必须是两个不同的值');
+  // ⚠️ TEXT_UNTRUSTED 和 TAIL_UNCONFIRMED 也必须分开 ✗：
+  //    TAIL_UNCONFIRMED = 那句还在说（没静音）· TEXT_UNTRUSTED = 说完了而文本是垃圾（幻觉）
+  //    对 delayed-player 来说前者该"等",后者该"丢"—— 混成一个就没法区分
+  if (!R.TEXT_UNTRUSTED || R.TEXT_UNTRUSTED === R.TAIL_UNCONFIRMED) {
+    throw new Error('TEXT_UNTRUSTED 和 TAIL_UNCONFIRMED 必须是两个不同的值');
+  }
+});
+
+// ⭐ `isTextTrustworthy`（幻觉判据的注入点）—— 六种情形
+check('Whisper 分段决策：`isTextTrustworthy` 不传时行为与加它之前一致', () => {
+  const segs = [
+    { start: 0, end: 2, text: 'あ' },
+    { start: 2, end: 4, text: 'い' },
+  ];
+  const r = WSEG.decideAdvance(segs, { hasSilenceAfter: () => true });
+  if (r.reason !== WSEG.DECIDE_REASONS.ALL_ACCEPTED || r.nextStart !== 4 || r.accepted.length !== 2) {
+    throw new Error(`不传 trust 时结果变了：${JSON.stringify(r)}`);
+  }
+  // force 分支在不传 trust 时仍采纳全部 usable（包括"文本看着像幻觉"的）
+  const weird = [{ start: 0, end: 0.2, text: 'これは十三文字の hallucination' }];
+  const rf = WSEG.decideAdvance(weird, { hasSilenceAfter: () => false, force: true });
+  if (rf.reason !== WSEG.DECIDE_REASONS.FORCE_ACCEPTED || rf.accepted.length !== 1) {
+    throw new Error(`不传 trust 时 force 行为变了：${JSON.stringify(rf)}`);
+  }
+});
+
+check('Whisper 分段决策：`isTextTrustworthy` 返回 false 在中间 → 前面的采纳、从它起停住', () => {
+  const segs = [
+    { start: 0, end: 2, text: 'あ' },
+    { start: 2, end: 4, text: 'い' },
+    { start: 4, end: 6, text: 'う' },
+  ];
+  const r = WSEG.decideAdvance(segs, {
+    hasSilenceAfter: () => true,
+    isTextTrustworthy: (s) => s.text !== 'い',
+  });
+  if (r.reason !== WSEG.DECIDE_REASONS.TEXT_UNTRUSTED) throw new Error(`reason = ${r.reason}`);
+  if (r.accepted.length !== 1 || r.accepted[0].text !== 'あ') throw new Error(`accepted = ${JSON.stringify(r.accepted)}`);
+  if (r.nextStart !== 2) throw new Error(`nextStart = ${r.nextStart}（该是 2，即那段的 start）`);
+  if (!r.pending || r.pending.text !== 'い') throw new Error(`pending = ${JSON.stringify(r.pending)}`);
+});
+
+check('Whisper 分段决策：`isTextTrustworthy` 第一段就 false → 一个都不采纳', () => {
+  const segs = [{ start: 1, end: 3, text: 'あ' }, { start: 3, end: 5, text: 'い' }];
+  const r = WSEG.decideAdvance(segs, { hasSilenceAfter: () => true, isTextTrustworthy: () => false });
+  if (r.reason !== WSEG.DECIDE_REASONS.TEXT_UNTRUSTED || r.accepted.length !== 0) {
+    throw new Error(`reason=${r.reason} accepted=${r.accepted.length}`);
+  }
+  if (r.nextStart !== 1) throw new Error(`nextStart = ${r.nextStart}（该是 1）`);
+});
+
+check('Whisper 分段决策：`isTextTrustworthy` 优先于静音判据（同时命中时 reason 是 text-untrusted）', () => {
+  const segs = [{ start: 0, end: 2, text: 'あ' }];
+  const r = WSEG.decideAdvance(segs, {
+    hasSilenceAfter: () => false, // 也没静音
+    isTextTrustworthy: () => false, // 也不可信
+  });
+  if (r.reason !== WSEG.DECIDE_REASONS.TEXT_UNTRUSTED) throw new Error(`reason = ${r.reason}（trust 该优先）`);
+});
+
+check('Whisper 分段决策：`isTextTrustworthy` 只认 `=== false`，其余都当可信', () => {
+  const segs = [{ start: 0, end: 2, text: 'あ' }];
+  for (const ret of [undefined, null, 0, '', 'yes', 1, {}, []]) {
+    const r = WSEG.decideAdvance(segs, { hasSilenceAfter: () => true, isTextTrustworthy: () => ret });
+    if (r.reason !== WSEG.DECIDE_REASONS.ALL_ACCEPTED) {
+      throw new Error(`返回 ${JSON.stringify(ret)} 时被当成不可信了：reason = ${r.reason}`);
+    }
+  }
+});
+
+check('Whisper 分段决策：`isTextTrustworthy` 抛异常 → 当不可信（保守，不上屏）', () => {
+  const segs = [{ start: 0, end: 2, text: 'あ' }];
+  const r = WSEG.decideAdvance(segs, {
+    hasSilenceAfter: () => true,
+    isTextTrustworthy: () => { throw new Error('boom'); },
+  });
+  if (r.reason !== WSEG.DECIDE_REASONS.TEXT_UNTRUSTED || r.accepted.length !== 0) {
+    throw new Error(`抛异常时 reason=${r.reason} accepted=${r.accepted.length}`);
+  }
+});
+
+check('Whisper 分段决策：force 时也只采纳可信段；全不可信时 nextStart 仍要前进（不许卡死）', () => {
+  const segs = [
+    { start: 0, end: 2, text: 'あ' },
+    { start: 2, end: 4, text: 'い' },
+  ];
+  // 部分不可信 → 只采纳 あ
+  const r1 = WSEG.decideAdvance(segs, {
+    hasSilenceAfter: () => false,
+    force: true,
+    isTextTrustworthy: (s) => s.text === 'あ',
+  });
+  if (r1.reason !== WSEG.DECIDE_REASONS.FORCE_ACCEPTED) throw new Error(`部分可信时 reason = ${r1.reason}`);
+  if (r1.accepted.length !== 1 || r1.accepted[0].text !== 'あ') throw new Error(`accepted = ${JSON.stringify(r1.accepted)}`);
+  if (r1.nextStart !== 2) throw new Error(`nextStart = ${r1.nextStart}（该是 2）`);
+
+  // 全不可信 → 一个都不上屏，而 nextStart 必须前进到最后一个 usable 的 end
+  const r2 = WSEG.decideAdvance(segs, {
+    hasSilenceAfter: () => false,
+    force: true,
+    isTextTrustworthy: () => false,
+  });
+  if (r2.reason !== WSEG.DECIDE_REASONS.TEXT_UNTRUSTED) throw new Error(`全不可信时 reason = ${r2.reason}`);
+  if (r2.accepted.length !== 0) throw new Error(`全不可信却采纳了 ${r2.accepted.length} 段`);
+  if (r2.nextStart !== 4) throw new Error(`nextStart = ${r2.nextStart}（该是 4 —— 否则整条链卡死）`);
 });
 
 // ── 用户追加的三条边界（①空段 ②前空后有声 ③幻觉）────────────────────────────
