@@ -9583,7 +9583,7 @@ check('Whisper 分段决策：兜底 force + 一段都没确认 → 采纳到**�
   if (r.nextStart !== 8) throw new Error(`nextStart = ${r.nextStart}（应为最后一段的 end = 8）`);
 });
 
-check('Whisper 分段决策：force 但**已经确认过一段** → 不许硬推没确认的尾巴 ✗', () => {
+check('Whisper 分段决策：force 但**已经确认过一段** → 不许硬推没确认的尾巴（否则半句上屏）', () => {
   // 这一条是"兜底别过头"的守门：只要有进展，就不该把半句推上屏
   const r = WSEG.decideAdvance([wseg(0, 4, 'A'), wseg(4, 8, 'B')], { hasSilenceAfter: (t) => t < 5, force: true, from: 0 });
   if (r.reason !== WSEG.DECIDE_REASONS.TAIL_UNCONFIRMED) throw new Error(`reason = ${r.reason}（不该是 force-accepted）`);
@@ -9675,16 +9675,91 @@ check('Whisper 分段决策：`sanitizeSegments` 按 start 升序，并保留额
   if (WSEG.sanitizeSegments('nope').length !== 0) throw new Error('非数组应返回空数组');
 });
 
-check('Whisper 分段决策：`reason` 只是这四种，且都是小写连字符（以后 delayed-player 要 switch 它）', () => {
+check('Whisper 分段决策：`reason` 只是这五种，且都是小写连字符（以后 delayed-player 要 switch 它）', () => {
   const R = WSEG.DECIDE_REASONS;
   const vals = Object.values(R);
-  if (vals.length !== 4) throw new Error(`reason 有 ${vals.length} 种：${vals.join(',')}`);
+  if (vals.length !== 5) throw new Error(`reason 有 ${vals.length} 种：${vals.join(',')}`);
   for (const v of vals) {
     if (typeof v !== 'string' || !/^[a-z]+(-[a-z]+)*$/.test(v)) throw new Error(`reason「${v}」不是小写连字符格式`);
   }
   if (!Object.isFrozen(R)) throw new Error('DECIDE_REASONS 必须被冻结（不许运行时被改）');
-  // 四个取值互不相同
-  if (new Set(vals).size !== 4) throw new Error('reason 有重复值');
+  // 五个取值互不相同
+  if (new Set(vals).size !== 5) throw new Error('reason 有重复值');
+  // ⚠️ EMPTY_ONLY 和 NO_SEGMENTS 的语义必须分开 ✗：
+  //    NO_SEGMENTS = 别推进（原样返回 from）· EMPTY_ONLY = 要推进（跳过空段）
+  //    搞混的话静音段会让推进点卡住，整条链停在那儿
+  if (!R.EMPTY_ONLY || R.EMPTY_ONLY === R.NO_SEGMENTS) throw new Error('EMPTY_ONLY 和 NO_SEGMENTS 必须是两个不同的值');
+});
+
+// ── 用户追加的三条边界（①空段 ②前空后有声 ③幻觉）────────────────────────────
+// ⚠️ ③（幻觉：字数/时长不合理、极短尾巴）这一轮**没做** —— 那两条判据现在在
+//    createSession 的闭包里，要抽成纯函数才能复用，属于下一步。见提交信息。
+
+check('Whisper 分段决策：整批都没语音（text 空）→ **跳过并推进**，nextStart 不许卡住', () => {
+  // ⚠️ 这是"整段空的"那条边界的要害：空段不是"没确认"（stall），而是"跳过"。
+  //    若当成没确认，nextStart 会停在 0 不动 ⇒ 整条链停在那儿 ✗
+  const r = WSEG.decideAdvance([wseg(0, 2, ''), wseg(2, 4, '   ')], { hasSilenceAfter: () => true, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.EMPTY_ONLY) throw new Error(`reason = ${r.reason}`);
+  if (r.accepted.length !== 0) throw new Error(`空文本不该上屏（accepted = ${r.accepted.length}）`);
+  if (r.nextStart !== 4) throw new Error(`nextStart = ${r.nextStart}（应前进到最后一个空段的 end = 4，不许卡在 0）`);
+  if (r.speechless !== 2) throw new Error(`speechless = ${r.speechless}（应为 2）`);
+});
+
+check('Whisper 分段决策：空段 + 有声段混着 → **只采纳有声的**，空段被跳过', () => {
+  const r = WSEG.decideAdvance([wseg(0, 2, ''), wseg(2, 6, 'A')], { hasSilenceAfter: () => true, from: 0 });
+  if (r.accepted.length !== 1 || r.accepted[0].text !== 'A') throw new Error(`accepted = ${JSON.stringify(r.accepted)}`);
+  if (r.nextStart !== 6) throw new Error(`nextStart = ${r.nextStart}（应为 6）`);
+  if (r.speechless !== 1) throw new Error(`speechless = ${r.speechless}`);
+});
+
+check('Whisper 分段决策：极短段（< 0.1 秒）也算"没语音" —— 它装不下一个完整音节', () => {
+  const r = WSEG.decideAdvance([wseg(0, 0.05, 'x')], { hasSilenceAfter: () => true, from: 0 });
+  if (r.reason !== WSEG.DECIDE_REASONS.EMPTY_ONLY) throw new Error(`reason = ${r.reason}（0.05 秒的段该被跳过）`);
+  if (r.nextStart !== 0.05) throw new Error(`nextStart = ${r.nextStart}`);
+  // 边界：0.1 秒不算"极短"（严格小于）⇒ 它走正常确认流程
+  const r2 = WSEG.decideAdvance([wseg(0, 0.1, 'x')], { hasSilenceAfter: () => true, from: 0 });
+  if (r2.reason !== WSEG.DECIDE_REASONS.ALL_ACCEPTED) throw new Error(`0.1 秒的段被误判成"没语音"了（reason = ${r2.reason}）`);
+});
+
+check('Whisper 分段决策：**前空后有声**（`start > 0` 且没确认）→ 前面的空被切掉，那段进 pending 当小尾巴', () => {
+  // ⭐ 这条就是用户说的"前面空后面有语音"：Whisper 给的 start > 0
+  //    ⇒ 从 nextStart 到 start 那段没有语音 ⇒ 跳过；[start,end] 是"小尾巴"，留着下一批一起
+  const r = WSEG.decideAdvance([wseg(3, 7, 'A')], { hasSilenceAfter: () => false, from: 0 });
+  if (r.nextStart !== 3) throw new Error(`nextStart = ${r.nextStart}（应为 3 = 小尾巴的 start，前面的空被切掉）`);
+  if (!r.pending || r.pending.start !== 3 || r.pending.end !== 7) throw new Error(`pending = ${JSON.stringify(r.pending)}`);
+  if (r.accepted.length !== 0) throw new Error('小尾巴不该单独上屏');
+  // 而若它确认了，就该采纳、nextStart = end
+  const r2 = WSEG.decideAdvance([wseg(3, 7, 'A')], { hasSilenceAfter: () => true, from: 0 });
+  if (r2.accepted.length !== 1 || r2.nextStart !== 7) throw new Error(`确认后应采纳且 nextStart=7，实得 ${r2.nextStart}`);
+});
+
+check('Whisper 分段决策：兜底 `force` 也**不许**把空文本（没语音）推上屏', () => {
+  // force 原本采纳 `list`，会把空段一起推上去 ✗ —— 必须是 `usable`
+  const r = WSEG.decideAdvance([wseg(0, 2, ''), wseg(2, 6, 'A')], {
+    hasSilenceAfter: () => false,
+    force: true,
+    from: 0,
+  });
+  if (r.reason !== WSEG.DECIDE_REASONS.FORCE_ACCEPTED) throw new Error(`reason = ${r.reason}`);
+  if (r.accepted.length !== 1) throw new Error(`accepted = ${r.accepted.length}（只该有那一段有声的）`);
+  if (r.accepted.some((s) => !s.text.trim())) throw new Error('空文本被推上屏了 ✗');
+  if (r.nextStart !== 6) throw new Error(`nextStart = ${r.nextStart}`);
+});
+
+check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / 有字 / 短段 / null）', () => {
+  const I = WSEG.isSpeechless;
+  const cases = [
+    [wseg(0, 2, ''), true, '空字符串'],
+    [wseg(0, 2, '   '), true, '全空白'],
+    [wseg(0, 2, 'A'), false, '有字'],
+    [wseg(0, 0.05, 'A'), true, '0.05 秒'],
+    [wseg(0, 0.1, 'A'), false, '0.1 秒（边界，不算极短）'],
+    [null, true, 'null'],
+    [{ start: 0, end: 2 }, true, '没有 text 字段'],
+  ];
+  for (const [input, want, label] of cases) {
+    if (I(input) !== want) throw new Error(`${label} → ${I(input)}，应为 ${want}`);
+  }
 });
 
 console.log(`\n${failures === 0 ? '全部通过 ✅' : `失败 ${failures} 项 ❌`}\n`);
