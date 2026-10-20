@@ -2316,9 +2316,14 @@ function pumpSubtitles() {
       showHeldCount += 1;
       schedule.items.unshift(...dueItems);
       pumpLater();
-;
+      return;
     }
     const item = batch[0];
+    /**
+     * 🔴 **给这一批每一条都打上"已消费"标记** ✗ —— 幂等保护 ✓
+     * `pickShownBatch` 会滤掉带 `shownAt` 的条目，防止同一条被反复 flush ✓
+     */
+    for (const b of batch) b.shownAt = now;
     if (batch.length > 1) {
       const merged = mergeShownBatch(batch);
       if (merged) {
@@ -2349,7 +2354,7 @@ function pumpSubtitles() {
     if (rest.length) schedule.items.unshift(...rest);
     renderSubs();
     pumpLater();
-;
+    return;
   }
 
   for (let di = 0; di < dueItems.length; di += 1) {
