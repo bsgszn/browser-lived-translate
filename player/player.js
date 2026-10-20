@@ -598,7 +598,24 @@ async function saveAudioAndLog() {
      *  → 一个没被印出来的配置，错了就没人能一眼看出来。 */
     ` · 识别语言 ${cfg(() => sv()?.asr?.language)}` +
     ` · 翻译 ${cfg(() => sv()?.translation?.provider)}` +
-    ` · 目标延迟 ${cfg(() => sv()?.capture?.delaySec)}s` +
+    /**
+     * ⚠️ **必须印生效值，而不是设定值** —— 两处会不一致，而那个不一致害过一次 ✗
+     *
+     * 用户选了「本地 Whisper 自断句」（`provider === 'vad-segments'`）：
+     * 设置页与滑块显示 `effectiveDelaySec()` = **10 秒** ✓
+     * 而 storage 里 `capture.delaySec` 仍是 **7.1** ✓（那是用户自己的旧值，切回别的服务时要用 ✓）
+     * ⇒ 只印裸值就会出现「**UI 说 10、日志说 7.1**」✗ —— 而看到日志的人会以为新模式没生效，
+     *    于是往"新路没接上"那个方向查了整整一轮（实测踩过 ✗）。
+     *
+     * ⇒ 印生效值；**两个不一致时把设定值也带上** ✓ —— 那本身就是要能一眼看出来的信息。
+     */
+    ` · 目标延迟 ${cfg(() => {
+      const eff = effectiveDelaySec(sv());
+      const raw = Number(sv()?.capture?.delaySec);
+      return Number.isFinite(raw) && Math.abs(raw - eff) > 1e-6
+        ? `${eff}（设定 ${raw}）`
+        : eff;
+    })}s` +
     ` · 帧率上限 ${cfg(() => sv()?.capture?.maxFrameRate)}\n` +
     `  VAD 阈值 ${cfg(() => sv()?.asr?.vad?.vadThreshold)}` +
     ` · 静音确认 ${cfg(() => sv()?.asr?.vad?.vadMinSilenceMs)}ms` +
@@ -1657,6 +1674,21 @@ function scheduleUtterance(u) {
   if (subLog.length > SUBLOG_KEEP) subLog.shift();
   diag(
     `整句上屏 · ${whenText} · ${text.length} 字 · ${u.reason}` +
+      /**
+       * ⚠️ **`切` 必须印** —— 它是**唯一**能一眼分出「这条字幕是哪条路收的」的字段 ✗
+       *
+       * `u.reason` 是「累积器为什么收句」（`utterance-end` / `max-span` / `max-chars` …），
+       * **两条路都会给它** ⇒ 光看它分不出新旧路 ✗
+       * 而 `u.cut` 是「这段音频**怎么被切出来的**」：
+       *   · 旧路 → `lib/asr/vad.js:2710` 的 `reason`（`utterance-end` / `max-length` / …）
+       *   · 新路 → `vad.js:3212` 固定写 `'whisper-segment'` ✓
+       *
+       * 实测踩过：用户选了新模式，而日志里 `新断句` 一条都没有 ——
+       * 于是查了一整轮"新路为什么没跑"✗，而我**没有任何一条日志能证明它跑了没有** ✗
+       * （`新断句 · 批 N` 是 `status` 事件，只保留最后一条；`累积 1 片` 两条路都有）
+       * ⇒ 印出 `cut` 之后，这类问题一眼就能判 ✓
+       */
+      ` · 切 ${u.cut || '?'}` +
       ` · 累积 ${fmtNum(u.parts, 0, ' 片')} · 跨度 ${fmtNum(u.duration, 1, 's')}` +
       ` · 识别滞后 ${asrLagSec.toFixed(1)}s${overBudget ? ` ⚠ 超过延迟预算 ${delayForDiagSec}s` : ''}` +
       devText,
