@@ -22,7 +22,7 @@ import { PcmRing, encodeWav } from '../lib/pcm-ring.js';
 import { createRefiner } from '../lib/asr/refine.js';
 // 诊断日志的追加与窗口切片收在 lib/diag-window.js —— 页面脚本在 smoke-test 里加载不了，
 // 而「两个数组必须等长」和「窗口边界取 >=」这两条行为需要断言守住。
-import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote } from '../lib/diag-window.js';
+import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote, formatAtStamp } from '../lib/diag-window.js';
 // ⚠️ 为了让「这次识别到底带了多长的提示词」能印出来，必须拿到**算提示词的那个函数本身** ——
 //    在 player.js 里另写一份合并逻辑就是"同一事实记两遍"，迟早和它不一致 ✗。
 //    `lib/asr/vad.js` 早已在模块图里（`lib/asr/index.js` 顶层 import 了它），
@@ -1606,6 +1606,15 @@ function scheduleUtterance(u) {
   const item = schedule.items[schedule.items.length - 1];
   if (item) {
     item.arrivedAt = Date.now();
+    /**
+     * ⭐ 把「推入排期那一刻的 `at`」原样存一份 —— 诊断要用它判「排期有没有被挪过」。
+     *
+     * ⚠️ `item.at` 会被 `resync()` **每拍重算**（延迟一变就整体平移，见
+     *    `lib/delayed-player.js` 的 `resync`）。而"上屏时机乱"要查的正是
+     *    「排期在排队期间动没动、动了多少」✗ —— 所以**必须**留一个推入时的快照，
+     *    否则到上屏那一刻只能看到最终值，中间挪了几次、挪了多少全都看不见 ✗。
+     */
+    item.atPush = at;
     segs.push(item);
     if (segs.length > 40) segs.shift();
   }
@@ -1619,8 +1628,27 @@ function scheduleUtterance(u) {
    * ⚠️ 这里踩过：直接印 `${x}s 后`，于是日志里出现「**-2.3s 后**」这种自相矛盾的行
    * （用户实测）。负号的含义是"已经迟了"，不是"还要等负 2.3 秒"。
    */
-  const remainSec = (at - Date.now()) / 1000;
+  /**
+   * ⚠️ 两套时钟**成对**取一次，别各取各的。
+   *
+   * `at` 是 `Date.now()` 口径（epoch ms），而诊断行前缀是 `performance.now()` 口径
+   * ⇒ 要印一个能对账的绝对时刻，就必须同时拿到"此刻"的两个读数（见 `formatAtStamp`）。
+   * 这里成对取一次，下面的倒计时和 `at=` 用的是**同一对**，所以两格一定自洽。
+   */
+  const nowEpoch = Date.now();
+  const nowPerf = performance.now();
+  const remainSec = (at - nowEpoch) / 1000;
   const whenText = remainSec >= 0 ? `${remainSec.toFixed(1)}s 后` : `已迟 ${(-remainSec).toFixed(1)}s`;
+  /**
+   * ⭐ 把排期时刻**本身**印出来（绝对刻度，可和行前缀直接对账）。
+   *
+   * ⚠️ 此前这一行只印倒计时 ✗ —— 于是对账要拿 `at − now` 反推 `at`，
+   *    而那跨了 `Date.now()` / `performance.now()` 两个基准 ⇒ 永远对不上 ✗
+   *    （实测 8 条里 1 条对得上，其余差 0.19~1.45 秒，那个差里混着基准误差。）
+   * ⇒ 现在两行都印 `at=`：**印了同一个数，才谈得上"上屏时机乱"到底乱在哪** ✓
+   */
+  const atStamp = formatAtStamp({ at, atPush: at, now: nowEpoch, perfNow: nowPerf, t0: DIAG_T0 });
+  const atNote = atStamp ? `${atStamp} · ` : '';
   /**
    * 识别滞后 = 延迟预算 + 已经迟掉的部分。
    *
@@ -1673,7 +1701,8 @@ function scheduleUtterance(u) {
   subLog.push({ t: performance.now(), id, asr: String(text || ''), shown: null });
   if (subLog.length > SUBLOG_KEEP) subLog.shift();
   diag(
-    `整句上屏 · ${whenText} · ${text.length} 字 · ${u.reason}` +
+    // ⚠️ `at=` 放最前面（紧跟行前缀），因为它和行前缀同刻度 ⇒ 一眼就能算出差多少
+    `整句上屏 · ${atNote}${whenText} · ${text.length} 字 · ${u.reason}` +
       /**
        * ⚠️ **`切` 必须印** —— 它是**唯一**能一眼分出「这条字幕是哪条路收的」的字段 ✗
        *
@@ -2258,8 +2287,24 @@ function diagLate(item, now) {
       if (subLog.length > SUBLOG_KEEP) subLog.shift();
     }
   }
+  /**
+   * ⭐ 这里印的是**同一个** `at`（当前值），并把它和推入时的快照比一次。
+   *
+   * ⚠️ `item.at` 会被 `resync()` 每拍重算 —— 所以"排期时刻"在排队期间**会变** ✗。
+   *    这里若和推入时不同就明写 `排期被挪 ±X.XXs`，而不是悄悄用新值算 `比排期晚` ✗
+   *    （`lateMs` 一直用当前值，那是"真的晚了多少"，对 ✓）。
+   * ⇒ 和「整句上屏」那行的 `at=` 一对比，就能判出"上屏时机乱"是不是排期在动造成的 ✓
+   */
+  const atStamp = formatAtStamp({
+    at: item.at,
+    atPush: item.atPush,
+    now,
+    perfNow: performance.now(),
+    t0: DIAG_T0,
+  });
+  const atNote = atStamp ? `${atStamp} · ` : '';
   diag(
-    `字幕上屏 · 比排期晚 ${(lateMs / 1000).toFixed(2)}s · 这句说了 ${(saidMs / 1000).toFixed(1)}s${inside ? ' · 仍在句内' : ''}`,
+    `字幕上屏 · ${atNote}比排期晚 ${(lateMs / 1000).toFixed(2)}s · 这句说了 ${(saidMs / 1000).toFixed(1)}s${inside ? ' · 仍在句内' : ''}`,
     // 晚得还在句内 = 观感可接受，不用报警
     !inside,
   );

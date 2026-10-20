@@ -22,12 +22,51 @@ const fs = require('fs');
 const path = require('path');
 
 const PLAYER = path.join(__dirname, '..', 'player', 'player.js');
+const DIAGWIN = path.join(__dirname, '..', 'lib', 'diag-window.js');
 
-/** 从源码里抽出 `function <name>(...) { ... }` 的完整文本（花括号配对） */
+/**
+ * 从**真源码**里抽出 `lib/diag-window.js` 的 `formatAtStamp`（纯函数，无依赖）。
+ *
+ * ⚠️ 为什么不在这个工具里抄一份：那正是本项目栽过多次的"两份实现只改一份" ✗。
+ *    而这个函数没有 import、只用 `Number` / `Math` / `typeof`，所以抽出来就能直接跑 ✓。
+ *    （和下面抽 `scheduleUtterance` 是同一套做法。）
+ */
+function realFormatAtStamp() {
+  const src = fs.readFileSync(DIAGWIN, 'utf8');
+  const fnSrc = extractFn(src, 'formatAtStamp');
+  return new Function(`${fnSrc}; return formatAtStamp;`)();
+}
+
+/** 从源码里抽出 `function <name>(...) { ... }` 的完整文本（参数表按括号配对跳过，函数体按花括号配对） */
 function extractFn(src, name) {
   const start = src.indexOf(`function ${name}(`);
   if (start < 0) throw new Error(`源码里找不到 function ${name}`);
-  const open = src.indexOf('{', start);
+  /**
+   * ⚠️ 先跳过**参数表**，再找函数体开括号 —— 否则参数默认值里的 `{}` 会被当成函数体 ✗
+   *
+   * 实测踩到：`formatAtStamp(o = {})` 的第一条 `{` 就在参数默认值里，
+   * 于是花括号配对当场归零，抽出来是 `function formatAtStamp(o = {` 这半句，
+   * 下游 `new Function` 直接报 `SyntaxError: Unexpected token ';'` ✗
+   * —— 和本项目反复栽的"朴素锚点"是同一族（`indexOf` 取到**调用点**而不是定义、
+   *    `slice` 固定长度够不到判据）。
+   */
+  const parenOpen = src.indexOf('(', start);
+  if (parenOpen < 0) throw new Error(`${name} 没有参数表`);
+  let pdepth = 0;
+  let parenClose = -1;
+  for (let i = parenOpen; i < src.length; i++) {
+    const c = src[i];
+    if (c === '(') pdepth++;
+    else if (c === ')') {
+      pdepth--;
+      if (pdepth === 0) {
+        parenClose = i;
+        break;
+      }
+    }
+  }
+  if (parenClose < 0) throw new Error(`${name} 的参数表括号不配对`);
+  const open = src.indexOf('{', parenClose);
   if (open < 0) throw new Error(`${name} 没有函数体`);
   let depth = 0;
   for (let i = open; i < src.length; i++) {
@@ -115,6 +154,17 @@ function runOnce(offsetMs, utterance, deviationMs) {
      */
     subLog: [],
     SUBLOG_KEEP: 120,
+    /**
+     * ⭐ 「排期时刻 `at`」那一格 —— 它必须和诊断行前缀**同一个刻度**，
+     * 而那个刻度就是 `DIAG_T0`（`player.js` 里于模块加载那一刻取 `performance.now()`）。
+     * 少了它就是 `ReferenceError`，而这四条「整句上屏」断言正是跑在这里的 ✗
+     */
+    DIAG_T0: performance.now(),
+    /**
+     * ⭐ 印 `at=` 用的纯函数 —— **从真源码里抽**（见 `realFormatAtStamp`），
+     * 不是在这里抄一份实现。少了它同样是 `ReferenceError`。
+     */
+    formatAtStamp: realFormatAtStamp(),
     performance,
     Date,
     Math,
@@ -153,10 +203,19 @@ function scenarios() {
   ];
 }
 
-/** 哪一行里出现了负数时长（`-2.3s` 这种）—— 空数组 = 干净 */
+/**
+ * 哪一行里出现了**负数时长** —— 空数组 = 干净。
+ *
+ * ⚠️ 判据要**盯住那个字段**，不能拿整行扫负号 ✗ ——
+ *    原来这里是 `/-\d+(\.\d+)?s/` 扫全行，于是 `at=-2.300s`（排期时刻落在过去，
+ *    **合法**）会被当成"负数时长"误报 ✗。
+ *    而这条断言真正要不许的只有一件事：**`Xs 后` 里的 X 是负的**（"后"是负的，自相矛盾）。
+ *    ⇒ 所以锚点收紧成 `-X.Xs 后` —— 这比原来**更准**，不是放宽：
+ *      v2.66.29 那次实测的 `-2.3s 后` 照样会被抓到 ✓
+ */
 function negativeHits() {
   return scenarios()
-    .filter(([, line]) => /-\d+(\.\d+)?s/.test(line))
+    .filter(([, line]) => /-\d+(\.\d+)?s 后/.test(line))
     .map(([name, line]) => `${name}: ${line}`);
 }
 
