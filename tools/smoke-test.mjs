@@ -4464,6 +4464,38 @@ check('分片时长必须够短：识别滞后 ≈ 分片×2 + 推理，超过�
  * `scheduleUtterance`，用假 `schedule` / `settings` / `diag` 驱动）——
  * 不是抄一份实现来测（这个项目为"两份实现只改一份"栽过）。
  */
+/**
+ * ⚠️ 这条是**行为断言**，不是"源码里有没有这几个字" ✗
+ *
+ *   排期按目标值走（`currentDelayMs` → `target + lag`），而缓冲达不到目标时，
+ *   画面其实更靠前 ⇒ 这句会**偏晚**；反过来（缓冲超出）会**偏早**。
+ *   用户要的不是"偏早"也不是"偏晚"，而是「准」，并且**要知道什么时候不准**：
+ *     「句子明明很短，但是出来的晚 —— 或者说很早就出来了」
+ *   ⇒ 所以那行诊断必须把偏差和方向说出来 ✓
+ *
+ * 只查源码里有没有「画面实际比目标」这几个字是不够的 —— 把调用处那一行删掉，
+ * 定义还在，断言照样绿 ✗（本项目为"断言看着有、实际抓不到"栽过多次，M4 就是这种）。
+ */
+check('整句上屏那行：画面比目标靠前/靠后时要报出来，并说清这句会晚还是早', () => {
+  const require_ = createRequire(import.meta.url);
+  const { runOnce } = require_('./shown-time-preview.cjs');
+  // ① 缓冲只到 7.1 秒、目标 10 秒 ⇒ 画面靠前 1.7 秒 ⇒ 这句会**晚**
+  const late = runOnce(2100, undefined, -1700);
+  if (!/画面实际比目标靠前 1\.7s/.test(late)) throw new Error(`没报出"靠前 1.7s"：${late}`);
+  if (!/这句会晚 1\.7s/.test(late)) throw new Error(`没说清会晚多少：${late}`);
+  if (!/缓冲没填到目标/.test(late)) throw new Error(`没给出原因（缓冲没填到目标）：${late}`);
+  // ② 缓冲 11.2 秒、目标 10 秒 ⇒ 画面靠后 1.2 秒 ⇒ 这句会**早**
+  const early = runOnce(2100, undefined, 1200);
+  if (!/画面实际比目标靠后 1\.2s/.test(early)) throw new Error(`没报出"靠后 1.2s"：${early}`);
+  if (!/这句会早 1\.2s/.test(early)) throw new Error(`没说清会早多少：${early}`);
+  // ③ 偏差低于门槛（0.2 秒）不报 —— 否则每句都挂一条 ⚠，真正该看的被淹掉
+  const fine = runOnce(2100, undefined, -200);
+  if (/画面实际比目标/.test(fine)) throw new Error(`0.2 秒的偏差不该报：${fine}`);
+  // ④ 还没测到实测值时不报
+  const unknown = runOnce(2100, undefined, undefined);
+  if (/画面实际比目标/.test(unknown)) throw new Error(`实测未知时不该报偏差：${unknown}`);
+});
+
 check('整句上屏那行：「后」不能是负的（实测出现过「-2.3s 后」）', () => {
   const require_ = createRequire(import.meta.url);
   const { scenarios, negativeHits } = require_('./shown-time-preview.cjs');

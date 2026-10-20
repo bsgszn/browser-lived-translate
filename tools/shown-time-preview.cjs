@@ -48,7 +48,7 @@ function extractFn(src, name) {
  * @param {object} [utterance] 喂给它的那一段；不传就用一句普通的（`parts` 缺省 → 那行该印 `?`）
  * @returns {string} 那行诊断（没打印就返回空串）
  */
-function runOnce(offsetMs, utterance) {
+function runOnce(offsetMs, utterance, deviationMs) {
   const src = fs.readFileSync(PLAYER, 'utf8');
   const fnSrc = extractFn(src, 'scheduleUtterance');
   const printed = [];
@@ -83,11 +83,13 @@ function runOnce(offsetMs, utterance) {
      * （`scheduleDeviationEma` / `SCHEDULE_DEVIATION_WARN_MS`）。
      * 少了它们就是 `ReferenceError`，而三条「整句上屏」断言正在这儿跑，会一起红 ✗
      *
-     * 这里给 `null` = **还没测到实测值** ⇒ 不印偏差那一段。
-     * ⚠️ 「有偏差时会印什么」**不在这里**验 —— 那是 player.js 自己那条断言管的 ✓
+     * 这里默认给 `null` = **还没测到实测值** ⇒ 不印偏差那一段。
+     * 传 `deviationMs` 就预置一个偏差，用来验"偏差会不会真的印出来" ——
+     * ⚠️ 只查源码里有没有那几个字是**不够的**（把调用处那一行删掉，源码里照样有，
+     *    断言仍然是绿的 ✗ —— 本项目为"断言看着有、实际抓不到"栽过多次）。
      */
-    scheduleDeviationEma: null,
-    scheduleDeviationMs: null,
+    scheduleDeviationEma: deviationMs === undefined ? null : deviationMs,
+    scheduleDeviationMs: deviationMs === undefined ? null : deviationMs,
     SCHEDULE_DEVIATION_WARN_MS: 300,
     diag: (line) => printed.push(line),
     refineEnabled: () => false,
