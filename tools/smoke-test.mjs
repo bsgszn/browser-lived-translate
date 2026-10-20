@@ -10119,37 +10119,78 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     const p1 = loop.next(SR * 6);
     if (!p1) throw new Error('首批应当开批');
     if (Math.abs(p1.offsetSec) > 1e-6) throw new Error(`首批 offsetSec = ${p1.offsetSec}，应 0`);
-    const o1 = loop.apply([
+    // ⚠️ 只给一段：[0,4]（离批尾 6.0 还有余量 ⇒ 确认 ✓）
+    const o1 = loop.apply([{ start: 0, end: 4, text: 'A' }]);
+    if (o1.accepted.length !== 1) throw new Error(`应采纳 1 段，实际 ${o1.accepted.length}`);
+    if (Math.abs(o1.nextStart - 4) > 1e-6) throw new Error(`nextStart = ${o1.nextStart}，应 4`);
+
+    // 下一批：nextStart = 4，尾巴为空 ⇒ 要 5 秒新音频
+    const p2 = loop.next(SR * 11);
+    if (!p2) throw new Error('11 秒时第二批应当开批');
+    if (Math.abs(p2.offsetSec - 4) > 1e-6) throw new Error(`第二批 offsetSec = ${p2.offsetSec}，应 4`);
+    const o2 = loop.apply([{ start: 0.5, end: 3, text: 'C' }]);
+    // ⚠️ 这就是那条最容易犯的错：漏加 offsetSec 的话绝对起点会是 0.5 而不是 4.5 ✗
+    const abs = o2.offsetSec + o2.accepted[0].start;
+    if (Math.abs(abs - 4.5) > 1e-6) throw new Error(`绝对起点 ${abs}，应 4.5`);
+  });
+
+  check('批次引擎：批尾那段不采纳（它可能是被批长截断的半句）', () => {
+    const loop = mkLoop(60);
+    loop.next(SR * 6); // 0~6 秒
+    // 两段：[0,4] 离批尾还有 2 秒 ✓；[4,6] 正好压在批尾 ⇒ 可能被截断 ✗
+    const out = loop.apply([
       { start: 0, end: 4, text: 'A' },
       { start: 4, end: 6, text: 'B' },
     ]);
-    if (o1.accepted.length !== 2) throw new Error(`应采纳 2 段，实际 ${o1.accepted.length}`);
-    if (Math.abs(o1.nextStart - 6) > 1e-6) throw new Error(`nextStart = ${o1.nextStart}，应 6`);
-
-    // 下一批：nextStart = 6，尾巴为空 ⇒ 要 5 秒新音频
-    const p2 = loop.next(SR * 11);
-    if (!p2) throw new Error('11 秒时第二批应当开批');
-    if (Math.abs(p2.offsetSec - 6) > 1e-6) throw new Error(`第二批 offsetSec = ${p2.offsetSec}，应 6`);
-    const o2 = loop.apply([{ start: 0.5, end: 3, text: 'C' }]);
-    // ⚠️ 这就是那条最容易犯的错：漏加 offsetSec 的话绝对起点会是 0.5 而不是 6.5 ✗
-    const abs = o2.offsetSec + o2.accepted[0].start;
-    if (Math.abs(abs - 6.5) > 1e-6) throw new Error(`绝对起点 ${abs}，应 6.5`);
+    if (out.accepted.length !== 1) throw new Error(`应只采纳 1 段，实际 ${out.accepted.length}`);
+    if (out.accepted[0].text !== 'A') throw new Error(`采纳了「${out.accepted[0].text}」，应是 A`);
+    if (out.reason !== 'tail-unconfirmed') throw new Error(`reason = ${out.reason}`);
+    if (Math.abs(out.nextStart - 4) > 1e-6) throw new Error(`nextStart = ${out.nextStart}，应 4`);
+    if (!out.pending || out.pending.text !== 'B') throw new Error('pending 应是 B');
   });
 
-  check('批次引擎：没静音确认就一直不采纳（`tail-unconfirmed`，nextStart 回到那段 start）', () => {
-    const loop = mkLoop(60, { silent: false });
-    loop.next(SR * 6);
-    const out = loop.apply([
-      { start: 0, end: 2, text: 'A' },
-      { start: 2, end: 5, text: 'B' },
-    ]);
-    if (out.accepted.length !== 0) throw new Error(`没静音却采纳了 ${out.accepted.length} 段`);
-    if (out.reason !== 'tail-unconfirmed') throw new Error(`reason = ${out.reason}`);
-    if (Math.abs(out.nextStart) > 1e-6) throw new Error(`nextStart = ${out.nextStart}，应 0`);
+  check('批次引擎：`confirmMode: silence` 仍按静音判（旧判据保留可切回）', () => {
+    // 有声 → 不确认；无声 → 确认
+    const loud = WB.createSegmentLoop({
+      takeRange: (s, e) => {
+        const n = Math.max(0, e - s);
+        const a = new Int16Array(n);
+        a.fill(8000);
+        return a;
+      },
+      transcribe: async () => [],
+      sampleRate: SR,
+      confirmMode: 'silence',
+    });
+    loud.next(SR * 6);
+    const o1 = loud.apply([{ start: 0, end: 2, text: 'A' }]);
+    if (o1.accepted.length !== 0) throw new Error('有声时 silence 模式不该采纳');
+    if (o1.reason !== 'tail-unconfirmed') throw new Error(`reason = ${o1.reason}`);
+
+    const quiet = WB.createSegmentLoop({
+      takeRange: (s, e) => new Int16Array(Math.max(0, e - s)),
+      transcribe: async () => [],
+      sampleRate: SR,
+      confirmMode: 'silence',
+    });
+    quiet.next(SR * 6);
+    const o2 = quiet.apply([{ start: 0, end: 2, text: 'A' }]);
+    if (o2.accepted.length !== 1) throw new Error('无声时 silence 模式应当采纳');
   });
 
   check('批次引擎：`force` 兜底能推上屏（stop / 要停了才用）', () => {
-    const loop = mkLoop(60, { silent: false });
+    // ⚠️ 用 silence 模式 + 有声音频造出"一段都没确认"的局面，再 force ✓
+    //    （boundary 模式下批中间的段一律确认，造不出这个局面）
+    const loop = WB.createSegmentLoop({
+      takeRange: (s, e) => {
+        const a = new Int16Array(Math.max(0, e - s));
+        a.fill(8000);
+        return a;
+      },
+      transcribe: async () => [],
+      sampleRate: SR,
+      confirmMode: 'silence',
+    });
     loop.next(SR * 6);
     const out = loop.apply([{ start: 0, end: 4, text: 'A' }], { force: true });
     if (out.accepted.length !== 1) throw new Error(`force 应采纳 1 段，实际 ${out.accepted.length}`);
@@ -10158,12 +10199,23 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
   });
 
   check('批次引擎：`isTextTrustworthy` 真的被透传（幻觉段不上屏）', () => {
-    const loop = WB.createSegmentLoop({
-      takeRange: () => new Int16Array(SR),
-      transcribe: async () => [],
-      sampleRate: SR,
-      isTextTrustworthy: (seg) => seg.text !== 'BAD',
-    });
+    // ⚠️ 桩必须**按请求长度**返回音频 —— 第一版写死 1 秒，
+    //    于是 `batchSec` 变成 1.0，两段都被判成"贴批尾" ⇒ 断言红在错误的原因上 ✗
+    const mk = (trust) => {
+      const o = {
+        takeRange: (s, e) => {
+          const n = Math.max(0, e - s);
+          const a = new Int16Array(n);
+          a.fill(8000); // 有声（boundary 模式下不看内容，这里只是别让它像静音）
+          return a;
+        },
+        transcribe: async () => [],
+        sampleRate: SR,
+      };
+      if (trust) o.isTextTrustworthy = trust;
+      return WB.createSegmentLoop(o);
+    };
+    const loop = mk((seg) => seg.text !== 'BAD');
     loop.next(SR * 6);
     const out = loop.apply([
       { start: 0, end: 2, text: 'OK' },
@@ -10173,11 +10225,7 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
     if (out.accepted[0].text !== 'OK') throw new Error(`采纳了「${out.accepted[0].text}」`);
     if (out.reason !== 'text-untrusted') throw new Error(`reason = ${out.reason}`);
     // ⚠️ 不传 → 完全跳过那道判据（回归保护）：同一批两段都该采纳 ✓
-    const loop2 = WB.createSegmentLoop({
-      takeRange: () => new Int16Array(SR),
-      transcribe: async () => [],
-      sampleRate: SR,
-    });
+    const loop2 = mk(null);
     loop2.next(SR * 6);
     const out2 = loop2.apply([
       { start: 0, end: 2, text: 'OK' },
