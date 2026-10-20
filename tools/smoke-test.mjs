@@ -4510,11 +4510,12 @@ check('排期延迟必须包含「录音/编码滞后」—— 字幕恒偏早�
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   if (!/function recorderLagMs/.test(src)) throw new Error('没有 recorderLagMs 辅助函数');
   const fn = src.slice(src.indexOf('function currentDelayMs'), src.indexOf('function recorderLagMs'));
-  if (!/actual \* 1000\) \+ lag/.test(fn)) {
-    throw new Error('排期延迟没有加上录音滞后 —— 只算 bufferedEnd−currentTime 会让字幕恒偏早');
+  // ⚠️ 排期按**目标值**排（不是实测）—— 但录音滞后必须加上，否则字幕恒偏早
+  if (!/return target \+ lag;/.test(fn)) {
+    throw new Error('排期延迟没有按「目标延迟 + 录音滞后」算 —— 少了滞后会让字幕恒偏早');
   }
-  // 未知时不能瞎补
-  if (!/if \(!Number\.isFinite\(actual\) \|\| actual <= 0\) return target \+ lag/.test(fn)) {
+  // 未知时也不能瞎补：回到同一个式子（目标值 + 滞后）
+  if (!/return target \+ lag;/.test(fn)) {
     throw new Error('实测延迟未知时也要把录音滞后算上');
   }
   const helper = src.slice(src.indexOf('function recorderLagMs'), src.indexOf('function recorderLagMs') + 500);
@@ -4527,18 +4528,26 @@ check('排期延迟必须包含「录音/编码滞后」—— 字幕恒偏早�
   }
 });
 
-check('排期延迟有下限：新模式要 10 秒，缓冲只填到 7 秒时也不许按 7 秒排', () => {
+check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏差报出来（不许悄悄补偿）', () => {
   /**
-   * ⚠️ 为什么这条要单独守（v2.66.83）：
+   * ⚠️ 这条断言的方向被用户纠正过**两次**，别再改回去 ✗
    *
-   *   `actualDelaySec` 量的是**缓冲领先播放头多少**，而缓冲没填满时它比目标值小。
-   *   新模式（`vad-segments`）要 ≈10 秒（首批音频 6 秒 + 一次往返 + 确认），
-   *   而只填到 7.1 秒时排期会算成 7.1 + 录音滞后 ≈ 8.3 秒
-   *   ⇒ 字幕排在 8.3 秒，画面到 10 秒才播到那一帧 ⇒ **字幕提前 (10 − 8.3) 秒**。
+   *   ① 最初：`actual*1000 + lag`（只信实测）
+   *      → 缓冲没填满时，画面其实更靠前 ⇒ 短句**忽早忽晚** ✗
+   *   ② 上一版：`max(target, actual*1000) + lag`（"宁可靠后"）
+   *      → 用户当场否掉：「**并非晚比早好**」✗
+   *   ③ 现在：`target + lag`（按**目标**排）+ **把偏差报出来**
    *
-   *   用户实测「新路提前很明显、旧路时机还好」—— 正是这个数。
-   *   ⇒ 排期必须取 `max(target, actual)`：实测更小就按目标值排（宁可晚，不许早）。
-   *   ⚠️ **只 max 不 min**：actual 更大时用 target 压下来会让字幕迟到，那是另一个 bug。
+   *   用户定的目标不是"偏早"也不是"偏晚"，而是「**准**」：
+   *   > 「宁可早，不晚 —— 记得不是绝对的。如果句子真的很长可以稍微晚点。
+   *   >   但是不要说：句子明明很短，但是出来的晚 —— 或者说很早就出来了」
+   *
+   *   ⇒ 排期按目标值走 = 假定画面真的在目标延迟那个位置 ✓
+   *   ⇒ 而实测达不到目标时（缓冲没填满），**画面确实更靠前**，这句就会偏晚 ——
+   *      **必须报出来**（`SCHEDULE_DEVIATION_WARN_MS` 那行诊断）✓
+   *      **不许用排期去悄悄补偿** ✗ —— 那会让"短句为什么晚"变得查不出来 ✗
+   *   ⇒ 真正的修法是**让 actual 达到 target**：缩短批长（`MAX_BATCH_SEC` 12 → 8）✓
+   *      或者让缓冲真的填满（取决于编码能不能跟上）✗
    *
    * 这里用**真源码**（抠出三个函数 eval），不是切片正则 —— 正则只能证明"写了什么"，
    * 证明不了"算出来多少"。本项目为"判据存在但算错"栽过太多次。
@@ -4560,7 +4569,6 @@ check('排期延迟有下限：新模式要 10 秒，缓冲只填到 7 秒时也
   const minSecM = /const WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*(\d+)\s*;/.exec(src);
   if (!minSecM) throw new Error('源码里没有 WHISPER_SEGMENTS_MIN_DELAY_SEC');
   const MIN_SEC = Number(minSecM[1]);
-  if (MIN_SEC < 10) throw new Error('新模式的最小延迟不到 10 秒，新路必然超预算：' + MIN_SEC);
   const DELAY_MIN_SEC = 3; // 与 lib/delayed-player.js 的 DELAY_MIN_SEC 一致
 
   /** 在假作用域里跑真源码：settings / playback 注入，EMA 可以预置 */
@@ -4568,10 +4576,14 @@ check('排期延迟有下限：新模式要 10 秒，缓冲只填到 7 秒时也
     const body = `
       const DELAY_MIN_SEC = ${DELAY_MIN_SEC};
       const WHISPER_SEGMENTS_MIN_DELAY_SEC = ${MIN_SEC};
+      const SCHEDULE_DEVIATION_WARN_MS = 300;
+      let scheduleDeviationMs = getEma();
+      let scheduleDeviationEma = getEma();
       ${sliceFn('effectiveDelaySec')}
       ${sliceFn('recorderLagMs')}
       ${sliceFn('currentDelayMs', 'function recorderLagMs')}
-      return { eff: effectiveDelaySec(settings), ms: currentDelayMs() };
+      const ms = currentDelayMs();
+      return { eff: effectiveDelaySec(settings), ms, dev: scheduleDeviationMs, devEma: scheduleDeviationEma };
     `;
     let ema = ema0;
     const fn = new Function(
@@ -4579,7 +4591,7 @@ check('排期延迟有下限：新模式要 10 秒，缓冲只填到 7 秒时也
       'playback',
       'getEma',
       'setEma',
-      `let actualDelayEma = getEma();\n${body}\n`,
+      `${body}\n`,
     );
     return fn(
       settingsIn,
@@ -4595,47 +4607,54 @@ check('排期延迟有下限：新模式要 10 秒，缓冲只填到 7 秒时也
   const old = { capture: { delaySec: 7.1 }, asr: { provider: 'vad' } };
   const EPS = 1e-6;
 
-  // ① 下限：新模式 + 实测只有 7.1 秒 ⇒ 至少 target(10) + 录音滞后(1.2)
+  // ① 排期按**目标值**排：新模式 = target(10) + 录音滞后(1.2) = 11.20s
+  //    ⚠️ 不许按实测（7.1+1.2=8.30）排 —— 那是拿"缓冲不够"当锚，会让短句忽早忽晚而查不出原因
   const a = runOnce(neu, 7.1, 1.2, null);
   if (Math.abs(a.eff - MIN_SEC) > EPS) throw new Error(`新模式的生效延迟应是 ${MIN_SEC}，实际 ${a.eff}`);
-  if (!(a.ms >= (MIN_SEC + 1.2) * 1000 - EPS)) {
+  if (Math.abs(a.ms / 1000 - (MIN_SEC + 1.2)) > 0.02) {
     throw new Error(
-      `缓冲区只填到 7.1 秒时排期只用了 ${(a.ms / 1000).toFixed(2)}s，` +
-        `而新模式要 ${MIN_SEC}s ⇒ 字幕会提前 ${(MIN_SEC + 1.2 - a.ms / 1000).toFixed(2)}s`,
+      `新模式排期是 ${(a.ms / 1000).toFixed(2)}s，应为 ${MIN_SEC + 1.2}s（目标值 + 录音滞后）` +
+        ` —— 按实测排会让短句忽早忽晚，而日志里看不出为什么`,
     );
   }
 
-  // ② 只 max 不 min：实测比目标大时不许被压回目标值（那会让字幕迟到）
+  // ② 实测比目标大时也按目标排（同样不许被实测带跑）
   const b = runOnce(neu, 12, 1.2, null);
-  if (!(b.ms >= 12 * 1000 + 1200 - EPS)) {
-    throw new Error(`实测 12 秒时排期被压到 ${(b.ms / 1000).toFixed(2)}s —— 会把字幕推晚`);
+  if (Math.abs(b.ms / 1000 - (MIN_SEC + 1.2)) > 0.02) {
+    throw new Error(`实测 12 秒时排期变成 ${(b.ms / 1000).toFixed(2)}s，应为 ${MIN_SEC + 1.2}s`);
   }
 
-  // ③ 旧路不受影响：7.1 + 1.2
+  // ③ 旧路不变（7.1 + 1.2）—— 旧路目标本来就等于实测量级，两边自洽
   const c = runOnce(old, 7.1, 1.2, null);
   if (Math.abs(c.ms / 1000 - 8.3) > 0.02) {
     throw new Error(`旧路排期变了：期望 8.30s，实际 ${(c.ms / 1000).toFixed(2)}s`);
   }
 
-  // ④ 平滑也不能把值拉到下限以下（EMA 里可能残留上一个更小的估计）
-  let ema = 8300; // 比下限 11200 低
-  let worst = Infinity;
-  for (let i = 0; i < 8; i += 1) {
-    const r = runOnce(neu, 7.1, 1.2, ema);
-    ema = r.ms;
-    worst = Math.min(worst, r.ms);
-  }
-  if (!(worst >= (MIN_SEC + 1.2) * 1000 - EPS)) {
-    throw new Error(`平滑后仍有拍低于下限：最低 ${(worst / 1000).toFixed(2)}s`);
+  // ④ 实测未知时同样是 target + lag（唯一能用的估计）
+  const d = runOnce(neu, null, 1.2, null);
+  if (Math.abs(d.ms / 1000 - (MIN_SEC + 1.2)) > 0.02) {
+    throw new Error(`实测未知时应回落 target + lag，实际 ${(d.ms / 1000).toFixed(2)}s`);
   }
 
-  // ⑤ 源里必须是 max(target, actual) —— 正则只是复核，行为由上面四条钉
+  // ⑤ 源里必须 `return target + lag;`，且**不许**再拿实测当锚（两个方向都不许）
   const fnText = sliceFn('currentDelayMs', 'function recorderLagMs');
-  if (!/Math\.max\(target, actual \* 1000\)/.test(fnText)) {
-    throw new Error('currentDelayMs 没有对实测值取下限（Math.max(target, actual*1000)）');
+  if (!/return target \+ lag;/.test(fnText)) {
+    throw new Error('currentDelayMs 没有按目标值排 —— 排期必须跟着"我们要的延迟"走');
+  }
+  if (/return actualDelayEma/.test(fnText) || /return actual \* 1000/.test(fnText)) {
+    throw new Error('排期又拿实测值当锚了 —— 短句会忽早忽晚，而日志里查不出原因');
   }
 
-  // ⑥ 两处 setDelay 不许再裸读 delaySec（那会把正在跑的延迟从 10 拉回 7.1）
+  // ⑥ 而"缓冲没填到目标"这件事**必须报出来**（否则这句为什么晚就查不到）
+  if (!/scheduleDeviationMs\s*=/.test(src)) {
+    throw new Error('没有记录「实测 − 目标」的偏差 —— 字幕偏早/偏晚时查不出原因');
+  }
+  if (!/SCHEDULE_DEVIATION_WARN_MS/.test(src)) throw new Error('没有偏差报警的门槛');
+  if (!/画面实际比目标/.test(src) || !/（缓冲没填到目标）/.test(src)) {
+    throw new Error('诊断里没有说明"画面实际比目标靠前/靠后 ⇒ 这句会晚/早"');
+  }
+
+  // ⑦ 两处 setDelay 不许再裸读 delaySec（那会把正在跑的延迟从 10 拉回 7.1）
   const setDelaySites = [...src.matchAll(/playback\?\.setDelay\(([^)]*)\)/g)].map((m) => m[1].trim());
   if (setDelaySites.length < 2) {
     throw new Error('setDelay 的调用点少于 2 处（storage 变化 / 滑块）—— 判据失效了，得重新审视');
@@ -4693,16 +4712,26 @@ check('「变速纠偏」要能整体关掉 —— 关掉后速率恒为 1，画
   if (!/smoothRate: settings\.capture\.smoothRate !== false/.test(player)) throw new Error('播放页没把设置传进去');
   const html = fs.readFileSync(path.join(process.cwd(), 'player', 'player.html'), 'utf8');
   if (!/id="smoothRate"/.test(html)) throw new Error('没有开关，用户没法验证');
-  // 关掉纠偏的前提是：字幕排期用的是**实测**延迟，而不是目标值
+  // 关掉纠偏的前提是：字幕排期用的是**我们向播放器要的那个延迟**（目标值）
   //
-  // ⚠️ v2.66.83 起排期是 `Math.max(target, actual*1000) + lag`（加了「不许低于目标值」的下限，
-  //    因为新模式要 10 秒而缓冲没填满时实测只有 7.1 ⇒ 字幕提前 2.9 秒）。
-  //    **实测值仍然参与**：它比目标大时按它排 —— 否则关掉纠偏后字幕会跟着漂。
-  if (!/Math\.max\(target, actual \* 1000\) \+ lag/.test(player)) {
-    throw new Error('排期必须用实测延迟（actual 要比 target 大时说了算）—— 否则关掉纠偏后字幕会跟着漂');
+  // ⚠️ 这三行的方向被用户纠正过两次，别再改回去 ✗
+  //    · 先是 `actual*1000 + lag`（只信实测）→ 缓冲没填满时短句忽早忽晚 ✗
+  //    · 再是 `Math.max(target, actual*1000)`（宁可晚）→ 用户：「并非晚比早好」✗
+  //    · 现在是 **`target + lag`**（按目标排）+ **把实测与目标的偏差报出来** ✓
+  //      用户的原话：「不是要偏早也不是要偏晚，而是要**准**；短句尤其不许早也不许晚」✗
+  //      ⇒ 而"准"的前提是 actual ≈ target；达不到就**说出来**，不许用排期悄悄补偿 ✓
+  if (!/return target \+ lag;/.test(player)) {
+    throw new Error('排期没有按目标值算 —— 那会让短句跟着缓冲抖动忽早忽晚');
   }
-  if (/const ms = target \+ lag;/.test(player)) {
-    throw new Error('排期只用目标值了 —— 关掉纠偏后字幕会跟着漂');
+  if (/Math\.max\(target, actual \* 1000\)/.test(player)) {
+    throw new Error('排期又搞成"宁可晚"了 —— 用户原话「并非晚比早好」');
+  }
+  if (/const ms = actual \* 1000 \+ lag;/.test(player)) {
+    throw new Error('排期又只信实测了 —— 缓冲没填满时短句会忽早忽晚');
+  }
+  // 而"缓冲没填到目标"必须报出来，否则这句为什么晚查不到
+  if (!/SCHEDULE_DEVIATION_WARN_MS/.test(player) || !/画面实际比目标/.test(player)) {
+    throw new Error('没有把「实测 vs 目标」的偏差报出来 —— 偏早/偏晚就没法归因');
   }
 });
 
@@ -10452,7 +10481,13 @@ check('Whisper 分段决策：`isSpeechless` 的四种输入（空 / 空白 / �
   check('批次引擎：常量是预期值（改常量要同步改注释里的标定）', () => {
     if (WB.FIRST_BATCH_SEC !== 6) throw new Error(`FIRST_BATCH_SEC = ${WB.FIRST_BATCH_SEC}`);
     if (WB.CONTINUE_BATCH_SEC !== 5) throw new Error(`CONTINUE_BATCH_SEC = ${WB.CONTINUE_BATCH_SEC}`);
-    if (WB.MAX_BATCH_SEC !== 12) throw new Error(`MAX_BATCH_SEC = ${WB.MAX_BATCH_SEC}`);
+    /**
+     * ⚠️ 12 → 8（用户定的取舍：「批长适当短点也行」）
+     *   批长越短 ⇒ 识别滞后越小 ⇒ 目标延迟越容易达到 ⇒ **短句才不早不晚** ✓
+     *   代价：生僻专有名词（要 ≈14 秒）会错 ✗ —— 用户已接受。
+     * 这条断言钉住上限，**别悄悄调回去**（调回去短句又会晚）。
+     */
+    if (WB.MAX_BATCH_SEC !== 8) throw new Error(`MAX_BATCH_SEC = ${WB.MAX_BATCH_SEC}`);
     if (WB.SILENCE_CHECK_SEC !== 0.25) throw new Error(`SILENCE_CHECK_SEC = ${WB.SILENCE_CHECK_SEC}`);
   });
 
