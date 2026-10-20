@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 // 纯函数，不碰 chrome —— 所以可以静态导入（在下面那个 chrome 桩之前求值也没问题）。
-import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote } from '../lib/diag-window.js';
+import { pushDiagPair, diagWindow, formatAlignNote, formatPromptNote, formatAtStamp } from '../lib/diag-window.js';
 // 「按锚点改文件」的共用守卫 —— 判断逻辑是纯函数，所以这里能真调它断言。
 import { planReplace } from '../lib/anchor-edit.js';
 
@@ -9860,6 +9860,105 @@ console.log('\n[3f] 导出头的「时间对齐」与「电平分布」—— �
     if (s.includes('-1') || s.includes('NaN') || s.includes('abc')) throw new Error(`脏值漏出来了：${JSON.stringify(s)}`);
     if (!s.includes('提示词 —')) throw new Error(`应该印 —：${JSON.stringify(s)}`);
   });
+
+  /**
+   * ⭐ 「排期时刻 at」那一格存在的理由（这是一条**行为**断言，不是源码检查）。
+   *
+   * `at` 是**唯一**决定"字幕什么时候出现"的那个数，而它此前**从没被印出来过** ✗:
+   *   · 「整句上屏」印 `at − Date.now()`（倒计时）
+   *   · 「字幕上屏」印 `now − item.at`（晚到多久）
+   * 要对账就只能拿倒计时反推 `at` —— 而倒计时的基准是 `Date.now()`、
+   * 行前缀的基准是 `performance.now()` ⇒ **跨基准做减法，怎么算都对不上** ✗
+   * （实测 8 条里只有 1 条对得上、其余差 0.19~1.45 秒；那个差里混着基准误差，
+   *   所以"上屏时机乱"到那时**根本没被度量对** ✗）
+   *
+   * ⚠️ 所以这里钉的是**恒等式**，不是"印出来有这串字"：
+   *    `at=` 的读数 − 行前缀的读数 == 倒计时（误差 ≤2ms，只允许 3 位小数的舍入）
+   */
+  {
+    const T0 = 1234.5;
+    const PERF = 15_000;
+    const NOW = 1_000_000;
+    const AT = NOW + 3200;
+    const stampOf = (o) => formatAtStamp({ t0: T0, now: NOW, perfNow: PERF, ...o });
+    const secOf = (s) => Number((/at=\+([0-9.]+)s/.exec(s) || [])[1]);
+
+    check('排期时刻：印的是绝对刻度，和诊断行前缀同基准（对账误差 ≤2ms）', () => {
+      const s = stampOf({ at: AT, atPush: AT });
+      if (!/^at=\+[0-9]+\.[0-9]{3}s$/.test(s)) throw new Error(`格式不对：${JSON.stringify(s)}`);
+      const linePrefixSec = (PERF - T0) / 1000;
+      const diff = secOf(s) - linePrefixSec;
+      const countdown = (AT - NOW) / 1000;
+      if (Math.abs(diff - countdown) > 0.002) {
+        throw new Error(`对账不上：at= − 行前缀 = ${diff.toFixed(3)}s，而倒计时 = ${countdown.toFixed(3)}s`);
+      }
+    });
+
+    check('排期时刻：落在过去时印 -X.XXXs，绝不许出现双符号 at=+-2.000s', () => {
+      /**
+       * ⚠️ 这条是变异 M4 抓出来的缺口：最初只测了**未来**的排期（`at=+16.966s`），
+       *    而负值那条路**一次都没被测到** ✗
+       *    ⇒ 把符号逻辑改坏成 `at=+${负数}`（印出 `at=+-2.000s`）时，8 条断言全绿 ✗
+       *    而它正是用户会看到的那种"自相矛盾的行"（和当年 `-2.3s 后` 同一类）。
+       *
+       * ⚠️ 怎么才会负：`at=` 印的是**绝对刻度**（相对 `DIAG_T0`），所以
+       *    「迟到」本身**不会**让它变负 —— 只有 `at` 指向**模块加载之前**才会（排期严重落后）。
+       *    所以这里必须显式构造 `atPerf < t0`，不能靠"迟到"那条路顺带覆盖。
+       */
+      const s = formatAtStamp({ at: 999_000, atPush: 999_000, now: 1_000_000, perfNow: 2_000, t0: 3000.25 });
+      if (!/^at=-2\.000s$/.test(s)) throw new Error(`过去时刻该印 at=-2.000s，实际 ${JSON.stringify(s)}`);
+      if (s.includes('+-') || s.includes('-+')) throw new Error(`出现了双符号：${JSON.stringify(s)}`);
+    });
+
+    check('排期时刻：没被 resync 挪过 → 不许印"排期被挪"（否则它是永远为假的后缀）', () => {
+      if (stampOf({ at: AT, atPush: AT }).includes('排期被挪')) throw new Error('没挪却印了挪动量');
+    });
+
+    check('排期时刻：被挪过就明写挪了多少（正负都要对）', () => {
+      const plus = stampOf({ at: AT + 420, atPush: AT });
+      if (!plus.includes('排期被挪 +0.42s')) throw new Error(`挪动量没印对：${JSON.stringify(plus)}`);
+      const minus = stampOf({ at: AT - 300, atPush: AT });
+      if (!minus.includes('排期被挪 -0.30s')) throw new Error(`负向没印对：${JSON.stringify(minus)}`);
+      // ⚠️ 挪过时 `at=` 必须是**当前**值 —— 藏起来就等于把"排期在动"这个事实删掉
+      if (Math.abs(secOf(plus) - secOf(stampOf({ at: AT, atPush: AT })) - 0.42) > 0.002) {
+        throw new Error('at= 印的不是挪过之后的当前值');
+      }
+    });
+
+    check('排期时刻：挪动小于门槛（默认 50ms）不印 —— 否则每句都会挂一条噪声', () => {
+      if (stampOf({ at: AT + 20, atPush: AT }).includes('排期被挪')) throw new Error('20ms 的抖动不该报');
+      if (!stampOf({ at: AT + 80, atPush: AT }).includes('排期被挪')) throw new Error('80ms 该报却没报');
+    });
+
+    check('排期时刻：同一排期在两行里印同一个数（时刻相同时必须一致）', () => {
+      // 「整句上屏」在 push 时印（atPush===at）、「字幕上屏」在 render 时印（atPush 是快照）
+      // 没被 resync 挪过 ⇒ 两者必须逐字相同
+      const pushLine = stampOf({ at: AT, atPush: AT });
+      const laterNow = NOW + 500;
+      const renderLine = formatAtStamp({ at: AT, atPush: AT, now: laterNow, perfNow: PERF + 500, t0: T0 });
+      if (pushLine !== renderLine) throw new Error(`两行印的数不一致：${JSON.stringify(pushLine)} vs ${JSON.stringify(renderLine)}`);
+    });
+
+    check('排期时刻：now 与 at 同时平移一个常量 → at= 不变（它只依赖倒计时和 perfNow）', () => {
+      const a = stampOf({ at: AT, atPush: AT });
+      const b = formatAtStamp({ at: AT + 50_000, atPush: AT + 50_000, now: NOW + 50_000, perfNow: PERF, t0: T0 });
+      if (a !== b) throw new Error(`平移后变了：${JSON.stringify(a)} vs ${JSON.stringify(b)}`);
+    });
+
+    check('排期时刻：拿不到时刻 → 空串（绝不印 NaN/undefined，也绝不编一个数）', () => {
+      for (const o of [{ at: NaN }, { at: AT, now: undefined }, { at: AT, perfNow: null }, {}]) {
+        const s = formatAtStamp({ ...o, t0: T0 });
+        if (s !== '') throw new Error(`脏输入应返回空串，实际 ${JSON.stringify(s)}（输入 ${JSON.stringify(o)}）`);
+        if (s.includes('NaN') || s.includes('undefined')) throw new Error('印出了脏值');
+      }
+    });
+
+    check('排期时刻：没有 atPush 快照时只印 at=，不编造挪动量', () => {
+      const s = formatAtStamp({ at: AT, now: NOW, perfNow: PERF, t0: T0 });
+      if (!s.startsWith('at=+')) throw new Error(`应该照印 at=：${JSON.stringify(s)}`);
+      if (s.includes('排期被挪')) throw new Error('没有快照却报了挪动量');
+    });
+  }
 
   /**
    * ⚠️ 这一栏存在的理由:心跳那行的 `输入电平` 是**一帧**的值 ✗，
