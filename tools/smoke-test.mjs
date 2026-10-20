@@ -3537,8 +3537,11 @@ await checkAsync('诊断日志必须留得住，而且要能整份复制出来',
 
 await checkAsync('诊断：字幕滞后必须相对「排期时刻」，不能把画面延迟算进去', async () => {
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
-  if (!/function diagLate/.test(src)) throw new Error('没有 diagLate');
-  const fn = src.slice(src.indexOf('function diagLate'), src.indexOf('function renderSubs'));
+  // ⚠️ 名字从 `diagLate` 改成了 `diagShown` —— 因为它现在**无条件**被调用（不再看 `item.late`）✗
+  //    见那条「上屏时刻必须无条件可测」的断言 ✓
+  if (!/function diagShown/.test(src)) throw new Error('没有 diagShown');
+  if (/function diagLate\b/.test(src)) throw new Error('diagLate 已经改名成 diagShown，不许留着旧名');
+  const fn = src.slice(src.indexOf('function diagShown'), src.indexOf('function renderSubs'));
   // 踩过的坑：写成 now − (firstAudioAt + start*1000) 会**把 D 加进去** ——
   // D=8 时会报"晚 8.6 秒"，而实际只晚 0.6 秒，把人吓得去调延迟。
   if (/firstAudioAt \+ item\.start/.test(fn)) {
@@ -3546,6 +3549,45 @@ await checkAsync('诊断：字幕滞后必须相对「排期时刻」，不能�
   }
   if (!/const lateMs = now - item\.at/.test(fn)) throw new Error('应当以 item.at（排期时刻）为基准');
   if (!/仍在句内/.test(fn)) throw new Error('应当给出"是否还在句内"这个可接受的判据');
+});
+
+await checkAsync('诊断：上屏时刻必须**无条件**可测（否则在屏时长只能反推 ⇒ 那些数不可信）', async () => {
+  const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  /**
+   * 缺口（实测）：「字幕上屏」原来写的是 `if (item.late) diagLate(item, now)` ✗
+   * 而 `item.late` 是**推入时**算的（`at <= Date.now()`），**不是上屏时重算** ✗
+   * ⇒ 被让位、但推入时"还没晚"的条目**既不打印、也不记 `subLog.dt`** ✗
+   * ⇒ 「在屏时长」只能拿 `at + 比排期晚` **反推** ⇒ 「在屏<跨度 12/45、最短 0.14s」
+   *    那些数**全是错的** ✗（"看不见"这一族今天已栽过六次 ✓）
+   */
+  if (/if\s*\(\s*item\.late\s*\)\s*diag(?:Late|Shown)/.test(src)) {
+    throw new Error(
+      'diagShown 不许只在 `item.late` 时调用 ✗ —— 那样被让位过的条目在日志里没有上屏时刻，' +
+        '而在屏时长只能用 `at + 比排期晚` 反推（那些数是错的 ✗）',
+    );
+  }
+  if (!/^\s*diagShown\(item, now\);/m.test(src)) {
+    throw new Error('渲染循环里必须**无条件**调用 `diagShown(item, now);`');
+  }
+  const fn = src.slice(src.indexOf('function diagShown'), src.indexOf('function renderSubs'));
+  /**
+   * 一行里必须同时有这四格，否则"在屏时长/阅读速度"还是算不出来 ✓
+   * ⚠️ 用 `includes` 逐个查，并且**每格都写清缺了会怎样** —— 别只查"函数存在" ✗
+   */
+  for (const [needle, why] of [
+    ['真 ', '必须印**真实**上屏时刻（和 `at=` 同刻度），否则没法算在屏时长'],
+    ['上条待 ', '必须印**上一条**真的在屏上待了多久'],
+    ['字/秒', '必须印阅读速度（实测出现过 20~210 字/秒 ✗，正常 5~8）'],
+    ['切 ', '必须印这一条的切法（新路 `whisper-segment` / 旧路 `utterance-end`，一眼分得出）'],
+  ]) {
+    if (!fn.includes(needle)) throw new Error(`diagShown 里没有「${needle}」—— ${why}`);
+  }
+  if (!/lastShownPerf = shownPerf/.test(fn)) {
+    throw new Error('diagShown 必须更新 `lastShownPerf`，否则下一条算不出在屏时长');
+  }
+  if (!/lastShownChars = chars/.test(fn)) {
+    throw new Error('diagShown 必须更新 `lastShownChars`，否则下一条算不出阅读速度');
+  }
 });
 
 await checkAsync('延迟测量：必须能量出「缓冲末尾落后实况多久」（字幕恒偏早的根因）', async () => {
@@ -8527,8 +8569,8 @@ check('快照完整性自检：残缺快照必须被抓到，完好快照不许�
   check(
     '看门狗的基准是「字幕真的上屏」：上屏时刻必须打在真正的渲染循环里',
     renderLoop.length > 100 && /lastShownAt\s*=\s*Date\.now\(\)/.test(renderLoop) && /shownCount\s*\+=\s*1/.test(renderLoop),
-    '⚠️ 不能只打在 diagLate 里 —— 那个函数只对 `item.late` 的条目调用，' +
-      '所以它根本不是"上屏"的信号。断言的锚点是渲染循环（schedule.due → pumpSubtitles 之间），' +
+    '⚠️ 不能只打在 diagShown 里 —— 那个函数虽然现在**无条件**被调用（原来是 `if (item.late) diagLate(...)` ✗），' +
+      '但它仍然不是"上屏"的唯一信号。断言的锚点是渲染循环（schedule.due → pumpSubtitles 之间），' +
       `切出 ${renderLoop.length} 字符（守卫要求 > 100）。`,
   );
 
@@ -11972,9 +12014,24 @@ assertSpeechRun();
     if (!/minShowHoldMs\(\{/.test(playerSrc)) {
       throw new Error('player.js 没有调用 minShowHoldMs');
     }
-    // 旧路必须保持原样：`MIN_SHOW_HOLD_MS` 仍要作为默认值出现 ✓
-    if (!/let minHoldMs = MIN_SHOW_HOLD_MS/.test(playerSrc)) {
-      throw new Error('player.js 的 minHoldMs 默认值必须仍是 MIN_SHOW_HOLD_MS（旧路不许被改 ✗）');
+    // 旧路必须保持原样：默认值仍是 `MIN_SHOW_HOLD_MS` ✓
+    // ⚠️ **必须钉到分号** ✗ —— 原来写 `/let minHoldMs = MIN_SHOW_HOLD_MS/`，
+    //    而那是个**前缀匹配** ⇒ `let minHoldMs = MIN_SHOW_HOLD_MS || minShowHoldMs({…})`
+    //    照样通过 ✗（`||` 短路掉真值 ⇒ 每条「待够」静默退回固定 500ms ✗，
+    //    而所有断言全绿 —— 这就是 M4 骗过去的方式 ✓）
+    if (!/let minHoldMs = MIN_SHOW_HOLD_MS;/.test(playerSrc)) {
+      throw new Error(
+        'player.js 的 minHoldMs 默认值必须仍是 `MIN_SHOW_HOLD_MS;`（旧路不许被改 ✗，' +
+          '也不许用 `||` / `??` 把 per-item 的值短路掉 ✗）',
+      );
+    }
+    // ⭐ 而且 `minHoldMs` 必须被**无条件重新赋值**成 `minShowHoldMs(...)`
+    //    —— 不是塞在 `||` 右半边、也不是别的表达式的子表达式 ✓
+    if (!/(?:^|[^|&?])minHoldMs = minShowHoldMs\(\{/m.test(playerSrc)) {
+      throw new Error(
+        'player.js 必须把 `minHoldMs = minShowHoldMs({…})` 作为一个**独立赋值** ✗' +
+          '（写成 `MIN_SHOW_HOLD_MS || minShowHoldMs(...)` 会被短路，等于没接线 ✗）',
+      );
     }
   });
 
@@ -11987,7 +12044,29 @@ assertSpeechRun();
     if (WB.MIN_SHOW_HOLD_MS !== 500) {
       throw new Error(`屏上最小停留应是 500ms，实际 ${WB.MIN_SHOW_HOLD_MS}`);
     }
-    const H = WB.holdSwitchForGap;
+    /**
+     * ⭐ 调用一律**显式给** `minHoldMs` —— 因为函数**没有默认值**，漏传会抛 ✗
+     *    （这正是 M4 那个"`||` 短路成静默退化"的根治：漏传立刻炸，而不是悄悄用 500ms ✓）
+     */
+    const H = (o = {}) => WB.holdSwitchForGap({ minHoldMs: WB.MIN_SHOW_HOLD_MS, ...o });
+
+    // ⓪ ⭐ **漏传 `minHoldMs` 必须抛** ✗ —— 不许静默退回固定停留 ✓
+    let missingThrew = false;
+    try {
+      WB.holdSwitchForGap({ now: 1100, lastSwitchAt: 1000 });
+    } catch {
+      missingThrew = true;
+    }
+    if (!missingThrew) {
+      throw new Error(
+        'holdSwitchForGap 漏传 minHoldMs 时必须抛错 ✗ —— 有默认值的话，「每条待够」' +
+          '会被静默退化成固定 500ms，而所有断言照样全绿（M4 就是这么骗过去的 ✗）',
+      );
+    }
+    // ⚠️ 而 `enabled=false`（旧路）**连校验都不进** ⇒ 不许因为漏传而炸 ✓
+    if (WB.holdSwitchForGap({ now: 1100, lastSwitchAt: 1000, enabled: false }) !== false) {
+      throw new Error('enabled=false 时必须只返回 false，不许抛也不许挡');
+    }
 
     // ① ⭐ **还没换过屏（0）⇒ 不许挡** —— `0` 不能被当成"刚换过" ✗
     //    （`Number(null) === 0` 那一族；挡了的话第一条字幕就永远不上屏 ✗）
