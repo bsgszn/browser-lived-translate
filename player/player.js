@@ -1880,24 +1880,38 @@ function buildContext(seg) {
   return text;
 }
 
-/** 排期用的延迟值：优先用实测的（平滑后），拿不到就退回目标值 */
+/**
+ * 排期用的延迟值（毫秒）。
+ *
+ *   actualDelaySec = bufferedEnd − currentTime          （画面缓冲领先播放头多少）
+ *   recorderLag    = (现在 − 开始录音) − bufferedEnd     （还没进缓冲的那一段）
+ *   ───────────────────────────────────────────────────
+ *   画面离实况的真实距离 = actualDelaySec + recorderLag
+ *
+ * ⚠️ 只用 actualDelaySec 排期，字幕会恒定偏早 recorderLag 那么多（实测约 1.0~1.4 秒）。
+ *
+ * ⚠️⚠️ **下限不能低于目标值** —— v2.66.83 修的「新路字幕提前」就是这个。
+ *
+ *   新断句路径要 ≈10 秒（首批音频 6 秒 + 一次往返 + 确认）。而 `actualDelaySec` 量的是
+ *   **缓冲领先多少**，缓冲没填满时它比 10 小（实测只填到 7.1 秒时算成 7.1 + 录音滞后 ≈ 8.3 秒）。
+ *   于是字幕被排在 8.3 秒那一刻，而画面要到 10 秒才播到那一帧
+ *   ⇒ **字幕提前 (10 − 8.3) 秒** —— 用户实测「提前按秒算」，和这里算出来的数吻合。
+ *
+ *   ⇒ 取 `max(target, actual*1000)`：实测更小就按目标值排（宁可靠后一帧，不许提前）。
+ *   ⚠️ **只取 max、不取 min**：actual 大于 target 时不能用 target 压下来 —— 那会让字幕迟到。
+ */
 function currentDelayMs() {
   const target = effectiveDelaySec(settings) * 1000;
+  const lag = recorderLagMs();
   const actual = playback?.actualDelaySec;
-  if (!Number.isFinite(actual) || actual <= 0) return target + recorderLagMs();
-  // ⚠️ 必须把「录音/编码滞后」加进来 —— 这是字幕恒偏早的根因。
-  //
-  //   actualDelaySec = bufferedEnd − currentTime
-  //   recorderLag    = (现在 − 开始录音) − bufferedEnd
-  //   ─────────────────────────────────────────────────
-  //   画面离实况的真实距离 = actualDelaySec + recorderLag
-  //
-  // 只用 actualDelaySec 排期的话，字幕会恒定偏早 recorderLag 那么多。
-  // 实测（H.264/MP4 录制、4K 源）：约 1.0~1.4 秒，而且会缓慢漂移 ——
-  // 所以拿同步微调这个固定旋钮是抵不掉的，必须动态补上。
-  const ms = actual * 1000 + recorderLagMs();
+  if (!Number.isFinite(actual) || actual <= 0) return target + lag;
+  // 画面离实况的**真实距离不可能小于目标值**：目标值是这条链路的下限（批长 + 往返 + 确认）。
+  const floor = target + lag;
+  const ms = Math.max(target, actual * 1000) + lag;
   actualDelayEma = actualDelayEma === null ? ms : actualDelayEma + (ms - actualDelayEma) * 0.2;
-  return actualDelayEma;
+  // ⚠️ 平滑之后也要夹回下限 —— 一次低估就是一条提前上屏的字幕。
+  //    而且不能夹 `actualDelayEma` 本身：它是"实测值"的平滑，留着才能看出实测到底是多少。
+  return Math.max(floor, actualDelayEma);
 }
 
 /**
@@ -2375,8 +2389,17 @@ function watchExternalSettings() {
       return;
     }
     applySettingsToUi();
-    const d = Number(settings.capture?.delaySec);
-    if (Number.isFinite(d) && d !== Number(before?.capture?.delaySec)) playback?.setDelay(d);
+    /**
+     * ⚠️ 必须走 `effectiveDelaySec`，**不能裸读 `settings.capture.delaySec`** ✗
+     *
+     *    裸读的后果（v2.66.83 修）：选着「本地 Whisper 自断句」时 storage 里是 7.1，
+     *    而新模式要 10 —— 裸读会把正在跑的播放延迟**从 10 拉回 7.1**，
+     *    画面只落后 7.1 秒而字幕按 10 排 ⇒ 字幕提前 2.9 秒。
+     *    比的是**生效值**，所以"只切了识别服务"也会被正确识别成一次延迟变化。
+     */
+    const d = effectiveDelaySec(settings);
+    const prevD = effectiveDelaySec(before ?? settings);
+    if (Number.isFinite(d) && d !== prevD) playback?.setDelay(d);
     /**
      * ⚠️ 画质 / 码率 / 帧率**改不了正在跑的这一次**，必须说清楚。
      *
@@ -2431,11 +2454,23 @@ function tickUi() {
 
 function bindUi() {
   $('delay').addEventListener('input', (e) => {
-    const v = Number(e.target.value);
-    $('delayVal').textContent = `${v.toFixed(1)}s`;
-    settings.capture.delaySec = v;
+    const raw = Number(e.target.value);
+    /**
+     * ⚠️ 新模式有**硬下限 10 秒**，拖到下面也不会生效 —— 所以滑块当场弹回下限。
+     *
+     *    不弹回去就会出现「滑块 7、标签 7、实际按 10 排」这种三个数各不相同的情况 ✗
+     *    （本项目为「滑块 10 而标签 3.0s」专门写过断言，那是同一类问题。）
+     *
+     *    ⚠️ 但 storage 里**存用户自己的原值**：切回别的识别服务时，他要的就是那个值。
+     *       显示与生效都走 `effectiveDelaySec`，所以看着一致、切回去也不丢他的设置。
+     */
+    const v = effectiveDelaySec({ ...settings, capture: { ...settings.capture, delaySec: raw } });
+    const snapped = v !== raw;
+    if (snapped) $('delay').value = String(v);
+    $('delayVal').textContent = snapped ? `${v.toFixed(1)}s（新模式最低 ${v.toFixed(1)}s）` : `${v.toFixed(1)}s`;
+    settings.capture.delaySec = raw;
     playback?.setDelay(v);
-    scheduleSave('capture.delaySec', v);
+    scheduleSave('capture.delaySec', raw);
   });
   $('sync').addEventListener('input', (e) => {
     const v = Number(e.target.value);
