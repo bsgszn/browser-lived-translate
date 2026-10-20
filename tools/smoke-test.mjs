@@ -133,6 +133,9 @@ const MODULES = [
   'lib/asr/openai-realtime.js',
   'lib/asr/whisper-chunked.js',
   'lib/asr/vad.js',
+  // ⚠️ 「本地 Whisper 自断句」的适配器 —— 少写一行它就在这个清单里缺席，
+  //    而缺席的模块**一个断言都不会有**（`whisper-batch.js` 就是这么漏过的 ✗）。
+  'lib/asr/vad-segments.js',
   'lib/asr/vad-gate.js',
   'lib/asr/hallucination.js',
   'lib/asr/whisper-segments.js',
@@ -7888,6 +7891,110 @@ check('「让 Whisper 自己断句」的延迟预算：滑块与 clamp 上限都
   if (bare) throw new Error('player.js 里还有绕开 effectiveDelaySec 的裸读：' + bare);
   const calls = (pjs.match(/effectiveDelaySec\(settings\)/g) || []).length;
   if (calls < 6) throw new Error('effectiveDelaySec 只被调了 ' + calls + ' 处，应有 6 处（构造/诊断/排期/滑块/标签/UI 跳动）');
+});
+
+await checkAsync('新断句路径是「识别服务」里的一整项，老用户那个勾选框会被迁过去并清掉', async () => {
+  /**
+   * ⚠️ 为什么这条要单独守：这个功能一开始是**下拉 + 一个勾选框**，v2.66.82 搬成
+   * 下拉里的独立一项（`vad-segments`）。搬的时候有三个坑，每一个都会静默出错：
+   *
+   *  ① **只改界面不迁移** —— 老用户勾过那个框，`asr.provider` 还是 `vad`，
+   *     而勾选框已经从界面上删掉了 ⇒ 他在跑新路，却**看不到任何地方显示它开着**。
+   *     这正是本项目反复吃的"有设置没控件"（`translateLeadMs`、`delayBitsPerSecond`
+   *     两次都是这个形态，用户的表现是"我明明没开它"）。
+   *  ② **迁移了但没清旧开关** —— 用户切回「本地 VAD 断句」时，storage 里残留的
+   *     `whisperSegments: true` 会让新路**重新生效** ⇒ "我选了 A，实际跑 B"。
+   *  ③ **适配器没把 `backend` 字面写出来** —— `smoke` 里那条"复用 VAD 引擎的服务
+   *     必须能看到 VAD 旋钮"是**从源码推**的，推不出来 ⇒ 整组旋钮对它隐藏，
+   *     而那些旋钮对它生效。
+   */
+  // ① 老用户：provider=vad + 勾过那个框（v11 时就是"开着新路"）
+  const old = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  old.asr.provider = 'vad';
+  old.asr.whisperChunked.whisperSegments = true;
+  localStore.clear();
+  localStore.set(settings.STORAGE_KEY, old);
+  localStore.set('livedub.settingsVersion', 11);
+  const migrated = await settings.getSettings();
+  if (migrated.asr.provider !== 'vad-segments') {
+    throw new Error(
+      `勾过那个框的老用户没被迁到「本地 Whisper 自断句」，provider = ${migrated.asr.provider} ` +
+        '—— 而界面上已经没有那个勾选框了，他看不见自己在跑新路',
+    );
+  }
+  if (migrated.asr.whisperChunked.whisperSegments !== false) {
+    throw new Error(
+      '旧开关没清掉 —— 他切回「本地 VAD 断句」时新路会悄悄复活，而界面上没有任何控件显示它开着',
+    );
+  }
+
+  // ② 没勾过的人（绝大多数）一个字节都不许动
+  const plain = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  plain.asr.provider = 'vad';
+  plain.asr.whisperChunked.whisperSegments = false;
+  plain.asr.vad.vadMinSilenceMs = 600; // 用户自己调过的值
+  localStore.clear();
+  localStore.set(settings.STORAGE_KEY, plain);
+  localStore.set('livedub.settingsVersion', 11);
+  const kept = await settings.getSettings();
+  if (kept.asr.provider !== 'vad') throw new Error('没勾过的人不该被换服务');
+  if (kept.asr.vad.vadMinSilenceMs !== 600) throw new Error('迁移动了用户的断句参数');
+
+  // ③ 别的服务上残留的 true 也要清掉（那是死数据，但不能留着复活）
+  const other = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  other.asr.provider = 'deepgram';
+  other.asr.deepgram.apiKey = 'k';
+  other.asr.whisperChunked.whisperSegments = true;
+  localStore.clear();
+  localStore.set(settings.STORAGE_KEY, other);
+  localStore.set('livedub.settingsVersion', 11);
+  const dg = await settings.getSettings();
+  if (dg.asr.provider !== 'deepgram') throw new Error('迁移把用 Deepgram 的人切换走了');
+  if (dg.asr.whisperChunked.whisperSegments !== false) throw new Error('Deepgram 用户身上残留的旧开关没清掉');
+
+  // ④ 下拉里真的有这一项，而且就绪校验认得它
+  const ids = settings.ASR_PROVIDERS.map((p) => p.id);
+  if (!ids.includes('vad-segments')) throw new Error('识别服务列表里没有 vad-segments');
+  const fresh = JSON.parse(JSON.stringify(settings.DEFAULT_SETTINGS));
+  fresh.asr.provider = 'vad-segments';
+  if (settings.asrReadiness(fresh).ok !== true) {
+    throw new Error('选了「本地 Whisper 自断句」却判成未就绪：' + JSON.stringify(settings.asrReadiness(fresh)));
+  }
+  fresh.asr.whisperChunked.baseUrl = '';
+  if (settings.asrReadiness(fresh).ok !== false) throw new Error('没填服务地址却判成就绪');
+
+  // ⑤ 界面上那个勾选框必须已经删掉（留着就又是"两个来源"）
+  const html = fs.readFileSync(new URL('../options/options.html', import.meta.url), 'utf8');
+  if (/wc-whisperSegments/.test(html)) {
+    throw new Error('设置页还留着 wc-whisperSegments 勾选框 —— 断句策略会有两个来源');
+  }
+  const optJs = fs.readFileSync(new URL('../options/options.js', import.meta.url), 'utf8');
+  if (/wc-whisperSegments/.test(optJs)) {
+    throw new Error('options.js 还留着 wc-whisperSegments 的映射 —— 它会把旧开关又写回去');
+  }
+  if (!/data-panel="[^"]*\bvad-segments\b[^"]*"/.test(html)) {
+    throw new Error('选 vad-segments 时看不到 VAD 那组旋钮 —— 而那些旋钮对它生效');
+  }
+
+  // ⑥ 适配器必须**强制**打开新路，并把 backend 字面写出来（smoke 那条推导要靠它）
+  const adapters = loaded['lib/asr/vad-segments.js'];
+  if (typeof adapters?.createSession !== 'function') throw new Error('vad-segments.js 没有 createSession');
+  const adapterSrc = stripComments(fs.readFileSync(new URL('../lib/asr/vad-segments.js', import.meta.url), 'utf8'));
+  if (!/whisperSegments:\s*true/.test(adapterSrc)) {
+    throw new Error('适配器没有强制打开 whisperSegments —— 选了这一项却还跑旧断句');
+  }
+  if (!/backend:\s*'whisper'/.test(adapterSrc)) {
+    throw new Error(
+      '适配器没把 backend 字面写出来 —— smoke 里"复用 VAD 引擎的服务必须看到 VAD 旋钮"那条是从源码推的，会推不出它',
+    );
+  }
+
+  // ⑦ 延迟预算也要认这个服务（否则选了它，字幕必然迟到）
+  const pjs2 = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
+  const fn = pjs2.slice(pjs2.indexOf('function effectiveDelaySec'));
+  if (!/provider\s*===\s*'vad-segments'/.test(fn.slice(0, 900))) {
+    throw new Error('effectiveDelaySec 不认 vad-segments —— 选它之后延迟还是 7 秒左右，新路会一直超预算');
+  }
 });
 
 check('画面延迟下限必须是 3 秒，而且老用户 storage 里的旧值绕不过去', () => {
