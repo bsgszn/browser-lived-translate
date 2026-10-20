@@ -47,14 +47,20 @@ import {
   mergeTailText,
 } from '../lib/delayed-player.js';
 
-// ⭐ 有效延迟：打开「让 Whisper 自己断句」时，首批音频 6 秒 + 往返 + 确认 ⇒ 需要 ≈10 秒。
-//    ⚠️ 只在运行时抬，**不写 storage** —— 用户取消勾选就回到他自己的值。
+// ⭐ 有效延迟：选「本地 Whisper 自断句」时，首批音频 6 秒 + 往返 + 确认 ⇒ 需要 ≈10 秒。
+//    ⚠️ 只在运行时抬，**不写 storage** —— 用户切回别的服务就立刻回到他自己的值。
 //    ⚠️ 这里不 clamp：DelayedPlayback 自己会 clamp（现在是 3~20 秒）。
+//    ⚠️ 判据有两支：**下拉项**（`asr.provider === 'vad-segments'`，正常路径）
+//       和**旧开关**（`whisperSegments === true`，v2.66.82 迁移之前的残留数据）。
+//       两支都要认 —— 否则老用户迁移完之前那一次打开会按旧延迟排期，字幕必然迟到。
 const WHISPER_SEGMENTS_MIN_DELAY_SEC = 10;
 function effectiveDelaySec(settings) {
   const raw = Number(settings?.capture?.delaySec);
   const own = Number.isFinite(raw) && raw > 0 ? raw : DELAY_MIN_SEC;
-  if (settings?.asr?.whisperChunked?.whisperSegments === true) {
+  const onWhisperSegments =
+    settings?.asr?.provider === 'vad-segments' ||
+    settings?.asr?.whisperChunked?.whisperSegments === true;
+  if (onWhisperSegments) {
     return Math.max(own, WHISPER_SEGMENTS_MIN_DELAY_SEC);
   }
   return own;

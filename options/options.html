@@ -264,13 +264,14 @@
         </div>
 
         <!--
-          本地 VAD 断句 —— ⚠️ 这个面板对**两个**识别服务都显示：
-            vad        本地 VAD 定轴 + 本地 Whisper 出文本
-            dashscope  同一套 VAD 定轴，只是文本换成阿里云（见 lib/asr/dashscope.js）
-          两者由同一个 Silero VAD 引擎切句，所以这些旋钮对两者都生效。
+          本地 VAD 断句 —— ⚠️ 这个面板对**三个**识别服务都显示：
+            vad          本地 VAD 定轴 + 本地 Whisper 出文本
+            vad-segments 同一套引擎、同一批旋钮，只差断句策略（Whisper 自己断）
+            dashscope    同一套 VAD 定轴，只是文本换成阿里云（见 lib/asr/dashscope.js）
+          三者由同一个 Silero VAD 引擎切句，所以这些旋钮对三者都生效。
           data-panel 是空格分隔的列表，见 options.js 的 panelShown()。
         -->
-        <div class="panel" data-panel="vad dashscope">
+        <div class="panel" data-panel="vad vad-segments dashscope">
           <div class="grid">
             <label class="field">
               <span>语速档位</span>
@@ -469,29 +470,28 @@
             <input type="checkbox" id="wc-liveHotwords" />
             <span>并入内置「直播热词」（<b>默认关</b> · 日语直播行话 146 个）</span>
           </label>
-          <label class="check">
-            <input type="checkbox" id="wc-whisperSegments" />
-            <span>让 Whisper 自己断句（<b>实验性 · 默认关</b>）</span>
-          </label>
         </div>
         <p class="hint">
-          <b>Whisper 自己断句</b>：现在这条路是 <b>VAD 先切、再逐片送识别</b> ——
+          <b>「本地 Whisper 自断句」是上面「识别服务」里的一个选项</b>（不是这里的勾选框）——
+          选它就等于换一套断句策略，其它什么都不用动。
+          <br />
+          <b>它和「本地 VAD 断句」的差别</b>：后者是 <b>VAD 先切、再逐片送识别</b> ——
           而 VAD 切出来的每片都可能是<u>半句开头</u>，于是「ネコの真似」被切成两半认成「この場」、
           「コックスプレッシャー」被切成三片认成「蝶用 / 石窟 / セックス」。
           <br />
-          打开后反过来：<b>从上一句的结尾连续取一段音频，整段送 Whisper 让它自己断</b>，
+          前者反过来：<b>从上一句的结尾连续取一段音频，整段送 Whisper 让它自己断</b>，
           只有<b>离批尾还有余量的段</b>才算那句真说完了、才上屏（贴在批尾的可能是半句）；
           没确认就整个不采纳，下一批从那段开头<b>连续重采</b>（不是拼接碎片）。
           <br />
           ⚠️ <b>代价：字幕会晚约 3 秒</b>（约 7 秒 → <b>约 10 秒</b>）—— 首批音频比旧路长。
           <br />
-          🔴 <b>必须先把「画面延迟」提到 10 秒以上</b>，否则新路一直超预算、字幕会迟到。
-          勾上这一项时会把延迟自动提到 10 秒（<b>不会往下压</b>你已经设得更大的值）。
+          🔴 <b>必须让「画面延迟」到 10 秒以上</b>，否则新路一直超预算、字幕会迟到。
+          <b>选中它时延迟会自动抬到 10 秒</b>（<b>不会往下压</b>你已经设得更大的值；切回别的服务就立刻回到你自己的值）。
           <br />
           ⚠️ <b>已知限制：生僻专有名词还是认不准</b> —— 实测「コックスプレッシャー」这类
           需要 <b>约 14 秒</b>的批长才认对，而那时延迟得 <b>≈18 秒</b>。日常句子不受影响。
           <br />
-          ⚠️ <b>实验性</b>：关掉就回到旧路，行为逐字不变。
+          ⚠️ <b>实验性</b>：切回「本地 VAD 断句」就回到旧路，行为逐字不变。
         </p>
         <p class="hint">
           <b>146 个词</b>：配信 / 生放送 / 枠 / 凸待ち / スパチャ / 初見 / 常連 … ——

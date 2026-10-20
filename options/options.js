@@ -85,10 +85,10 @@ const FIELDS = [
   // 原来这里是「把术语表里的源词也并入识别热词」，用户反馈它有问题（术语表是翻译用的表，
   // 整表塞进 prompt 会把识别带偏），v2.66.80 起换成这个。
   ['wc-liveHotwords', 'checkbox', 'asr.whisperChunked.liveHotwords'],
-  // 新的断句架构（Whisper 先断、VAD 只做静音确认）—— **默认关**。
-  // ⚠️ 现在打开它不会有任何变化：新路还没接进 vad.js 的 flushSpeech（旧路仍在跑）。
-  //    零件已齐（lib/asr/whisper-segments.js + lib/asr/silence-span.js），接上才生效。
-  ['wc-whisperSegments', 'checkbox', 'asr.whisperChunked.whisperSegments'],
+  // ⚠️ 新断句架构（Whisper 先断、VAD 只做静音确认）**这里没有勾选框** ——
+  //    它已经是「识别服务」下拉里的一整项（`vad-segments`）。断句策略只能有一个来源，
+  //    否则会出现"选了 A 而实际跑 B"。旧开关 `asr.whisperChunked.whisperSegments`
+  //    只留给 v2.66.82 的迁移读一次（搬完就清回 false）。
   ['wc-skipSilence', 'checkbox', 'asr.whisperChunked.skipSilence'],
   // AGC 档位：差麦克风场景下 gentle 常常比默认更稳（提升减半、收敛慢 4 倍、噪声门抬高）
   ['cp-agcProfile', 'text', 'capture.agcProfile'],
@@ -581,8 +581,12 @@ async function onTestAsr() {
   setResult('asrTestResult', '测试中…', '');
   const settings = collect();
   try {
-    // 本地 VAD 和 Whisper 分片打的是同一个端点，测试方式一样
-    if (settings.asr.provider === 'whisper-chunked' || settings.asr.provider === 'vad') {
+    // 本地 VAD、本地 Whisper 自断句、Whisper 分片打的是同一个端点，测试方式一样
+    if (
+      settings.asr.provider === 'whisper-chunked' ||
+      settings.asr.provider === 'vad' ||
+      settings.asr.provider === 'vad-segments'
+    ) {
       const status = await probeWhisper(settings.asr.whisperChunked);
       setResult('asrTestResult', `端点可达（HTTP ${status}）`, 'ok');
     } else if (settings.asr.provider === 'dashscope') {
