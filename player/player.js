@@ -2293,30 +2293,29 @@ function pumpSubtitles() {
    */
   if (holdEnabled && dueItems.length) {
     /**
-     * ⭐ **宽限等待**：队首到点后**再多等一小会儿**，把这段时间内到期的也收进来一起出 ✓
+     * 🔴 **宽限等待已撤掉** ✗ —— 用户定的
      *
-     * 为什么必须有（真机 `xhsp-batch2-B` 实测）：不加它时 `屏上批量` 只触发 **3 次 / 51 条** ✗
-     * 因为 `schedule.due()` 每拍几乎只到期**一条** ⇒ "同一拍里 at 相近的"凑不出批 ✗
-     * ⇒ 用户要的"同时出现"就退化成"一条一条换"了 ✗
+     * 用户原话：
+     * > 「你对闪的优化有问题。**不要有什么上屏时间限制**。只有下一句该上了就上。
+     * >   问题是**什么时候该上**,而不是让他**前面的延长**」
      *
-     * 判据（两条同时成立才等）：
-     *   ① 队首到点还**没满** `SHOW_BATCH_TOLERANCE_SEC`
-     *   ② 队列里**确实有**在这段宽限内会到期的条目 ⇒ 等它才可能凑成批 ✓
-     * ⇒ 若队列里没有快到的，就**立刻出**（不无谓变晚 ✗）
+     * 原来这里有一段"队首到点后再等 1.5 秒，把这段内到期的收进来" ✗ ——
+     * 它确实让「屏上批量」从 3 次涨到 13 次 ✓，但代价是**每批都白等最多 1.5 秒**，
+     * 真机实测「比排期晚」中位 **1.29 → 1.69 秒** ✗。
+     *
+     * ⇒ **"等"换来的是"晚"，而"晚"是累积的** ✗（越往后越落后）
+     * ⇒ 撤掉之后：`schedule.due()` 这一拍弹出来的就是这一批 ✓
+     *    —— 同一拍里到期的条目仍然**一起上屏**（"同时出现"保留 ✓）、**合一行** ✓
+     *    而**不再为了凑批而故意多等** ✓
+     *
+     * ⚠️ 真正的解是 ②：把 `at`（该上的时刻）算准（见 `shownStartOf` 的多段锚）✗
+     *    而不是靠"等"或"让前面那条多待" —— 那两者都只会让时间轴往后塌 ✓
      */
-    const graceMs = SHOW_BATCH_TOLERANCE_SEC * 1000;
-    const head = dueItems[0];
-    const nextAt = schedule.items[0] && Number.isFinite(schedule.items[0].at) ? schedule.items[0].at : null;
-    const waitedMs = Number.isFinite(head.at) ? now - head.at : graceMs;
-    if (nextAt !== null && waitedMs < graceMs && nextAt <= now + (graceMs - waitedMs)) {
-      schedule.items.unshift(...dueItems);
-      pumpLater();
-      return;
-    }
     const { batch, rest } = pickShownBatch(dueItems);
     /**
-     * 屏上那一条的最小在屏时长（按**它自己**算：跨度剩余 / 读完要多久 / 0.6s 下限）。
-     * ⚠️ 按"批"算 —— 一批整体算一条，因为它们**同时出现** ✓
+     * 屏上那一条的最小在屏时长。
+     * ⚠️ 现在只剩 `MIN_SHOW_SEC`（0.6 秒）这一个绝对下限 ——
+     *    "跨度剩余"和"字数÷6"两项已按用户要求撤掉（见 `minShowHoldMs` 的说明）✗
      */
     let minHoldMs = MIN_SHOW_HOLD_MS;
     if (history.length) {
