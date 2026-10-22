@@ -12246,6 +12246,48 @@ assertSpeechRun();
     }
   });
 
+  /**
+   * 🔴 **连续翻译失败之后不许再等译文** ✗
+   *
+   * 病（真机实测 `xhsp-nofix-B`，2026-10-23，出网被拦）：`translate.googleapis.com`
+   * 全程 `Failed to fetch` / 12 秒超时 ⇒ 52 条字幕**全部**撞 4 秒兜底、全部退回日文原文 ✗
+   * ⇒ 显示吞吐钉死 **4 秒/条**，而识别 **2.5 秒/条** ⇒ 队列无界积压
+   * ⇒「比排期晚」60 秒内从 **6 秒涨到 19 秒** ✗ —— 观众体感"普遍都晚那么多" ✓
+   */
+  check('翻译故障：连续失败 ≥3 次之后**不再等译文**（否则吞吐被钉死、字幕一路变晚 ✗）', () => {
+    const F = WB.translationHoldMs;
+    if (typeof F !== 'function') throw new Error('whisper-batch.js 没有导出 translationHoldMs');
+    if (WB.TRANSLATE_FAIL_STREAK !== 3) {
+      throw new Error(`连续失败阈值应是 3，实际 ${WB.TRANSLATE_FAIL_STREAK}`);
+    }
+    // ① 没失败 / 失败不够 ⇒ 照旧等 4 秒 ✓
+    for (const n of [0, 1, 2]) {
+      if (F(n) !== 4000) throw new Error(`连续失败 ${n} 次时应仍等 4000ms，实际 ${F(n)}`);
+    }
+    // ② 够 3 次 ⇒ 立刻放行（0）✓
+    for (const n of [3, 4, 10]) {
+      if (F(n) !== 0) throw new Error(`连续失败 ${n} 次时必须不再等（0ms），实际 ${F(n)}`);
+    }
+    // ③ 自定义兜底时长要能被覆盖 ✓
+    if (F(0, 1500) !== 1500) throw new Error(`lateMs 应可覆盖，实际 ${F(0, 1500)}`);
+    // ④ 脏输入一律当"没在失败" ⇒ 用正常兜底（`Number(null) === 0` 那一族 ✗）
+    for (const bad of [undefined, null, 'abc', NaN, -9, {}]) {
+      if (F(bad) !== 4000) throw new Error(`脏输入 ${JSON.stringify(bad)} 应用 4000，实际 ${F(bad)}`);
+    }
+    if (F(5, 'abc') !== 0) throw new Error('失败够多时，脏 lateMs 也必须是 0');
+    // ⑤ ⭐ **接线反证**：`player.js` 必须用这个纯函数，不许自己再写一份判据 ✗
+    const playerSrc = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
+    if (!/translationHoldMs\(translateFailStreak/.test(playerSrc)) {
+      throw new Error('player.js 没有调用 translationHoldMs —— 「不再等译文」没接线 ✗');
+    }
+    if (/translateFailStreak\s*>=\s*TRANSLATE_FAIL_STREAK/.test(playerSrc)) {
+      throw new Error('player.js 自己又写了一份阈值判据 —— 两份真相 ✗（阈值只在 lib 里 ✓）');
+    }
+    if (!/translateFailStreak = 0;/.test(playerSrc) || !/translateFailStreak \+= 1;/.test(playerSrc)) {
+      throw new Error('player.js 必须在成功时清零、失败时自增 —— 否则恢复后回不到"等译文" ✓');
+    }
+  });
+
   check('上屏时刻：`holdSwitchForGap` 屏上让位（上一条没待够就别换屏，只对新路）', () => {
     // ⚠️ 为什么夹在**排期时刻**上不够（实测）：`at` 里含会变的 `delayMs` ✗
     //    `xhsp-ab3-B` 里「夹紧推后」**一次都没触发**（0 次），而导出日志里仍有
