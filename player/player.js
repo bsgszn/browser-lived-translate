@@ -41,7 +41,7 @@ import {
   pickShownBatch,
   mergeShownBatch,
   SHOW_BATCH_TOLERANCE_SEC,
-  translationHoldMs,
+  displayHoldMs,
   TRANSLATE_FAIL_STREAK,
 } from '../lib/asr/whisper-batch.js';
 import { JA_LIVE_HOTWORD_LIST } from '../lib/hotwords/ja-live.js';
@@ -646,7 +646,12 @@ async function saveAudioAndLog() {
      *  而那两个错**看起来像模型问题**，不像配置问题，所以错了很久没人发现 ✗
      *  → 一个没被印出来的配置，错了就没人能一眼看出来。 */
     ` · 识别语言 ${cfg(() => sv()?.asr?.language)}` +
-    ` · 翻译 ${cfg(() => sv()?.translation?.provider)}` +
+    /**
+     * ⚠️ 键名是 `translate`，不是 `translation` ✗
+     *    写错过一次 ⇒ 快照上那格一直印 `翻译 ?` ⇒ 查"翻译到底开没开"时看了一眼却没看出问题
+     *    （`DEFAULT_SETTINGS` 里是 `translate: { provider, target, ... }`）
+     */
+    ` · 翻译 ${cfg(() => sv()?.translate?.provider)}` +
     /**
      * ⚠️ **必须印生效值，而不是设定值** —— 两处会不一致，而那个不一致害过一次 ✗
      *
@@ -2386,7 +2391,7 @@ function pumpSubtitles() {
       );
     }
     diagShown(item, now);
-    if (!item.translation) diag('翻译没赶上 · 先显示原文', true);
+    if (!item.translation && !translationOff()) diag('翻译没赶上 · 先显示原文', true);
     rendered.set(item.id, item);
     history.push(item.id);
     if (history.length > 3) {
@@ -2509,7 +2514,7 @@ function pumpSubtitles() {
      * ⇒ 导出里那些句子的"上屏时刻"是**缺的**，而"在屏时长"只能反推 ⇒ 那些数不可信 ✗
      */
     diagShown(item, now);
-    if (!item.translation) diag('翻译没赶上 · 先显示原文', true);
+    if (!item.translation && !translationOff()) diag('翻译没赶上 · 先显示原文', true);
     // 存引用而不是拷贝：译文晚到时才能直接改到已经上屏的这一条
     rendered.set(item.id, item);
     history.push(item.id);
@@ -2542,10 +2547,21 @@ const LATE_TRANSLATION_MS = 4000;
 /**
  * 当前**连续**翻译失败次数（成功一次清零 ✓）。
  *
- * ⚠️ 阈值和判据都在 `lib/asr/whisper-batch.js` 的 `translationHoldMs`（纯函数，有断言 ✓）
+ * ⚠️ 阈值和判据都在 `lib/asr/whisper-batch.js`（`displayHoldMs` / `translationHoldMs`，纯函数、有断言 ✓）
  *    —— 这里只负责计数，别在显示层再写一份判据（两份真相 ✗）
  */
 let translateFailStreak = 0;
+
+/**
+ * 翻译被**关掉**了吗（`translate.provider === 'none'` = 「不翻译（仅显示原文）」）。
+ *
+ * ⚠️ 和 `lib/translate/index.js` 的 `isTranslateEnabled` 是**同一个判据**，
+ *    只是这里不吃 `null` settings（那边会直接抛）✓
+ */
+function translationOff() {
+  const t = settings?.translate;
+  return !!(t && t.provider === 'none');
+}
 
 function renderable(now) {
   return (item) => {
@@ -2553,10 +2569,19 @@ function renderable(now) {
     // 第一次到点却没译文时记下时刻，用它衡量"已经扣了多久"
     if (!item.dueSince) item.dueSince = now;
     /**
-     * ⚠️ 翻译已经连续失败到阈值 ⇒ **不再等**（0 毫秒）✗
-     *    否则每条白等 4 秒 ⇒ 吞吐天花板 4 秒/条 ⇒ 字幕一路变晚 ✓
+     * 要等译文多久 —— **判据只在 lib 一处**（`displayHoldMs`，纯函数、有断言 ✓）✗
+     *
+     * 它管两件事，两件都会把吞吐钉死成 `LATE_TRANSLATION_MS` 一条：
+     *   ① 翻译**关掉**（「不翻译（仅显示原文）」）⇒ 0 —— 译文永远不来，等就是白等
+     *   ② 连续失败 ≥ `TRANSLATE_FAIL_STREAK` ⇒ 0 —— 翻译挂了，同样等不到
+     * 实测（闭环 · 不翻译 · 160 秒）：不修则在屏时长恒定 **4.02s**（32/35 条）、
+     * 「比排期晚」中位 **15.30s** / 最大 **37.13s** ✗；修后中位 **1.32s** / 最大 **2.37s** ✓
      */
-    const holdMs = translationHoldMs(translateFailStreak, LATE_TRANSLATION_MS);
+    const holdMs = displayHoldMs({
+      translateOn: !translationOff(),
+      failStreak: translateFailStreak,
+      lateMs: LATE_TRANSLATION_MS,
+    });
     return now - item.dueSince >= holdMs;
   };
 }
