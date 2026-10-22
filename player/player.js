@@ -41,6 +41,8 @@ import {
   pickShownBatch,
   mergeShownBatch,
   SHOW_BATCH_TOLERANCE_SEC,
+  translationHoldMs,
+  TRANSLATE_FAIL_STREAK,
 } from '../lib/asr/whisper-batch.js';
 import { JA_LIVE_HOTWORD_LIST } from '../lib/hotwords/ja-live.js';
 import { buildAnalysisChain, AgcController, setAgcProfile } from '../lib/audio-chain.js';
@@ -1989,6 +1991,8 @@ async function translateSegment(seg) {
     }
 
     if (out) {
+      // 翻译成功 ⇒ 失败连击清零（服务恢复后立刻回到"等译文"的正常行为 ✓）
+      translateFailStreak = 0;
       if ((Number(seg.gen) || 0) !== gen) {
         // 期间被并进了新内容 → 这份译文作废（原文已经变长，它只对应前半截）
         diag(`译文作废 · 这句刚被并进了新内容，需重翻`, true);
@@ -1999,6 +2003,27 @@ async function translateSegment(seg) {
       }
     }
   } catch (e) {
+    /**
+     * 🔴 **连续翻译失败要计数** ✗ —— 否则它会变成"每条字幕都等 4 秒"的吞吐天花板
+     *
+     * 实测（2026-10-23 闭环，`xhsp-nofix-B`）：出网被拦，`translate.googleapis.com`
+     * 全程 `Failed to fetch` / 12 秒超时 ⇒ 52 条字幕**全部**撞上 `LATE_TRANSLATION_MS`
+     * 的 4 秒兜底、全部显示日文原文 ✗ ⇒ 显示吞吐被钉死 **4 秒/条**，
+     * 而识别约 **2.5 秒/条** ⇒ 队列越积越长 ⇒「比排期晚」从 6 秒涨到 **19 秒** ✗
+     * 而观众体感就是"**普遍都晚那么多**" ✓
+     *
+     * ⇒ 连续失败够多就**不再等译文**：立刻显示原文，译文真到了再由 `renderSubs()` 补上
+     *    （那条路径本来就有 ✓ 见上面 `if (rendered.has(seg.id)) renderSubs();`）
+     * ⚠️ 成功一次就复位 —— 服务恢复后立刻回到"等译文"的正常行为 ✓
+     */
+    translateFailStreak += 1;
+    if (translateFailStreak === TRANSLATE_FAIL_STREAK) {
+      diag(
+        `翻译失败 · 连续 ${translateFailStreak} 次 ⇒ 不再等译文（否则每条白等 ${LATE_TRANSLATION_MS}ms，` +
+          `字幕会一路变晚 ✗）；原文先上屏，译文回来再补`,
+        true,
+      );
+    }
     diag(`翻译失败 · ${Date.now() - t0}ms · ${e?.message || e}`, true);
   } finally {
     // 必须无条件归位。原来这一步写在正常路径末尾，只要请求挂住一次，
@@ -2514,12 +2539,25 @@ function pumpSubtitles() {
  */
 const LATE_TRANSLATION_MS = 4000;
 
+/**
+ * 当前**连续**翻译失败次数（成功一次清零 ✓）。
+ *
+ * ⚠️ 阈值和判据都在 `lib/asr/whisper-batch.js` 的 `translationHoldMs`（纯函数，有断言 ✓）
+ *    —— 这里只负责计数，别在显示层再写一份判据（两份真相 ✗）
+ */
+let translateFailStreak = 0;
+
 function renderable(now) {
   return (item) => {
     if (item.translation) return true;
     // 第一次到点却没译文时记下时刻，用它衡量"已经扣了多久"
     if (!item.dueSince) item.dueSince = now;
-    return now - item.dueSince >= LATE_TRANSLATION_MS;
+    /**
+     * ⚠️ 翻译已经连续失败到阈值 ⇒ **不再等**（0 毫秒）✗
+     *    否则每条白等 4 秒 ⇒ 吞吐天花板 4 秒/条 ⇒ 字幕一路变晚 ✓
+     */
+    const holdMs = translationHoldMs(translateFailStreak, LATE_TRANSLATION_MS);
+    return now - item.dueSince >= holdMs;
   };
 }
 
