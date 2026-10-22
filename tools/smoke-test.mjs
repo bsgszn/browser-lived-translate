@@ -11631,25 +11631,51 @@ assertSpeechRun();
       if (got !== plain) throw new Error(`${name} ⇒ 必须原样返回 ${plain}，实际 ${got}`);
     }
 
-    // ⑤ `seg.start > 0.02` ⇒ Whisper 给了真实边界，**不许**被 VAD 覆盖
-    //    ⚠️ 判据用「回调**根本没被调用**」而不是「值没变」——
-    //       后者在"调了但结果碰巧相等"时会漏判 ✗（这一族今天栽过）
-    const segMoved = { start: 1.5, end: 5.44, text: 'x' };
+    /**
+     * ⑤ 🔴 **多段锚**：非首段的 `seg.start` **照样问 VAD** —— 而"真实边界"靠**位移门槛**保护 ✗
+     *
+     * 原来这里断言的是「`seg.start > 0.02` ⇒ 一次都不许问」✗ —— 那正是这次的病根：
+     * 一批里 Whisper 给 3 段时，**只有第一段**用过 VAD 开口锚，
+     * 第 2、3 段的 `at` 全靠 `seg.start`；而 Whisper 合并段时那个 `start` 落在前导短音上 ✓
+     *
+     * ⇒ 现在判据换成**两条**（比原来更准，不是放宽 ✗）：
+     *    · `seg.start = 1.5` 且 VAD 指出的开口**只晚 40ms** ⇒ 问 ≥1 次，而**不许挪**
+     *      （40ms 是帧粒度抖动，挪它没有任何意义 ✗）
+     *    · 同上但开口**晚 0.6 秒** ⇒ **必须挪到那里** ✓（那才是"这一段开头有 0.6 秒不是语音"）
+     */
+    const segMoved = { start: 1.5, end: 6.94, text: 'x' };
     const plainMoved = WB.shownStartOf({ offsetSec: base, seg: segMoved, pcm, sampleRate: SR });
-    let movedCalls = 0;
-    const keptMoved = WB.shownStartOf({
-      offsetSec: base,
-      seg: segMoved,
-      pcm,
-      sampleRate: SR,
-      firstSpeechAt: () => { movedCalls += 1; return base + 0.1; },
-      speechThreshold: THR,
-    });
-    if (movedCalls !== 0) {
-      throw new Error(`seg.start=${segMoved.start} 时不该问 VAD（它会覆盖真实边界），实际调了 ${movedCalls} 次`);
+    {
+      let calls = 0;
+      const got = WB.shownStartOf({
+        offsetSec: base,
+        seg: segMoved,
+        pcm,
+        sampleRate: SR,
+        firstSpeechAt: () => { calls += 1; return base + 1.5 + 0.04; },
+        speechThreshold: THR,
+      });
+      if (calls !== 1) {
+        throw new Error(`非首段 seg.start=${segMoved.start} 必须问 VAD 一次（多段锚 ✗），实际 ${calls} 次`);
+      }
+      if (got !== plainMoved) {
+        throw new Error(`开口只晚 40ms 时不许挪（帧粒度抖动 ✗）：${got} ≠ ${plainMoved}`);
+      }
     }
-    if (keptMoved !== plainMoved) {
-      throw new Error(`seg.start=1.5 时不许被 VAD 覆盖：${keptMoved} ≠ ${plainMoved}`);
+    {
+      let calls = 0;
+      const got = WB.shownStartOf({
+        offsetSec: base,
+        seg: segMoved,
+        pcm,
+        sampleRate: SR,
+        firstSpeechAt: () => { calls += 1; return base + 1.5 + 0.6; },
+        speechThreshold: THR,
+      });
+      if (calls !== 1) throw new Error(`非首段也必须问 VAD，实际 ${calls} 次`);
+      if (Math.abs(got - (base + 1.5 + 0.6)) > 1e-6) {
+        throw new Error(`开口晚 0.6s ⇒ 必须锚到 ${base + 1.5 + 0.6}，实际 ${got}`);
+      }
     }
 
     // ⑥ 完全不传回调（旧路 / 离线仿真）⇒ 逐字一样
@@ -11709,7 +11735,9 @@ assertSpeechRun();
       }
     }
 
-    // ② 非首段 + 同样 seg.start = 0.4 ⇒ **一次都不许问**
+    // ② 非首段 + 同样 seg.start = 0.4、而开口只晚 0.02 秒
+    //    🔴 **多段锚**：现在**要问**（原来断言"一次都不许问"✗）
+    //    而结果**不许采信**（0.02 < `MIN_ANCHOR_SHIFT_SEC` 0.1）⇒ 值必须和不传时一致 ✓
     {
       const seg = { start: 0.4, end: 3.4, text: 'ああああああ' };
       const cb = mk(0.42);
@@ -11717,9 +11745,9 @@ assertSpeechRun();
         offsetSec: base, seg, pcm, sampleRate: SR,
         firstSpeechAt: cb.fn, speechThreshold: 0.5,
       });
-      if (cb.calls !== 0) throw new Error(`非首段 seg.start=0.4 不许问 VAD，实际 ${cb.calls} 次`);
+      if (cb.calls !== 1) throw new Error(`非首段也必须问 VAD 一次（多段锚 ✗），实际 ${cb.calls} 次`);
       const plain = WB.shownStartOf({ offsetSec: base, seg, pcm, sampleRate: SR });
-      if (got !== plain) throw new Error(`非首段必须和不传回调时一致：${got} ≠ ${plain}`);
+      if (got !== plain) throw new Error(`位移只有 0.02s 时不许挪：${got} ≠ ${plain}`);
     }
 
     // ③ 首段但 `seg.start = 1.5`（>= 1 秒）⇒ Whisper 已经在说"开头 1.5 秒没语音" ⇒ 不许问
@@ -11839,17 +11867,28 @@ assertSpeechRun();
           throw new Error(`被拒时必须带出 VAD 的 reason，实际 ${probe.reason}`);
         }
       }
-      // ⓔ 非首段且 start 是真实边界 ⇒ decision 必须是 skipped-not-first（不许被当成"没动"）
+      /**
+       * ⓔ 🔴 **多段锚**：非首段（`start` 看起来是"真实边界"）**照样要问 VAD** ✗
+       *
+       * 原来这里断言 `decision === 'skipped-not-first'` 且**一次都不许问** ✗
+       * —— 那正是病根：一批 3 段时只有第一段用过开口锚，
+       * 第 2、3 段全靠 `seg.start`，而 Whisper 合并段时它落在前导短音上 ✓
+       *
+       * ⇒ 现在：问了，且位移 ≥0.1 秒 ⇒ **采信**（`decision === 'vad'`）✓
+       */
       {
         const probe = {};
         const cb = mkDelta(1.0);
-        WB.shownStartOf({
+        const got = WB.shownStartOf({
           offsetSec: base, seg: { start: 0.5, end: 3, text: 'ああ' }, pcm, sampleRate: SR,
           firstSpeechAt: cb.fn, speechThreshold: 0.5, probe,
         });
-        if (cb.calls !== 0) throw new Error('非首段 start=0.5 不许问 VAD');
-        if (probe.decision !== 'skipped-not-first') {
-          throw new Error(`应为 skipped-not-first，实际 ${probe.decision}`);
+        if (cb.calls !== 1) throw new Error(`非首段也必须问 VAD 一次（多段锚 ✗），实际 ${cb.calls} 次`);
+        if (probe.decision !== 'vad') {
+          throw new Error(`非首段位移 1s ⇒ 应采信（decision=vad），实际 ${probe.decision}`);
+        }
+        if (Math.abs(got - (base + 1.5)) > 1e-6) {
+          throw new Error(`非首段应锚到 ${base + 1.5}，实际 ${got}`);
         }
       }
     }
@@ -12097,9 +12136,23 @@ assertSpeechRun();
           ' —— 漏了 return 就会落到旧路循环（实测会指数放大原文 ✗）',
       );
     }
-    // ⑮ ⭐ 宽限等待：队首到点后要等一小会儿把后续到期的收进来（否则凑不出批 —— 实测只 3 次/51 条 ✗）
-    if (!/waitedMs < graceMs/.test(batchBlock)) {
-      throw new Error('没有宽限等待 —— `due()` 每拍几乎只到期一条 ⇒ 批凑不出来（实测 3 次/51 条 ✗）');
+    /**
+     * ⑮ 🔴 **宽限等待必须不存在** ✗ —— 用户明确要求撤掉
+     *
+     * 用户原话：
+     * > 「你对闪的优化有问题。**不要有什么上屏时间限制**。只有下一句该上了就上。
+     * >   问题是**什么时候该上**,而不是让他**前面的延长**」
+     *
+     * 那段"队首到点后再等 1.5 秒"曾把「屏上批量」从 3 次涨到 13 次 ✓，
+     * 但真机实测「比排期晚」中位 **1.29 → 1.69 秒** ✗ —— 而"晚"是累积的 ✓
+     * ⇒ 撤掉：这一拍 `due()` 弹出什么就是什么，**不再为了凑批而等** ✗
+     * ⚠️ 而"同时出现"仍然保留（同拍到期的照样一起上屏 ✓ 合成一行 ✓）
+     */
+    if (/waitedMs < graceMs/.test(batchBlock) || /setTimeout\(pumpSubtitles/.test(batchBlock)) {
+      throw new Error(
+        '按批分支里还有"宽限等待"（等多 1.5 秒凑批）—— 用户明确要求撤掉：' +
+          '不要上屏时间限制，该上就上（实测它会累积成"晚 1.69 秒" ✗）',
+      );
     }
     // ⑭ ⭐ flush 前必须给**每一条**打 `shownAt`（幂等保护 —— 同一条不许被反复 flush ✗）
     if (!/for \(const b of batch\) b\.shownAt = now;/.test(batchBlock)) {
@@ -12111,38 +12164,55 @@ assertSpeechRun();
     }
   });
 
-  check('上屏时刻：`minShowHoldMs` 每条「待够再换」（按自己的字数/跨度算，不是固定 0.5s）', () => {
-    // ⚠️ 为什么固定 0.5 秒不够（用户实测报的）✗:
-    //    7/56 条**在屏时长 < 它自己的跨度**（还没说完就被换 ✗）· 阅读速度 **20~210 字/秒** ✗
-    //    例:`21 字 / 2s` 在 0.1 秒后就被换掉 ⇒ 观众一个字都没读进去 ✗
+  check('上屏时刻：`minShowHoldMs` **只剩 0.6 秒绝对下限**（"待够"已按用户要求撤掉 ✗）', () => {
+    /**
+     * 🔴 用户原话：
+     * > 「你对闪的优化有问题。**不要有什么上屏时间限制**。只有下一句该上了就上。
+     * >   问题是**什么时候该上**,而不是让他**前面的延长**」
+     *
+     * ⇒ 原来这里取 `max(跨度剩余, 字数÷6, 0.6s)` ✗ —— 前两项**都是"延长前面那条"** ✗
+     *    它不解决"闪"，只把"后面那句上得太早"掩盖成"前面那句待得久"；
+     *    而掩盖有账：真机闭环实测「比排期晚」中位 **1.20 → 1.29 → 1.69 秒**（一路累积 ✗）
+     *
+     * ⇒ 现在只保留 `MIN_SHOW_SEC`（0.6 秒）—— 那是"人眼认得出这是一行字"的物理下限 ✓
+     *    而"该上的时刻"要靠在 `shownStartOf` 里**算准 `at`**（多段锚）✗ 不是靠等 ✓
+     */
     const F = WB.minShowHoldMs;
     if (typeof F !== 'function') throw new Error('whisper-batch.js 没有导出 minShowHoldMs');
-    if (WB.MIN_READ_CHARS_PER_SEC !== 6) {
-      throw new Error(`阅读速度下限应是 6 字/秒，实际 ${WB.MIN_READ_CHARS_PER_SEC}`);
-    }
     if (WB.MIN_SHOW_SEC !== 0.6) {
       throw new Error(`绝对下限应是 0.6 秒，实际 ${WB.MIN_SHOW_SEC}`);
     }
-
-    // ① **还没说完** ⇒ 取「跨度剩余」（22 字 / 5 秒、才待 0.2 秒 ⇒ 还剩 4.8 秒 ✗）
-    if (F({ chars: 22, spanSec: 5, elapsedMs: 200 }) !== 4800) {
-      throw new Error(`还没说完时应取跨度剩余 4800ms，实际 ${F({ chars: 22, spanSec: 5, elapsedMs: 200 })}`);
+    const FLOOR = 600;
+    // ① 以前"还没说完 ⇒ 取跨度剩余 4800ms"的那组，现在必须**回落到下限** ✗
+    if (F({ chars: 22, spanSec: 5, elapsedMs: 200 }) !== FLOOR) {
+      throw new Error(
+        `"跨度剩余"那一项必须已撤掉（否则就是"延长前面那条"✗）：32 应得 ${FLOOR}，` +
+          `实际 ${F({ chars: 22, spanSec: 5, elapsedMs: 200 })}`,
+      );
     }
-    // ② **字数多、跨度已过** ⇒ 取「读完要多久」（30 字 ÷ 6 = 5000ms ✗）
-    if (F({ chars: 30, spanSec: 2, elapsedMs: 3000 }) !== 5000) {
-      throw new Error(`30 字应取 5000ms，实际 ${F({ chars: 30, spanSec: 2, elapsedMs: 3000 })}`);
+    // ② 以前"30 字 ⇒ 读 5000ms"的那组，同样必须**回落到下限** ✗
+    if (F({ chars: 30, spanSec: 2, elapsedMs: 3000 }) !== FLOOR) {
+      throw new Error(
+        `"字数÷6"那一项必须已撤掉：应得 ${FLOOR}，实际 ${F({ chars: 30, spanSec: 2, elapsedMs: 3000 })}`,
+      );
     }
-    // ③ **字数少、跨度已过** ⇒ 落到下限 600ms（不许 0 ✗ —— 0 等于不挡）
-    if (F({ chars: 3, spanSec: 1, elapsedMs: 5000 }) !== 600) {
-      throw new Error(`短句应落到下限 600ms，实际 ${F({ chars: 3, spanSec: 1, elapsedMs: 5000 })}`);
+    // ③ 短句当然是下限 ✓
+    if (F({ chars: 3, spanSec: 1, elapsedMs: 5000 }) !== FLOOR) {
+      throw new Error(`短句应落到下限 ${FLOOR}ms，实际 ${F({ chars: 3, spanSec: 1, elapsedMs: 5000 })}`);
     }
-    // ④ **脏输入一律不崩、且不低于下限** —— `Number(null) === 0` 那一族 ✗
+    /**
+     * ④ ⭐ **不变量**：无论输入什么（含脏值），返回值**恒等于下限** ✓
+     *    —— 这比逐个 case 写死更硬：将来谁偷偷把某一项加回去，这里立刻红 ✗
+     */
     for (const bad of [undefined, null, {}, { chars: null, spanSec: null, elapsedMs: null },
       { chars: NaN, spanSec: NaN, elapsedMs: NaN }, { chars: -9, spanSec: -9, elapsedMs: -9 },
-      { chars: 'abc', spanSec: 'abc', elapsedMs: 'abc' }]) {
+      { chars: 'abc', spanSec: 'abc', elapsedMs: 'abc' },
+      { chars: 999, spanSec: 60, elapsedMs: 0 }]) {
       const v = F(bad);
-      if (!(Number.isFinite(v) && v >= 600)) {
-        throw new Error(`脏输入必须给出 ≥600ms 的有限值，实际 ${v}（输入 ${JSON.stringify(bad)}）`);
+      if (v !== FLOOR) {
+        throw new Error(
+          `返回值必须恒为 ${FLOOR}ms（"待够"已撤 ✗），实际 ${v}（输入 ${JSON.stringify(bad)}）`,
+        );
       }
     }
 
