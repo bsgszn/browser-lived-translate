@@ -12275,16 +12275,64 @@ assertSpeechRun();
       if (F(bad) !== 4000) throw new Error(`脏输入 ${JSON.stringify(bad)} 应用 4000，实际 ${F(bad)}`);
     }
     if (F(5, 'abc') !== 0) throw new Error('失败够多时，脏 lateMs 也必须是 0');
-    // ⑤ ⭐ **接线反证**：`player.js` 必须用这个纯函数，不许自己再写一份判据 ✗
+    // ⑤ ⭐ **接线反证**：`player.js` 必须走 `displayHoldMs`（两条规则的唯一入口）✗
+    //    ⚠️ 原来钉的是 `translationHoldMs(translateFailStreak` —— 而它有个洞 ✗：
+    //      **翻译关掉**（「不翻译（仅显示原文）」）时那条路仍然等 4 秒
+    //      ⇒ 每条白等 ⇒ 吞吐钉死 4 秒/条 ⇒「比排期晚」中位 15.30s / 最大 37.13s（实测 ✗）
+    //    所以入口换成 `displayHoldMs`，它同时管"翻译关了"和"连续失败"两件事 ✓
     const playerSrc = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
-    if (!/translationHoldMs\(translateFailStreak/.test(playerSrc)) {
-      throw new Error('player.js 没有调用 translationHoldMs —— 「不再等译文」没接线 ✗');
+    if (!/displayHoldMs\(\{/.test(playerSrc)) {
+      throw new Error('player.js 没有调用 displayHoldMs —— 「不再等译文」没接线 ✗');
+    }
+    if (/translationHoldMs\(translateFailStreak/.test(playerSrc)) {
+      throw new Error('player.js 还在直接调 translationHoldMs —— 绕过了「翻译关掉就不等」那条 ✗');
     }
     if (/translateFailStreak\s*>=\s*TRANSLATE_FAIL_STREAK/.test(playerSrc)) {
       throw new Error('player.js 自己又写了一份阈值判据 —— 两份真相 ✗（阈值只在 lib 里 ✓）');
     }
     if (!/translateFailStreak = 0;/.test(playerSrc) || !/translateFailStreak \+= 1;/.test(playerSrc)) {
       throw new Error('player.js 必须在成功时清零、失败时自增 —— 否则恢复后回不到"等译文" ✓');
+    }
+  });
+
+  check('翻译关掉（「不翻译（仅显示原文）」）时**不许等译文** —— 否则每条白等 4 秒、吞吐钉死', () => {
+    /**
+     * 病（闭环实测 2026-10-23，`translate.provider='none'` · 160 秒）：
+     *   显示层只问「`item.translation` 在不在」✗ ⇒ 翻译关掉时**每一条**都走"等译文"那条路
+     *   ⇒ 每条白扣 4 秒 ⇒ 在屏时长**恒定 4.02s**（32/35 条）、「比排期晚」中位 **15.30s** / 最大 **37.13s** ✗
+     * 修后（同一装置只差这一刀）：恒定 4s **0/41**、中位 **1.32s** / 最大 **2.37s** ✓
+     */
+    const F = WB.displayHoldMs;
+    if (typeof F !== 'function') throw new Error('whisper-batch.js 没有导出 displayHoldMs');
+    // ① 翻译关掉 ⇒ 永远 0（失败次数、兜底多长都不该起作用）
+    for (const streak of [0, 1, 2, 3, 99]) {
+      const v = F({ translateOn: false, failStreak: streak });
+      if (v !== 0) throw new Error(`翻译关掉时必须 0ms（streak=${streak}），实际 ${v}`);
+    }
+    if (F({ translateOn: false, lateMs: 12000 }) !== 0) throw new Error('翻译关掉时 lateMs 不该起作用');
+    // ② 翻译开着 ⇒ 回到原有规则
+    if (F({ translateOn: true, failStreak: 0 }) !== 4000) throw new Error('翻译开着、没失败 ⇒ 应等 4000ms');
+    if (F({ translateOn: true, failStreak: 3 }) !== 0) throw new Error('翻译开着、连续失败 3 次 ⇒ 必须 0');
+    if (F({ translateOn: true, failStreak: 0, lateMs: 1500 }) !== 1500) throw new Error('lateMs 应可覆盖');
+    // ③ 只有**明确** `=== false` 才算关 —— `0` / `'false'` / 缺省都当"不知道"⇒ 沿用老行为 ✓
+    //    ⚠️ 这条能抓 `if (!opt.translateOn)` 那种写法（`0` 会被它误判成"关"✗）
+    for (const v of [undefined, 0, '', 'false', null]) {
+      const got = F({ translateOn: v, failStreak: 0 });
+      if (got !== 4000) throw new Error(`translateOn=${JSON.stringify(v)} 不该算"关"，应 4000ms，实际 ${got}`);
+    }
+    if (F() !== 4000) throw new Error('不传参数应沿用老行为（4000ms）');
+    // ④ 脏输入不崩，返回有限非负数
+    for (const bad of [null, 'abc', 0, [], { translateOn: 1 }]) {
+      const v = F(bad);
+      if (!Number.isFinite(v) || v < 0) throw new Error(`脏输入 ${JSON.stringify(bad)} 应返回有限非负数，实际 ${v}`);
+    }
+    // ⑤ `player.js` 必须把「翻译开没开」传进去（只是调了函数但传错常量也白搭 ✗）
+    const ps = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
+    if (!/translateOn:\s*!translationOff\(\)/.test(ps)) {
+      throw new Error('player.js 必须把 translateOn: !translationOff() 传给 displayHoldMs —— 否则翻译关掉时仍会白等 ✗');
+    }
+    if (!/t\.provider === 'none'/.test(ps)) {
+      throw new Error("translationOff() 必须按 translate.provider === 'none' 判（和 isTranslateEnabled 同一判据）✗");
     }
   });
 
