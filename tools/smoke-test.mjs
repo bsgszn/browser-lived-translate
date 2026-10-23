@@ -11552,10 +11552,27 @@ function assertSpeechRun() {
     {
       const S = loaded['lib/settings.js'];
       const dflt = S.DEFAULT_SETTINGS?.asr?.vadSegments?.pauseSplitMinSegSec;
-      if (dflt !== seg) {
+      /**
+       * ⭐ v2.67.1：**设置默认值**和**模块常量**不再要求相等（默认值调成 4，而常量仍是 2.5）
+       *    ⇒ 判据换成**两条一起钉**（改准，不是放宽 ✗）：
+       *      ① 设置默认值必须等于 `vad.js` 里 `?? N` 的兜底 —— 配置坏掉时不许退回旧值 ✗
+       *      ② 模块常量必须仍是历史值 2.5 —— 它是引擎兜底；要改必须是有意的 ✓
+       */
+      if (dflt !== 4) {
         throw new Error(
-          `设置里的默认段长门槛（${String(dflt)}）必须等于常量 PAUSE_SPLIT_MIN_SEG_SEC（${seg}）—— `
-            + '否则升级之后行为就变了 ✗',
+          `设置里的默认段长门槛应当是 4 秒（v2.67.1 有意调宽的），实际 ${String(dflt)}`,
+        );
+      }
+      if (seg !== 2.5) {
+        throw new Error(
+          `常量 PAUSE_SPLIT_MIN_SEG_SEC 应当保持历史值 2.5（引擎兜底），实际 ${String(seg)}`,
+        );
+      }
+      const vsrc = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
+      if (!/pauseSplitMinSegSec:\s*Number\(config\.pauseSplitMinSegSec\s*\?\?\s*4\)/.test(vsrc)) {
+        throw new Error(
+          'vad.js 的 `??` 兜底必须是 4（= 设置默认值）—— '
+            + '否则配置坏掉时会退回 2.5，而设置页显示 4 ✗',
         );
       }
     }
@@ -11569,7 +11586,7 @@ function assertSpeechRun() {
   });
 
   /**
-   * ⭐⭐ **新路的四个旋钮:默认值 = 旧硬编码,且四个都真的接线**（v2.66.84）
+   * ⭐⭐ **新路的五个旋钮:成对的默认值,且五个都真的接线**（v2.66.84 起，v2.67 加第五个）
    *
    * 🔴 这一节存在的理由是一条已经量实的 UI 谎言 ✗：
    *    在这之前，设置页那一栏的 **9 个 VAD 旋钮对新路一个都不生效**
@@ -11578,14 +11595,16 @@ function assertSpeechRun() {
    *    看到 9 个控件、**一个都调不动它** ✓
    *
    * ⚠️ 所以这里的两条判据都不能省：
-   *    ① **默认值逐字等于旧硬编码**（8 / 1.9 / 2.5 / false）——
-   *       否则"加了旋钮"这件事本身就悄悄改了默认行为 ✗
-   *    ② **四个常量真的从设置读** —— 否则又是"存了但不读"
+   *    ① **默认值必须成对** —— v2.67.0 时它要求"逐字等于旧硬编码"（8 / 5 / 1.9 / 2.5 / false），
+   *       而 **v2.67.1 有意改了三个里的两个**（续批 5→4、段内切分 2.5→4）⇒
+   *       判据升级成"设置默认值 == 产品默认 **且** 模块常量 == 历史值 **且** `vad.js` 的
+   *       `??` 兜底 == 设置默认值" ✓ —— 三者缺一就是"两份真相" ✗
+   *    ② **五个常量真的从设置读** —— 否则又是"存了但不读"
    *       （今天这一族栽过五次：`words` 被 `transcribeSegments` 丢掉、
    *        `prompt` 在日志里看不见、`tooShort` 没人消费、`dt` 回填缺半边、
    *        `MIN_SHOW_HOLD_MS || …` 短路静默退化 ✓）
    */
-  check('新路五个旋钮：默认值必须等于旧硬编码，且五个都真的接线', () => {
+  check('新路五个旋钮：默认值 / 模块常量 / vad.js 兜底三者必须成对，且五个都真的接线', () => {
     const S = loaded['lib/settings.js'];
     const B = loaded['lib/asr/whisper-batch.js'];
     const V = loaded['lib/asr/vad.js'];
@@ -11593,26 +11612,53 @@ function assertSpeechRun() {
     if (!g || typeof g !== 'object') throw new Error('DEFAULT_SETTINGS 里没有 asr.vadSegments 这一组');
 
     /**
-     * ① 默认值必须**逐字等于**原来的硬编码 ✓
-     *    —— 这一条是"加旋钮不改变默认行为"的唯一保证 ✗
+     * ① **设置默认值**（产品默认）和 **模块常量**（引擎兜底）都要钉住 ★
+     *
+     * ⭐ v2.67.0：两者相等（8 / 5 / 1.9 / 2.5）—— 那时"加旋钮不许改默认行为" ✓
+     * 🔴 v2.67.1：`continueBatchSec 5→4`、`pauseSplitMinSegSec 2.5→4` **有意改了默认**，
+     *    于是两者**不再相等**。判据改成**三条一起钉**（改准，不是放宽 ✗）：
+     *      ① 设置默认值 == 这个版本的**产品默认**（下表第 4 列）
+     *      ② 模块常量 == **历史值**（引擎兜底，不跟着改）
+     *      ③ `vad.js` 的 `??` 兜底 == 设置默认值（见下面 ② 那段）
+     *    ⇒ 任何一边被悄悄改动都会红 ✓
      *    ⚠️ 用 `!==` 而不是 `Number(x) === Number(y)`：`8 !== '8'` 也要红 ✓
      */
     const mustEqual = [
-      ['maxBatchSec', g.maxBatchSec, B.MAX_BATCH_SEC, 8],
-      ['continueBatchSec', g.continueBatchSec, B.CONTINUE_BATCH_SEC, 5],
-      ['maxAvgWordSec', g.maxAvgWordSec, B.WORDS_MAX_AVG_WORD_SEC, 1.9],
-      ['pauseSplitMinSegSec', g.pauseSplitMinSegSec, V.PAUSE_SPLIT_MIN_SEG_SEC, 2.5],
+      // [键, 设置默认值, 产品默认, 模块常量, 历史常量]
+      ['maxBatchSec', g.maxBatchSec, 8, B.MAX_BATCH_SEC, 8],
+      ['continueBatchSec', g.continueBatchSec, 4, B.CONTINUE_BATCH_SEC, 5],
+      ['maxAvgWordSec', g.maxAvgWordSec, 1.9, B.WORDS_MAX_AVG_WORD_SEC, 1.9],
+      ['pauseSplitMinSegSec', g.pauseSplitMinSegSec, 4, V.PAUSE_SPLIT_MIN_SEG_SEC, 2.5],
     ];
-    for (const [name, actual, fromModule, oldHardcode] of mustEqual) {
-      if (actual !== oldHardcode) {
+    for (const [name, actual, productDefault, fromModule, oldHardcode] of mustEqual) {
+      if (actual !== productDefault) {
         throw new Error(
-          `asr.vadSegments.${name} 默认值必须是 ${oldHardcode}（原来的硬编码），实际 ${String(actual)} —— `
-            + '加旋钮不许改默认行为 ✗',
+          `asr.vadSegments.${name} 的默认值应当是 ${productDefault}（本版产品默认），实际 ${String(actual)} ✗`,
         );
       }
-      if (actual !== fromModule) {
+      if (fromModule !== oldHardcode) {
         throw new Error(
-          `asr.vadSegments.${name} 默认值（${String(actual)}）与模块常量（${String(fromModule)}）不一致 —— 两份真相 ✗`,
+          `模块常量里的 ${name}（${String(fromModule)}）必须保持历史值 ${oldHardcode} —— `
+            + '它是引擎兜底，不跟着设置默认值改 ✗',
+        );
+      }
+    }
+    /**
+     * 🔴 **`maxAvgWordSec` 必须严格小于 2.0** —— 设置默认值和模块常量**都算** ✗
+     *
+     * 判据是严格 `> maxAvgWordSec`，而 E 段（「ん」）正好 `1 词 / 2.00 秒`
+     * ⇒ 取 2.0 时 `2.00 > 2.0` 为 false ⇒ **那个段会漏过去**，而它正是这条判据
+     * 被加进来的唯一理由。
+     *
+     * ⚠️ 这一条是 v2.67.1 加的：那一版原本想把默认值从 1.9 抬到 **2.0**，
+     *    而抬上去**不会多放过任何一句真话**（1.9 已经放过 1.78 / 1.79），
+     *    只会丢掉 E 段那道保护 ✗ —— 所以这里同时钉住"两边都 < 2.0" ✓
+     */
+    for (const [where, v] of [['设置默认值', g.maxAvgWordSec], ['模块常量', B.WORDS_MAX_AVG_WORD_SEC]]) {
+      if (!(typeof v === 'number' && v > 1.1 && v < 2.0)) {
+        throw new Error(
+          `${where} maxAvgWordSec 必须落在 (1.10, 2.00) 之间（放过 1.01~1.10 的真话、`
+            + `拦住 E 段 2.00 秒/词），实际 ${String(v)} ✗`,
         );
       }
     }
@@ -11630,12 +11676,12 @@ function assertSpeechRun() {
      */
     const src = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
 
-    // 四个都从 config 读（且默认值写在 `??` 右边，和 ① 那次比对形成闭环 ✓）
+    // 四个都从 config 读（且 `??` 右边的兜底必须等于**设置默认值**，和 ① 形成闭环 ✓）
     for (const [name, dflt] of [
       ['maxBatchSec', 8],
-      ['continueBatchSec', 5],
+      ['continueBatchSec', 4],
       ['maxAvgWordSec', 1.9],
-      ['pauseSplitMinSegSec', 2.5],
+      ['pauseSplitMinSegSec', 4],
     ]) {
       const re = new RegExp(`${name}:\\s*Number\\(config\\.${name}\\s*\\?\\?\\s*${String(dflt).replace('.', '\\.')}\\)`);
       if (!re.test(src)) {
