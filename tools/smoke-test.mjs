@@ -11227,12 +11227,30 @@ function assertSpeechRun() {
      *      而且比原来更严：原来只要有一行长这样就过，现在要求**紧接着真的拦掉** ✓
      */
     const vadSrc = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
-    const slowByIdx = vadSrc.indexOf('if (looksTooSlowByWords(seg))');
+    /**
+     * ⚠️ v2.66.84：这一处现在**带第二个参数**（`{ maxAvgWordSec: segOpts.maxAvgWordSec }`）——
+     *    因为阈值改成从设置读（`asr.vadSegments.maxAvgWordSec`）✓
+     *    ⇒ 原来钉的 `/if \(looksTooSlowByWords\(seg\)\)/` 会红，而红的理由不是行为坏了 ✗
+     *    所以改成「调了（允许多一个参数）+ 真的拦掉 + **阈值必须从设置来**」✓
+     *    —— 最后那一条是**新加的**：它才是"旋钮真的接线"的判据 ✓
+     */
+    const slowByIdx = vadSrc.search(/if \(looksTooSlowByWords\(seg[,)]/);
     if (slowByIdx < 0) {
       throw new Error('isTextTrustworthy 没有调用 looksTooSlowByWords —— 垃圾段拦不住');
     }
-    if (!/return false;/.test(vadSrc.slice(slowByIdx, slowByIdx + 600))) {
-      throw new Error('looksTooSlowByWords 调了却没拦掉（后面 600 字里没有 return false）');
+    /**
+     * ⚠️ 窗口从 600 放宽到 1500 —— 这不是放宽判据 ✗：
+     *    v2.66.83 给这一处加了「被拦原因」诊断（`recordTrustReject(why('too-slow-by-words', …))`），
+     *    而那段模板字面量本身就占掉 300 多字 ⇒ `return false` 落到了 600 之外 ✗
+     *    判据本身没变：**调了就必须接着拦掉** ✓
+     */
+    if (!/return false;/.test(vadSrc.slice(slowByIdx, slowByIdx + 1500))) {
+      throw new Error('looksTooSlowByWords 调了却没拦掉（后面 1500 字里没有 return false）');
+    }
+    if (!/looksTooSlowByWords\(seg,\s*\{\s*maxAvgWordSec:\s*segOpts\.maxAvgWordSec\s*\}\)/.test(vadSrc)) {
+      throw new Error(
+        'looksTooSlowByWords 没有拿到设置里的阈值 —— 「词均时长上限」在设置页是一个假旋钮 ✗',
+      );
     }
     /**
      * ⑮ 阈值常量必须导出，且必须落在**两端都是实测数据**的区间里 ✗
@@ -11519,9 +11537,27 @@ function assertSpeechRun() {
     /**
      * ② 段长门槛必须真的参与判断（不能算出来不用）✗
      *    —— "判据存在但从不消费"这一族今天栽过（`tooShort` 算了没人读 ✓）
+     *
+     * ⚠️ v2.66.84：门槛现在从**设置**读（`asr.vadSegments.pauseSplitMinSegSec`）✓
+     *    ⇒ 原来钉的 `/dur >= PAUSE_SPLIT_MIN_SEG_SEC/` 会红，而那不是行为坏了 ✗
+     *    ⇒ 改成：**必须用 `segOpts.pauseSplitMinSegSec`**（比原来更严 —— 它要求旋钮真的接线 ✓），
+     *      同时常量仍然导出、并且**等于设置里的默认值**（否则"默认 = 旧硬编码"就不成立 ✗）
      */
-    if (!/dur\s*>=\s*PAUSE_SPLIT_MIN_SEG_SEC/.test(src)) {
-      throw new Error('PAUSE_SPLIT_MIN_SEG_SEC 没有参与判断 —— 短句也会被扫，更容易误切');
+    if (!/dur\s*>=\s*segOpts\.pauseSplitMinSegSec/.test(src)) {
+      throw new Error(
+        '段长门槛没有从设置读（必须是 segment `dur >= segOpts.pauseSplitMinSegSec`）—— '
+          + '「段内切分门槛」在设置页就是一个假旋钮 ✗',
+      );
+    }
+    {
+      const S = loaded['lib/settings.js'];
+      const dflt = S.DEFAULT_SETTINGS?.asr?.vadSegments?.pauseSplitMinSegSec;
+      if (dflt !== seg) {
+        throw new Error(
+          `设置里的默认段长门槛（${String(dflt)}）必须等于常量 PAUSE_SPLIT_MIN_SEG_SEC（${seg}）—— `
+            + '否则升级之后行为就变了 ✗',
+        );
+      }
     }
     /**
      * ③ 切开的**第二条**也要过排期夹紧 ✗
@@ -11529,6 +11565,140 @@ function assertSpeechRun() {
      */
     if (!/for \(const raw of rawPieces\)[\s\S]{0,400}?clampShownAt\(/.test(src)) {
       throw new Error('切开的每一条没有逐条过 clampShownAt —— 两条会撞在同一个 at 上');
+    }
+  });
+
+  /**
+   * ⭐⭐ **新路的四个旋钮:默认值 = 旧硬编码,且四个都真的接线**（v2.66.84）
+   *
+   * 🔴 这一节存在的理由是一条已经量实的 UI 谎言 ✗：
+   *    在这之前，设置页那一栏的 **9 个 VAD 旋钮对新路一个都不生效**
+   *    （`vad.js` 的 `if (segmentLoop) return;` 之后读的设置全被跳过），
+   *    而新路的 14 个常量在 `settings.js` 里**出现 0 次** ⇒ 用户选中新路后
+   *    看到 9 个控件、**一个都调不动它** ✓
+   *
+   * ⚠️ 所以这里的两条判据都不能省：
+   *    ① **默认值逐字等于旧硬编码**（8 / 1.9 / 2.5 / false）——
+   *       否则"加了旋钮"这件事本身就悄悄改了默认行为 ✗
+   *    ② **四个常量真的从设置读** —— 否则又是"存了但不读"
+   *       （今天这一族栽过五次：`words` 被 `transcribeSegments` 丢掉、
+   *        `prompt` 在日志里看不见、`tooShort` 没人消费、`dt` 回填缺半边、
+   *        `MIN_SHOW_HOLD_MS || …` 短路静默退化 ✓）
+   */
+  check('新路四个旋钮：默认值必须等于旧硬编码，且四个都真的接线', () => {
+    const S = loaded['lib/settings.js'];
+    const B = loaded['lib/asr/whisper-batch.js'];
+    const V = loaded['lib/asr/vad.js'];
+    const g = S.DEFAULT_SETTINGS?.asr?.vadSegments;
+    if (!g || typeof g !== 'object') throw new Error('DEFAULT_SETTINGS 里没有 asr.vadSegments 这一组');
+
+    /**
+     * ① 默认值必须**逐字等于**原来的硬编码 ✓
+     *    —— 这一条是"加旋钮不改变默认行为"的唯一保证 ✗
+     *    ⚠️ 用 `!==` 而不是 `Number(x) === Number(y)`：`8 !== '8'` 也要红 ✓
+     */
+    const mustEqual = [
+      ['maxBatchSec', g.maxBatchSec, B.MAX_BATCH_SEC, 8],
+      ['maxAvgWordSec', g.maxAvgWordSec, B.WORDS_MAX_AVG_WORD_SEC, 1.9],
+      ['pauseSplitMinSegSec', g.pauseSplitMinSegSec, V.PAUSE_SPLIT_MIN_SEG_SEC, 2.5],
+    ];
+    for (const [name, actual, fromModule, oldHardcode] of mustEqual) {
+      if (actual !== oldHardcode) {
+        throw new Error(
+          `asr.vadSegments.${name} 默认值必须是 ${oldHardcode}（原来的硬编码），实际 ${String(actual)} —— `
+            + '加旋钮不许改默认行为 ✗',
+        );
+      }
+      if (actual !== fromModule) {
+        throw new Error(
+          `asr.vadSegments.${name} 默认值（${String(actual)}）与模块常量（${String(fromModule)}）不一致 —— 两份真相 ✗`,
+        );
+      }
+    }
+    if (g.segStartAnchor !== false) {
+      throw new Error(`asr.vadSegments.segStartAnchor 默认必须是 false，实际 ${String(g.segStartAnchor)}`);
+    }
+    /** 开口锚：设置缺省时必须退回模块常量（那样"改常量能不能恢复旧行为"仍然成立 ✓） */
+    if (B.SEG_START_ANCHOR_ENABLED !== false) {
+      throw new Error('SEG_START_ANCHOR_ENABLED 默认必须是 false');
+    }
+
+    /**
+     * ② **接线反证**：`vad.js` 必须真的把 `segOpts.*` 传下去 ✗
+     *    —— 只钉默认值是不够的：那正是"存了但不读"的老坑 ✓
+     */
+    const src = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
+
+    // 四个都从 config 读（且默认值写在 `??` 右边，和 ① 那次比对形成闭环 ✓）
+    for (const [name, dflt] of [
+      ['maxBatchSec', 8],
+      ['maxAvgWordSec', 1.9],
+      ['pauseSplitMinSegSec', 2.5],
+    ]) {
+      const re = new RegExp(`${name}:\\s*Number\\(config\\.${name}\\s*\\?\\?\\s*${String(dflt).replace('.', '\\.')}\\)`);
+      if (!re.test(src)) {
+        throw new Error(`vad.js 没有从 config.${name} 读（应为 Number(config.${name} ?? ${dflt})）`);
+      }
+    }
+    if (!/segStartAnchor:\s*config\.segStartAnchor === undefined/.test(src)) {
+      throw new Error('vad.js 没有从 config.segStartAnchor 读 —— 开口锚开关是个假旋钮 ✗');
+    }
+
+    // 真正传到用点（三处）
+    if (!/maxBatchSec:\s*segOpts\.maxBatchSec/.test(src)) {
+      throw new Error('createSegmentLoop 没有收到 segOpts.maxBatchSec —— 批长旋钮没接线 ✗');
+    }
+    if (!/pauseSplitMinSegSec|segOpts\.pauseSplitMinSegSec/.test(src)) {
+      throw new Error('segOpts.pauseSplitMinSegSec 根本没出现');
+    }
+    if (!/segStartAnchor:\s*segOpts\.segStartAnchor/.test(src)) {
+      throw new Error('shownStartOf 没有收到 segOpts.segStartAnchor —— 开口锚开关没接线 ✗');
+    }
+    // `shownStartOf` 必须真的认这个 opt（不是收了不用）
+    const bs = stripComments(fs.readFileSync(new URL('../lib/asr/whisper-batch.js', import.meta.url), 'utf8'));
+    if (!/segStartAnchor\s*=\s*undefined,/.test(bs)) {
+      throw new Error('shownStartOf 的签名里没有 segStartAnchor —— 传了也收不到');
+    }
+    if (!/segStartAnchor === undefined[\s\S]{0,200}?SEG_START_ANCHOR_ENABLED/.test(bs)) {
+      throw new Error('shownStartOf 没有"缺省退回模块常量"的分支 —— 不传时行为可能变了 ✗');
+    }
+
+    /**
+     * ③ **两个面板不能同时显示**（否则用户又看到一堆对新路无效的旋钮 ✗）
+     *    · 旧的那 9 项在 `data-vad-legacy` 里，选新路时隐藏 ✓
+     *    · 新的 4 项在 `data-segmented-only` 里，只有选新路时显示 ✓
+     */
+    const html = fs.readFileSync(new URL('../options/options.html', import.meta.url), 'utf8')
+      .replace(/<!--[\s\S]*?-->/g, '');
+    if (!/data-vad-legacy/.test(html)) throw new Error('options.html 里没有 data-vad-legacy —— 旧 9 项藏不掉');
+    if (!/data-segmented-only/.test(html)) throw new Error('options.html 里没有 data-segmented-only —— 新 4 项显不出来');
+    for (const id of ['seg-maxBatchSec', 'seg-maxAvgWordSec', 'seg-pauseSplitMinSegSec', 'seg-segStartAnchor']) {
+      if (!html.includes(`id="${id}"`)) throw new Error(`options.html 里没有 id="${id}" —— 旋钮没控件`);
+    }
+    const ojs = fs.readFileSync(new URL('../options/options.js', import.meta.url), 'utf8');
+    for (const id of ['seg-maxBatchSec', 'seg-maxAvgWordSec', 'seg-pauseSplitMinSegSec', 'seg-segStartAnchor']) {
+      if (!ojs.includes(`'${id}'`)) throw new Error(`options.js 的 FIELDS 里没有 ${id} —— 存不下来`);
+    }
+    // 键必须在 `asr.vadSegments.*`（塞进 whisperChunked 会被「键必须属于那个面板」抓住 ✓）
+    for (const f of ['maxBatchSec', 'maxAvgWordSec', 'pauseSplitMinSegSec', 'segStartAnchor']) {
+      if (!ojs.includes(`'asr.vadSegments.${f}'`)) {
+        throw new Error(`FIELDS 里没有 'asr.vadSegments.${f}' —— 键落在错的组里`);
+      }
+    }
+    // 互斥显隐必须真的接进 syncPanels（不能只写属性不写代码 ✗）
+    if (!/data-vad-legacy'?\)\)\s*\{\s*\n?\s*el\.hidden = segmented/.test(ojs) && !/\[data-vad-legacy\][\s\S]{0,80}?el\.hidden = segmented/.test(ojs)) {
+      throw new Error('options.js 的 syncPanels 没有做 data-vad-legacy 的显隐 —— 旧 9 项永远显示 ✗');
+    }
+    if (!/\[data-segmented-only\][\s\S]{0,80}?el\.hidden = !segmented/.test(ojs)) {
+      throw new Error('options.js 的 syncPanels 没有做 data-segmented-only 的显隐 —— 新 4 项永远显示 ✗');
+    }
+    // ⚠️ `[hidden]` 必须显式写 CSS：`.grid { display: grid }` 会盖过 UA 的 `[hidden]` ✗
+    const css = fs.readFileSync(new URL('../options/options.css', import.meta.url), 'utf8');
+    if (!/\[data-vad-legacy\]\[hidden\][\s\S]{0,200}?display:\s*none\s*!important/.test(css)) {
+      throw new Error(
+        'options.css 没有 `[data-vad-legacy][hidden] { display: none !important }` —— '
+          + '`.grid` 的 display 会盖过 UA 的 [hidden]，显隐会静默失效 ✗',
+      );
     }
   });
 }
