@@ -60,6 +60,7 @@ import {
   MIME_PROBE_MS,
   tailMergeTrigger,
   mergeTailText,
+  MAX_PULL_FORWARD_MS,
 } from '../lib/delayed-player.js';
 
 // ⭐ 有效延迟：选「本地 Whisper 自断句」时，首批音频 6 秒 + 往返 + 确认 ⇒ 需要 ≈10 秒。
@@ -2290,11 +2291,22 @@ function pumpSubtitles() {
   // 否则它们会按旧延迟上屏 —— 现象就是"字幕提前了"。
   // （`smoothRate` 默认关着，所以延迟不会平滑过渡，只会被那两种方式一次改变一个台阶。）
   // 这里顺带把实测延迟的 EMA 也刷新一次（原来一次一句，跟不上变化）。
+  //
+  // ⭐ **新路**额外限制"一次往前拉"的量（`maxPullForwardMs`）——
+  //    实测缓冲只领先 3 秒而目标是 10 秒，`resync` 会一直在往前拉排期：
+  //    排期变早 ⇒"字幕提前"，而字幕已在路上 ⇒ 追不上 ⇒"字幕晚"（同一件事的两面）。
+  //    详细信息与实测取舍见 `lib/delayed-player.js` 的 `MAX_PULL_FORWARD_MS` 注释。
+  //    ⚠️ **旧路不传这个参数** ⇒ `Infinity` ⇒ 逐字不变 ✓
+  //    ⚠️ 判据和 `effectiveDelaySec` / `holdEnabled` 同一套（那两处也各自内联了一份）✓
+  const onWhisperSegmentsForResync =
+    settings?.asr?.provider === 'vad-segments' ||
+    settings?.asr?.whisperChunked?.whisperSegments === true;
   schedule.resync({
     firstAudioAt,
     delayMs: currentDelayMs(),
     syncOffsetMs: Number(settings.capture.syncOffsetMs) || 0,
     now,
+    maxPullForwardMs: onWhisperSegmentsForResync ? MAX_PULL_FORWARD_MS : Infinity,
   });
 
   /**
