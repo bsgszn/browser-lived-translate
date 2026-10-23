@@ -3979,6 +3979,58 @@ check('分片断句：看门狗必须比 chunkSeconds 长（否则每片都被�
   if (!/asr\.streaming === false/.test(src)) throw new Error('没有区分分片模式与流式模式');
 });
 
+/**
+ * ⭐ **`wordStart` 必须穿过累积器** —— 丢了的话「词首」那一格永远是 `—` ✗
+ *
+ * 实测踩过：`vad.js` 已经在 `final` 事件上带了 `wordStart`，
+ * 而 `lib/utterance.js` 的 `addFinal` 只攒 `text/start/cut` ⇒ **整句吐出来时它没了** ✗
+ * 于是 `player.js` 算了半天，日志里印的还是 `词首 —` ✓
+ * —— 和 `transcribeSegments` 丢掉 `words`、`prompt` 在日志里看不见、
+ *    `dt` 回填在 `if (item.late)` 里是同一族：**中间那道搬运没人钉** ✗
+ *
+ * 四条判据覆盖的正是"丢在哪一步"的四种方式：
+ *   ① 根本不记 ② 被后面的分片覆盖 ③ 缺值用了 `null`（`Number(null)===0` ⇒ 当成第 0 秒 ✗）
+ *   ④ 收完没清（下一句带着上一句的"词首"，而且看起来完全正常 ✗）
+ */
+check('诊断：`wordStart` 必须穿过累积器（丢在这一层 ⇒ 「词首」永远是 —）', () => {
+  const utt = loaded['lib/utterance.js'];
+  // 用 `maxChars`（默认 60）强制收句 —— 比 `endUtterance` 可靠（那条要 `pending` 才吐 ✗）
+  const chain = (finals) => {
+    const a = new utt.UtteranceAccumulator();
+    let out = null;
+    for (const f of finals) {
+      const r = a.addFinal(f);
+      if (r) out = r;
+    }
+    return out;
+  };
+  // ① 第一片记下来、随整句吐出来
+  const o1 = chain([{ text: 'あ'.repeat(61), start: 100, duration: 1.0, wordStart: 100.42 }]);
+  if (!o1) throw new Error('① 应该收句（61 字 ≥ maxChars 60）');
+  if (o1.wordStart !== 100.42) throw new Error(`① wordStart 必须穿过累积器，实际 ${o1.wordStart}`);
+  // ② 第二片不许覆盖（它的起点是"后续从句"，拿来当开口会晚一整段）
+  const o2 = chain([
+    { text: 'あ'.repeat(30), start: 100, duration: 1.0, wordStart: 100.42 },
+    { text: 'い'.repeat(31), start: 101, duration: 1.0, wordStart: 101.9 },
+  ]);
+  if (!o2) throw new Error('② 应该收句（30 + 31 = 61 字）');
+  if (o2.wordStart !== 100.42) throw new Error(`② 只许取第一片的 wordStart，实际 ${o2.wordStart}`);
+  // ③ 缺值必须是 undefined —— `null` 会被 `Number()` 当 0 ⇒ 词首印成"第 0 秒"✗
+  const o3 = chain([{ text: 'う'.repeat(61), start: 100, duration: 1.0 }]);
+  if (!o3) throw new Error('③ 应该收句');
+  if (o3.wordStart !== undefined) {
+    throw new Error(`③ 缺词级时间戳时必须是 undefined（null 会被 Number() 当 0），实际 ${o3.wordStart}`);
+  }
+  // ④ 收完必须清 —— 否则下一句带着上一句的"词首"
+  const a4 = new utt.UtteranceAccumulator();
+  a4.addFinal({ text: 'え'.repeat(61), start: 100, duration: 1.0, wordStart: 100.42 });
+  const o4 = a4.addFinal({ text: 'お'.repeat(61), start: 200, duration: 1.0 });
+  if (!o4) throw new Error('④ 应该收第二句');
+  if (o4.wordStart !== undefined) {
+    throw new Error(`④ 收完必须清掉 wordStart（否则下一句带着上一句的 ✗），实际 ${o4.wordStart}`);
+  }
+});
+
 check('分片断句：逐词时间在 segments 里，不在顶层（这个坑让字幕一条都不出来）', () => {
   const c = chunkedMod.collectWords;
   if (typeof c !== 'function') throw new Error('没有导出 collectWords');
