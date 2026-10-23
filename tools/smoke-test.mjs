@@ -10973,6 +10973,112 @@ function assertSpeechRun() {
   });
 
   /**
+   * ⭐ **词级时间戳**（`segments[].words`）—— 实测之后才知道它能干什么 ✗
+   *
+   * 用户那份 wav 的可疑 5 段逐段切出来送 8080，比对 `words[0].start` 与 `seg.start`：
+   * ```
+   * A-① 18 词 [0.00, 3.05] vs 段 [0.00, 3.06] · 差 0.00
+   * A-② 12 词 [3.06, 7.62] vs 段 [3.06, 7.62] · 差 0.00
+   * B    15 词 [0.00, 5.69] vs 段 [0.00, 5.70] · 差 0.00
+   * C    12 词 [0.00, 6.04] vs 段 [0.00, 6.06] · 差 0.00
+   * D-①  5 词 [0.07, 2.35] vs 段 [0.00, 2.40] · 差 0.07
+   * D-② 11 词 [2.40, 4.40] vs 段 [2.40, 4.40] · 差 0.00
+   * E    **1 词** [0.00, 2.00] vs 段 [0.00, 2.00]   ← 2 秒一个字，那 2 秒里没有语音
+   * ```
+   * ⇒ ⭐ **`seg.start` 已经贴着第一个词**（差 ≤0.07 秒）⇒ 它在 `at` 上**没有**帮助 ✗
+   * ⇒ ⭐ 而它治的是**垃圾段**：`1 个词占 2.00 秒` —— 而 `looksTooSlowForAudio`
+   *    要求 `跨度 ≥ 6 秒` ⇒ **2 秒的段它拦不住** ✗
+   *
+   * ⚠️ 两条都要钉：`wordsStartOf`（起点优先用它）+ `looksTooSlowByWords`（词均时长）
+   */
+  check('词级时间戳：起点优先用它，且「词少时长长」的段判为没人说话', () => {
+    const B = loaded['lib/asr/whisper-batch.js'];
+    const W = B.wordsStartOf;
+    const G = B.looksTooSlowByWords;
+    if (typeof W !== 'function') throw new Error('whisper-batch.js 没有导出 wordsStartOf');
+    if (typeof G !== 'function') throw new Error('whisper-batch.js 没有导出 looksTooSlowByWords');
+
+    /** ① 请求级时间（faster-whisper 的实际形态）⇒ 原样返回 */
+    if (W({ start: 3.06, end: 7.62, words: [{ start: 3.06, end: 3.36 }, { start: 3.4, end: 3.6 }] }) !== 3.06) {
+      throw new Error('请求级词时间必须原样返回（B 段 words[0].start = seg.start = 3.06）');
+    }
+    /** ② 相对本段的时间（少见形态）⇒ 补上 seg.start */
+    if (W({ start: 3.06, end: 7.62, words: [{ start: 0, end: 0.3 }] }) !== 3.06) {
+      throw new Error('相对本段的词时间必须补上 seg.start');
+    }
+    /** ③ 首词比段起点晚（D 段 0.07）⇒ 返回 0.07，那才是"第一个词" */
+    if (W({ start: 0, end: 2.4, words: [{ start: 0.07, end: 0.73 }] }) !== 0.07) {
+      throw new Error('首词比段起点晚时必须返回首词起点（D 段 0.07）');
+    }
+    /** ④ 拿不到 ⇒ null（调用方退回 seg.start，行为逐字不变） */
+    for (const bad of [null, undefined, {}, { start: 0, end: 2 }, { start: 0, end: 2, words: [] }]) {
+      if (W(bad) !== null) throw new Error(`没有可用词级时间时必须返回 null（${JSON.stringify(bad)}）`);
+    }
+    /** ⑤ 脏值一律 null —— `Number(null) === 0` 那族（今天栽过三次） */
+    for (const bad of [
+      { start: 0, end: 2, words: [{ start: null, end: 1 }] },
+      { start: 0, end: 2, words: [{ start: NaN, end: 1 }] },
+      { start: 0, end: 2, words: [{ start: -1, end: 1 }] },
+      { start: 0, end: 2, words: [{ start: 5, end: 6 }] },
+      { start: 0, end: 0, words: [{ start: 0, end: 1 }] },
+    ]) {
+      if (W(bad) !== null) throw new Error(`脏词级时间必须返回 null（${JSON.stringify(bad)}）`);
+    }
+
+    /** ⑥ 垃圾段：E 那段 1 个词占 2.00 秒 ⇒ 必须判"没人说话" */
+    if (G({ start: 0, end: 2, words: [{ word: 'ん', start: 0, end: 2 }] }) !== true) {
+      throw new Error('1 个词占 2 秒必须判为没人说话（E 段）');
+    }
+    /** ⑦ 正常段：实测出的最大值是 C 的 12 词 6.04 秒 = 0.50 秒/词 ⇒ 必须保住 */
+    const cWords = Array.from({ length: 12 }, (_, i) => ({ word: 'x', start: i * 0.5, end: i * 0.5 + 0.45 }));
+    if (G({ start: 0, end: 6.04, words: cWords }) !== false) {
+      throw new Error('12 词 6.04 秒（0.50 秒/词）是真话，不许拦');
+    }
+    /** ⑧ 更快的正常段（A 段 18 词 3.05 秒 = 0.17 秒/词）⇒ 必须保住 */
+    const aWords = Array.from({ length: 18 }, (_, i) => ({ word: 'x', start: i * 0.17, end: i * 0.17 + 0.15 }));
+    if (G({ start: 0, end: 3.06, words: aWords }) !== false) {
+      throw new Error('18 词 3.05 秒（0.17 秒/词）是真话，不许拦');
+    }
+    /** ⑨ 没有 words ⇒ **不判**（老服务端没词级时间戳时行为逐字不变） */
+    if (G({ start: 0, end: 8 }) !== false) throw new Error('没有 words 时不许判');
+    /** ⑩ 跨度 < 1 秒 ⇒ 不判（太短下不了结论） */
+    if (G({ start: 0, end: 0.9, words: [{ word: 'あ', start: 0, end: 0.9 }] }) !== false) {
+      throw new Error('跨度 < 1 秒不许判（边界 0.9 秒）');
+    }
+    /** ⑪ 脏输入不崩 */
+    for (const bad of [null, undefined, {}, { words: null }, { words: 'abc' }]) {
+      if (G(bad) !== false) throw new Error(`脏输入必须返回 false（${JSON.stringify(bad)}）`);
+    }
+    /** ⑫ 首末词的 end 非法 ⇒ 不判（算出来的均值是假的） */
+    if (G({ start: 0, end: 3, words: [{ start: 0, end: 1 }, { start: 1, end: null }] }) !== false) {
+      throw new Error('末词 end 非法时必须不判');
+    }
+
+    /**
+     * ⑬ **接线反证**：`shownStartOf` 必须真的用 `wordsStartOf` ✗
+     *    —— 只钉函数实现不钉接线，是"断言看着有、实际抓不到"（今天栽过五次 ✗）
+     */
+    const shownSrc = stripComments(fs.readFileSync(new URL('../lib/asr/whisper-batch.js', import.meta.url), 'utf8'));
+    const hunk = shownSrc.slice(shownSrc.indexOf('export function shownStartOf'));
+    if (!/wordsStartOf\(seg\)/.test(hunk)) {
+      throw new Error('shownStartOf 没有调用 wordsStartOf —— 词级起点没接线（有词级时间戳也不会用）');
+    }
+    if (!/const base = Number\(offsetSec\) \+ \(ws0 !== null \? ws0 :/.test(hunk)) {
+      throw new Error('shownStartOf 的 base 必须在 ws0 有效时优先用它、否则退回 seg.start');
+    }
+    /**
+     * ⑭ **接线反证**：`vad.js` 的 `isTextTrustworthy` 必须真的调 `looksTooSlowByWords` ✗
+     */
+    const vadSrc = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
+    if (!/if \(looksTooSlowByWords\(seg\)\) return false;/.test(vadSrc)) {
+      throw new Error('isTextTrustworthy 没有调用 looksTooSlowByWords —— 垃圾段拦不住');
+    }
+    /** ⑮ 阈值常量必须导出（否则断言只能靠源码正则，改坏了没人拦 ✗） */
+    if (B.WORDS_MAX_AVG_WORD_SEC !== 0.8) throw new Error('WORDS_MAX_AVG_WORD_SEC 应为 0.8');
+    if (B.WORDS_MIN_SPAN_SEC !== 1.0) throw new Error('WORDS_MIN_SPAN_SEC 应为 1.0');
+  });
+
+  /**
    * ⭐ **段内切分** —— Whisper 把两句话合成一段时，把它切开 ✗
    *
    * ## 为什么需要它
