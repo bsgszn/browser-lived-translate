@@ -11826,26 +11826,56 @@ assertSpeechRun();
     // ⚠️ 阈值故意取 **0.62 而不是 0.5** —— 0.5 是 `vadThreshold` 的默认值，
     //    若实现里把它写死，用 0.5 测是测不出来的 ✗（"断言看着有、抓不到"这一族）
     const THR = 0.62;
-    const seen = [];
-    const newAt = WB.shownStartOf({
-      offsetSec: base,
-      seg,
-      pcm,
-      sampleRate: SR,
-      firstSpeechAt: (a, b, thr) => {
-        seen.push([a, b, thr]);
-        return a <= 30.52 && 30.52 < b ? 30.52 : null;
-      },
-      speechThreshold: THR,
-    });
-    if (Math.abs(newAt - 30.52) > 1e-6) throw new Error(`新路应锚到 30.52，实际 ${newAt}`);
-    if (newAt - oldAt < 3) throw new Error(`应把提前量吃掉 ≥3s，实际只挪了 ${(newAt - oldAt).toFixed(2)}s`);
-    // ③ 回调拿到的窗口必须是 [段起点, 段终点] 且阈值原样透传
-    if (seen.length !== 1) throw new Error(`firstSpeechAt 应被调 1 次，实际 ${seen.length}`);
-    const [fromArg, toArg, thrArg] = seen[0];
-    if (Math.abs(fromArg - base) > 1e-9) throw new Error(`from 应是 ${base}，实际 ${fromArg}`);
-    if (Math.abs(toArg - (base + 5.44)) > 1e-9) throw new Error(`to 应是 ${base + 5.44}，实际 ${toArg}`);
-    if (thrArg !== THR) throw new Error(`阈值必须原样透传（两个阈值就是两份真相 ✗），实际 ${thrArg}`);
+    /**
+     * ⭐ **总开关的两面都要钉** ✓
+     *
+     * `SEG_START_ANCHOR_ENABLED` 是用户 2026-10-23 定的实验开关（"先关掉试试"）✗
+     * · 开：锚必须生效（挪到 30.52、问 VAD 一次、窗口/阈值原样透传）✓
+     * · 关：**一次都不许问 VAD**，且 `at` 必须**逐字等于段起点** ✓
+     *   —— 后半句才是"关掉"的定义；只钉"关掉"而不钉"不许问"，
+     *   实现就可能在关掉时仍然扫描一遍概率环（白烧 CPU，且在真机上改变 `firstSpeechAt` 的调用次数 ✗）
+     */
+    if (WB.SEG_START_ANCHOR_ENABLED === true) {
+      const seen = [];
+      const newAt = WB.shownStartOf({
+        offsetSec: base,
+        seg,
+        pcm,
+        sampleRate: SR,
+        firstSpeechAt: (a, b, thr) => {
+          seen.push([a, b, thr]);
+          return a <= 30.52 && 30.52 < b ? 30.52 : null;
+        },
+        speechThreshold: THR,
+      });
+      if (Math.abs(newAt - 30.52) > 1e-6) throw new Error(`新路应锚到 30.52，实际 ${newAt}`);
+      if (newAt - oldAt < 3) throw new Error(`应把提前量吃掉 ≥3s，实际只挪了 ${(newAt - oldAt).toFixed(2)}s`);
+      // ③ 回调拿到的窗口必须是 [段起点, 段终点] 且阈值原样透传
+      if (seen.length !== 1) throw new Error(`firstSpeechAt 应被调 1 次，实际 ${seen.length}`);
+      const [fromArg, toArg, thrArg] = seen[0];
+      if (Math.abs(fromArg - base) > 1e-9) throw new Error(`from 应是 ${base}，实际 ${fromArg}`);
+      if (Math.abs(toArg - (base + 5.44)) > 1e-9) throw new Error(`to 应是 ${base + 5.44}，实际 ${toArg}`);
+      if (thrArg !== THR) throw new Error(`阈值必须原样透传（两个阈值就是两份真相 ✗），实际 ${thrArg}`);
+    } else {
+      const seenOff = [];
+      const offAt = WB.shownStartOf({
+        offsetSec: base,
+        seg,
+        pcm,
+        sampleRate: SR,
+        firstSpeechAt: (a, b, thr) => {
+          seenOff.push([a, b, thr]);
+          return a <= 30.52 && 30.52 < b ? 30.52 : null;
+        },
+        speechThreshold: THR,
+      });
+      if (Math.abs(offAt - base) > 1e-9) {
+        throw new Error(`锚关掉时 \`at\` 必须逐字等于段起点 ${base}，实际 ${offAt}`);
+      }
+      if (seenOff.length !== 0) {
+        throw new Error(`锚关掉时一次都不许问 VAD（白烧概率环扫描），实际 ${seenOff.length} 次`);
+      }
+    }
 
     /**
      * ④ 回归：以下五种**必须和改之前逐字一样**
@@ -11886,23 +11916,26 @@ assertSpeechRun();
      */
     const segMoved = { start: 1.5, end: 6.94, text: 'x' };
     const plainMoved = WB.shownStartOf({ offsetSec: base, seg: segMoved, pcm, sampleRate: SR });
-    {
-      let calls = 0;
-      const got = WB.shownStartOf({
-        offsetSec: base,
-        seg: segMoved,
-        pcm,
-        sampleRate: SR,
-        firstSpeechAt: () => { calls += 1; return base + 1.5 + 0.04; },
-        speechThreshold: THR,
-      });
-      if (calls !== 1) {
-        throw new Error(`非首段 seg.start=${segMoved.start} 必须问 VAD 一次（多段锚 ✗），实际 ${calls} 次`);
+    /**
+     * ⭐ **锚关掉时，⑤ 这整块的前提也消失** ⇒ 只钉同一件事：不许问、不许挪 ✓
+     * （用户 2026-10-23「先关掉试试」—— 见 `SEG_START_ANCHOR_ENABLED` 的说明 ✓）
+     */
+    if (WB.SEG_START_ANCHOR_ENABLED !== true) {
+      for (const shift of [0.04, 0.6]) {
+        let calls = 0;
+        const got = WB.shownStartOf({
+          offsetSec: base, seg: segMoved, pcm, sampleRate: SR,
+          firstSpeechAt: () => { calls += 1; return base + 1.5 + shift; },
+          speechThreshold: THR,
+        });
+        if (calls !== 0) {
+          throw new Error(`锚关掉时非首段一次都不许问 VAD（开口+${shift}s），实际 ${calls} 次`);
+        }
+        if (got !== plainMoved) {
+          throw new Error(`锚关掉时非首段必须原样返回 ${plainMoved}（开口+${shift}s），实际 ${got}`);
+        }
       }
-      if (got !== plainMoved) {
-        throw new Error(`开口只晚 40ms 时不许挪（帧粒度抖动 ✗）：${got} ≠ ${plainMoved}`);
-      }
-    }
+    } else {
     {
       let calls = 0;
       const got = WB.shownStartOf({
@@ -11917,6 +11950,7 @@ assertSpeechRun();
       if (Math.abs(got - (base + 1.5 + 0.6)) > 1e-6) {
         throw new Error(`开口晚 0.6s ⇒ 必须锚到 ${base + 1.5 + 0.6}，实际 ${got}`);
       }
+    }
     }
 
     // ⑥ 完全不传回调（旧路 / 离线仿真）⇒ 逐字一样
@@ -11943,6 +11977,47 @@ assertSpeechRun();
    * ⚠️ 而**第一段之后**的段必须保持严格 0.02：它们的 `start` 是听完整个批之后
    *    给出的段间边界，覆盖它会把本来正确的段挪歪 ✗
    */
+  /**
+   * ⭐ **「早/晚」终于量得到** —— `词首` 这一格必须真的接上 ✗
+   *
+   * 用户报「有时候早有时候晚」，而日志里**没有"人真正开口"这一格** ✓
+   * `比排期晚` 只回答"上屏 vs `at`"，而 `at` 本身就是基准 ⇒ **基准错了它照样是 0.0x** ✗
+   * （今天就在这一点上绕过一整圈：一直在调"上屏时刻"，而问题在"`at` 对不对" ✓）
+   *
+   * ⇒ 现在 `屏上 ·` 那行印 `词首 +X.XXXs`，于是 `真 − 词首` 就是"观众真的看到这句
+   *   比人开口早/晚多少" —— **那才是"早/晚"的定义** ✓
+   *
+   * ## 为什么这条断言必须存在（而不是"代码写了就行"）
+   *
+   * 今天这一族已经栽了七次：`tooShort` 没人消费 / `prompt` 在日志里看不见 /
+   * `due()` 弹出被 break 永久丢字幕 / `words` 在 `transcribeSegments` 被丢 /
+   * `dt` 回填在 `if (item.late)` 里 ⇒ 导出缺半边 ✗
+   * ⇒ **"写了"和"在日志里真的能看到"是两件事**，只有源码反证能钉住后者 ✓
+   */
+  check('诊断：「人真正开口」必须印进 `屏上` 那行（否则"早/晚"永远量不到）', () => {
+    const pj = fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8');
+    const vj = fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8');
+    // ① 玩家侧：必须真的把这个字段拼进那行（只定义变量不拼 = 看不见 ✗）
+    if (!/· 词首 /.test(pj)) throw new Error('`屏上 ·` 那行必须印 `· 词首 …`（而不是只算不用）');
+    // ② 缺 words 时必须印 `—`，不许印 0 / NaN（0 会被读成"就是这一刻"✗）
+    if (!/' · 词首 —'/.test(pj)) throw new Error('缺词级时间戳时必须印 `词首 —`，不许印 0/NaN');
+    // ③ 必须从 `at` 反推：要减掉"延迟预算"，再加"词相对段起点的偏移"
+    if (!/atPerf - Number\(item\.delayPlusSyncMs\) \+ Number\(item\.wordShiftMs\)/.test(pj)) {
+      throw new Error('词首必须由 `at − 延迟预算 + 词偏移` 算出（少一项就整体偏一个延迟 ✗）');
+    }
+    // ④ 生产者侧：`final` 事件必须带上 `wordStart`，否则玩家永远拿到 null
+    if (!/type: 'final', text: piece\.text, start: piece\.startAbs, duration: pieceDur, cut: 'whisper-segment', wordStart: piece\.wordStart/.test(vj)) {
+      throw new Error('`final` 事件必须带 `wordStart`（不带 ⇒ 玩家那格永远是 — ✗）');
+    }
+    // ⑤ 而且它必须来自 `wordsStartOf`（不是"段起点"冒充 —— 那样就量不出锚点位移了 ✗）
+    if (!/import \{[^}]*wordsStartOf[^}]*\} from '\.\/whisper-batch\.js'/.test(vj)) {
+      throw new Error('vad.js 必须从 whisper-batch 导入 `wordsStartOf`');
+    }
+    if (!/const segWords0 = wordsStartOf\(s\)/.test(vj)) {
+      throw new Error('vad.js 必须对**每个段**取 `wordsStartOf(s)`，不能拿段起点冒充');
+    }
+  });
+
   check('上屏时刻：**批首段**的 `seg.start` 信任窗口放宽到 1 秒（其余段仍是 0.02）', () => {
     const base = 20;
     const pcm = new Int16Array(Math.round(3 * SR));
@@ -11959,6 +12034,31 @@ assertSpeechRun();
         return t > a && t < b ? t : null;
       };
       return box;
+    }
+
+    /**
+     * ⭐ **锚关掉时，这一整条的前提消失** ⇒ 只钉"关掉"的定义 ✓
+     *
+     * 用户 2026-10-23「先关掉试试」：不再用 VAD 开口锚 ⇒
+     * **无论首段还是非首段，一律不许问 VAD，`at` 一律逐字等于 `offsetSec + seg.start`** ✓
+     * （首段/非首段的信任窗口、多段锚、影子测量——这些都只在锚开着时才有意义 ✓）
+     */
+    if (WB.SEG_START_ANCHOR_ENABLED !== true) {
+      for (const isFirst of [true, false]) {
+        const seg = { start: 0.4, end: 3.4, text: 'ああああああ' };
+        const cb = mk(1.0);
+        const got = WB.shownStartOf({
+          offsetSec: base, seg, pcm, sampleRate: SR,
+          firstSpeechAt: cb.fn, speechThreshold: 0.5, isFirst,
+        });
+        if (cb.calls !== 0) {
+          throw new Error(`锚关掉时 isFirst=${isFirst} 一次都不许问 VAD，实际 ${cb.calls} 次`);
+        }
+        if (Math.abs(got - (base + 0.4)) > 1e-9) {
+          throw new Error(`锚关掉时 isFirst=${isFirst} 必须等于 ${base + 0.4}，实际 ${got}`);
+        }
+      }
+      return;
     }
 
     // ① 首段 + `seg.start = 0.4`（> 0.02 而 < 1）⇒ **必须**问 VAD，且采信
