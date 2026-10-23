@@ -11157,6 +11157,30 @@ function assertSpeechRun() {
     if (G({ start: 0, end: 2, words: [{ word: 'ん', start: 0, end: 2 }] }) !== true) {
       throw new Error('1 个词占 2 秒必须判为没人说话（E 段）');
     }
+    /**
+     * ⑥b ⭐ **慢一点的真话必须放过** ✗ —— 0.8 就是在这里误杀的
+     *
+     * 闭环实录:「そうなんだよね」3 词 / 3.02 秒 = **1.01 秒/词** ⇒ 那是一句正常的话 ✓
+     * 而阈值 0.8 时 `1.01 > 0.8` ⇒ **被判成"没人说话"丢掉** ✗
+     * （用户的原话:「语气词或者短一点的被丢了」）
+     *
+     * ⚠️ 阈值改回 0.8 ⇒ 这一条必红 ✓ —— 它就是这一刀的变异哨兵
+     */
+    if (G({
+      start: 0,
+      end: 3.02,
+      words: [
+        { word: 'そう', start: 0, end: 1.0 },
+        { word: 'なん', start: 1.0, end: 2.0 },
+        { word: 'だよね', start: 2.0, end: 3.02 },
+      ],
+    }) !== false) {
+      throw new Error('3 词 3.02 秒（1.01 秒/词）是正常的一句话，不许拦（0.8 时就是这样丢掉的）');
+    }
+    /** ⑥c 真正极端的垃圾段（「ですね」1 词 4.99 秒 = 4.99 秒/词）⇒ 仍然必须拦住（阈值放太宽的哨兵） */
+    if (G({ start: 0, end: 4.99, words: [{ word: 'ですね', start: 0, end: 4.99 }] }) !== true) {
+      throw new Error('1 个词占 4.99 秒必须判为没人说话（阈值放太宽的哨兵）');
+    }
     /** ⑦ 正常段：实测出的最大值是 C 的 12 词 6.04 秒 = 0.50 秒/词 ⇒ 必须保住 */
     const cWords = Array.from({ length: 12 }, (_, i) => ({ word: 'x', start: i * 0.5, end: i * 0.5 + 0.45 }));
     if (G({ start: 0, end: 6.04, words: cWords }) !== false) {
@@ -11210,9 +11234,28 @@ function assertSpeechRun() {
     if (!/return false;/.test(vadSrc.slice(slowByIdx, slowByIdx + 600))) {
       throw new Error('looksTooSlowByWords 调了却没拦掉（后面 600 字里没有 return false）');
     }
-    /** ⑮ 阈值常量必须导出（否则断言只能靠源码正则，改坏了没人拦 ✗） */
-    if (B.WORDS_MAX_AVG_WORD_SEC !== 0.8) throw new Error('WORDS_MAX_AVG_WORD_SEC 应为 0.8');
+    /**
+     * ⑮ 阈值常量必须导出，且必须落在**两端都是实测数据**的区间里 ✗
+     *
+     * ⚠️ 原来钉的是字面量 `!== 0.8` ✗ —— 那是"钉字面量、不钉不变量"：
+     *    改成 0.85 会红（哪怕行为完全一样），而把 `E` 的 2.00 漏掉也不会红 ✓
+     * ⇒ 改成钉区间，两端各有一条实测依据:
+     *    · 必须 **> 1.10**：「そうなんだよね」实测 1.01~1.10 秒/词，那是真话，要放过 ✓
+     *    · 必须 **< 2.00**：`E` 段 1 词占 2.00 秒要拦住 —— 而 `>` 是**严格比较**，
+     *      取整到 2.0 会让 `2.00 > 2.0 === false` ⇒ **正好漏掉 `E`** ✗
+     * ⇒ 顺带钉住"不许取整到 2.0"这个坑 ✓（取 2.0 ⇒ 这条红，而不是悄悄放过垃圾段 ✗）
+     */
     if (B.WORDS_MIN_SPAN_SEC !== 1.0) throw new Error('WORDS_MIN_SPAN_SEC 应为 1.0');
+    if (!(B.WORDS_MAX_AVG_WORD_SEC > 1.1)) {
+      throw new Error(
+        `WORDS_MAX_AVG_WORD_SEC 必须 > 1.10（「そうなんだよね」1.01~1.10 秒/词是真话，要放过），实际 ${B.WORDS_MAX_AVG_WORD_SEC}`,
+      );
+    }
+    if (!(B.WORDS_MAX_AVG_WORD_SEC < 2.0)) {
+      throw new Error(
+        `WORDS_MAX_AVG_WORD_SEC 必须 < 2.00（E 段 1 词 2.00 秒要拦住；取 2.0 会因严格比较漏掉），实际 ${B.WORDS_MAX_AVG_WORD_SEC}`,
+      );
+    }
 
     /**
      * ⑰ ⭐ **被拦的必须说得出「哪道闸 + 拦了什么文本」** ✗
