@@ -11076,6 +11076,29 @@ function assertSpeechRun() {
     /** ⑮ 阈值常量必须导出（否则断言只能靠源码正则，改坏了没人拦 ✗） */
     if (B.WORDS_MAX_AVG_WORD_SEC !== 0.8) throw new Error('WORDS_MAX_AVG_WORD_SEC 应为 0.8');
     if (B.WORDS_MIN_SPAN_SEC !== 1.0) throw new Error('WORDS_MIN_SPAN_SEC 应为 1.0');
+
+    /**
+     * ⑯ 🔴 **`words` 必须从「送 Whisper」那一层传下来** ✗
+     *
+     * 这一条是**真机闭环抓出来的**：`transcribeSegments()` 原来只造
+     * `{ start, end, text }` 三项 ⇒ **`words` 在进入判定层之前就被丢了** ✓
+     * 于是 `wordsStartOf` / `looksTooSlowByWords` 全程拿不到词级时间戳 ⇒ 一个都没生效 ✗
+     *
+     * ⚠️ 而上面 ⑬⑭ 钉的是「函数实现」和「下游接线」—— **就是没钉这一层** ✗
+     *    ⇒ 和「`prompt` 在日志里看不见」「`due()` 弹出被 break 会永久丢字幕」同一族 ✓
+     *    ⇒ 所以这条必须单独钉：**只钉两端、不钉中间那道搬运**，等于没钉 ✗
+     */
+    const vadSrc2 = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
+    const tIdx = vadSrc2.indexOf('async function transcribeSegments(pcm)');
+    if (tIdx < 0) throw new Error('vad.js 里找不到 transcribeSegments');
+    const tHunk = vadSrc2.slice(tIdx, tIdx + 1400);
+    if (!/\{\s*words:\s*s\.words\s*\}/.test(tHunk)) {
+      throw new Error('transcribeSegments 没有把 `words` 传下去 —— 词级时间戳进不了判定层（真机闭环抓到的真 bug）');
+    }
+    /** 只带非空数组：空数组 / 非数组都不许带（否则"有没有词级"分不清 ✗） */
+    if (!/Array\.isArray\(s\?\.words\)\s*&&\s*s\.words\.length/.test(tHunk)) {
+      throw new Error('transcribeSegments 必须是「非空数组才带 words」，空数组不许带');
+    }
   });
 
   /**
