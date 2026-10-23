@@ -2582,6 +2582,82 @@ check('延迟变化时排队中的条目必须跟着重算（否则集体提前�
   }
 });
 
+check('「往前拉」必须有上限 —— 新路一次最多挪 0.6 秒（否则排期永远在追一个追不上的目标）', () => {
+  /**
+   * ⚠️ 为什么要有上限（实测依据，两份真机日志）：
+   *    「缓冲落后实况」只有 **3.0~3.3 秒**，而目标延迟是 **10 秒** —— 差 7 秒。
+   *    `resync` 每一拍按新延迟重算 `at`，于是它**一直在往前拉**排期：
+   *    10/15 与 11/17 次被拉，最小 −2.38 秒、累计 −10.93 / −11.40 秒。
+   *
+   *    后果是两个症状**同时**出现，而它们是同一件事的两面：
+   *      · 排期往前拉 ⇒ `at` 变早 ⇒ **"字幕提前"** ✗
+   *      · 而字幕已在排队/在路上 ⇒ 追不上新时刻 ⇒ `比排期晚 1~2.4 秒` ⇒ **"字幕晚"** ✗
+   *
+   *    离线重算同一批日志：往前拉不限 ⇒ 晚中位 0.2~0.46 / 最大 2.36，而**永不早**；
+   *    只许往后推 ⇒ 晚中位 0.01~0.02 / 最大 1.66，而**早最多 1.27**。
+   *    ⇒ **这是取舍，不是 bug**。用户选了折中：600ms（早 ≤0.6 几乎看不出，晚 ≤~1.7）。
+   *
+   * ⚠️ 三条不许动的不变量：
+   *    ① **默认 `Infinity`** ⇒ 不传参数的调用方（含旧路）**逐字不变** ✓
+   *    ② **只限制往前拉，往后推不受限** —— 后者是 `resync` 的正常职责 ✓
+   *    ③ 位移**小于**上限时照旧，不许被放大到上限 ✓
+   */
+  if (dp.MAX_PULL_FORWARD_MS !== 600) {
+    throw new Error(`MAX_PULL_FORWARD_MS 应当是 600（用户选的折中值），实际 ${dp.MAX_PULL_FORWARD_MS}`);
+  }
+  const t0 = 1_700_000_000_000;
+  const mk = () => {
+    const s = new dp.SubtitleSchedule();
+    s.push({ id: 'a' }, { start: 0, duration: 2 }, t0, 10000, 0); // at = t0 + 10000
+    return s;
+  };
+  const atOf = (s) => s.items[0].at - t0;
+
+  // ① 不传参数 ⇒ 不受限（旧路逐字不变）：延迟 10 → 8 秒，at 应当整段拉到 +8s
+  const s1 = mk();
+  s1.resync({ firstAudioAt: t0, delayMs: 8000, syncOffsetMs: 0, now: t0 });
+  if (atOf(s1) !== 8000) throw new Error(`不传 maxPullForwardMs 时必须不受限（期望 8000，实际 ${atOf(s1)}）`);
+
+  // ② 传 600 ⇒ 一次只允许往前 600ms（该拉 2000，只拉 600 ⇒ +9400）
+  const s2 = mk();
+  s2.resync({ firstAudioAt: t0, delayMs: 8000, syncOffsetMs: 0, now: t0, maxPullForwardMs: 600 });
+  if (atOf(s2) !== 9400) throw new Error(`限制 600ms 时 at 应是 9400，实际 ${atOf(s2)}`);
+
+  // ③ **往后推不受限**（延迟变大 ⇒ 排期跟着推迟，那是正常职责）
+  const s3 = mk();
+  s3.resync({ firstAudioAt: t0, delayMs: 13000, syncOffsetMs: 0, now: t0, maxPullForwardMs: 600 });
+  if (atOf(s3) !== 13000) throw new Error(`往后推不该被限制（期望 13000，实际 ${atOf(s3)}）`);
+
+  // ④ 位移小于上限时照旧 —— 不许把"该拉 100ms"放大成 600
+  const s4 = mk();
+  s4.resync({ firstAudioAt: t0, delayMs: 9900, syncOffsetMs: 0, now: t0, maxPullForwardMs: 600 });
+  if (atOf(s4) !== 9900) throw new Error(`该拉 100ms 就该拉 100ms（期望 9900，实际 ${atOf(s4)}）`);
+
+  // ⑤ 连续多拍：每拍最多 600，而顺序不许乱（due() 依赖队首有序）
+  const s5 = new dp.SubtitleSchedule();
+  s5.push({ id: 'a' }, { start: 0, duration: 2 }, t0, 10000, 0);
+  s5.push({ id: 'b' }, { start: 2, duration: 2 }, t0, 10000, 0);
+  for (let k = 0; k < 5; k += 1) {
+    s5.resync({ firstAudioAt: t0, delayMs: 4000, syncOffsetMs: 0, now: t0, maxPullForwardMs: 600 });
+  }
+  const a5 = s5.items.map((i) => i.at - t0);
+  if (a5[0] !== 7000 || a5[1] !== 9000) {
+    throw new Error(`连续五拍应只拉到 7000/9000（每拍 600），实际 ${JSON.stringify(a5)}`);
+  }
+  if (!(a5[0] < a5[1])) throw new Error('顺序被打乱了');
+
+  // ⑥ 接线反证：只有新路传它，而默认值必须是 Infinity
+  const dsrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'lib', 'delayed-player.js'), 'utf8'));
+  if (!/maxPullForwardMs\s*=\s*Infinity/.test(dsrc)) {
+    throw new Error('resync 的 maxPullForwardMs 默认值必须是 Infinity —— 否则旧路会被一起改 ✗');
+  }
+  const psrc = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
+  const pump = psrc.slice(psrc.indexOf('function pumpSubtitles'), psrc.indexOf('function renderSubs'));
+  if (!/maxPullForwardMs:\s*[\w$]+\s*\?\s*MAX_PULL_FORWARD_MS\s*:\s*Infinity/.test(pump)) {
+    throw new Error('字幕泵没有按「新路才限制、旧路 Infinity」接上 MAX_PULL_FORWARD_MS');
+  }
+});
+
 await checkAsync('播放页必须每一拍都 resync（只在排期时算一次的话，调延迟后字幕会提前）', async () => {
   const src = stripComments(fs.readFileSync(path.join(process.cwd(), 'player', 'player.js'), 'utf8'));
   if (!/schedule\.resync\(/.test(src)) throw new Error('播放页没有 resync');
@@ -11068,14 +11144,50 @@ function assertSpeechRun() {
     }
     /**
      * ⑭ **接线反证**：`vad.js` 的 `isTextTrustworthy` 必须真的调 `looksTooSlowByWords` ✗
+     *
+     * ⚠️ 原来钉的是字面一行式 `/if \(looksTooSlowByWords\(seg\)\) return false;/` ✗ ——
+     *    而加了「被拦原因」诊断之后它变成带 `recordTrustReject` 的块 ✗
+     *    ⇒ 这里**改成"调了 + 之后确实 return false"**，对一行式和块式都成立，
+     *      而且比原来更严：原来只要有一行长这样就过，现在要求**紧接着真的拦掉** ✓
      */
     const vadSrc = stripComments(fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8'));
-    if (!/if \(looksTooSlowByWords\(seg\)\) return false;/.test(vadSrc)) {
+    const slowByIdx = vadSrc.indexOf('if (looksTooSlowByWords(seg))');
+    if (slowByIdx < 0) {
       throw new Error('isTextTrustworthy 没有调用 looksTooSlowByWords —— 垃圾段拦不住');
+    }
+    if (!/return false;/.test(vadSrc.slice(slowByIdx, slowByIdx + 600))) {
+      throw new Error('looksTooSlowByWords 调了却没拦掉（后面 600 字里没有 return false）');
     }
     /** ⑮ 阈值常量必须导出（否则断言只能靠源码正则，改坏了没人拦 ✗） */
     if (B.WORDS_MAX_AVG_WORD_SEC !== 0.8) throw new Error('WORDS_MAX_AVG_WORD_SEC 应为 0.8');
     if (B.WORDS_MIN_SPAN_SEC !== 1.0) throw new Error('WORDS_MIN_SPAN_SEC 应为 1.0');
+
+    /**
+     * ⑰ ⭐ **被拦的必须说得出「哪道闸 + 拦了什么文本」** ✗
+     *
+     * 用户报「语气词或者短一点的被丢了」✗ —— 而原来的日志只有光秃秃一句
+     * `text-untrusted`：既不说哪道闸，也不说文本 ✗ ⇒ **查不出丢的是不是语气词** ✗
+     * （今天这一族已经栽过五次：`prompt` 看不见 / `due()` 弹出被 break / `dt` 回填缺半边 …）
+     *
+     * ⚠️ 所以四条都要钉：**四道闸各记一笔** + **批日志印出来** + **心跳有分母** + **文本截断** ✓
+     *    只钉"函数存在"是不够的 —— 那正是"写了断言却抓不到"的老坑 ✗
+     */
+    for (const tag of ['too-fast', 'too-slow', 'too-slow-by-words', 'hard-cut-tail']) {
+      // ⚠️ 容忍换行与缩进：那几处是多行排版 ✓（写死单行的字面量会假红 ✗）
+      if (!new RegExp(`recordTrustReject\\(\\s*why\\(\\s*'${tag}'`).test(vadSrc)) {
+        throw new Error(`「${tag}」那道闸没有记录被拦原因 —— 丢句时查不出是哪条判据`);
+      }
+    }
+    if (!/function recordTrustReject\(/.test(vadSrc)) throw new Error('vad.js 里没有 recordTrustReject');
+    if (!/slice\(0, 20\)/.test(vadSrc)) {
+      throw new Error('被拦文本没有截断到 20 字 —— 日志会被整段文本刷爆');
+    }
+    if (!/out\.reason === 'text-untrusted' && trustReject/.test(vadSrc)) {
+      throw new Error('批日志没有把「被拦原因 + 文本」印出来');
+    }
+    if (!/文本被拦 \$\{trustRejectCount\} 条 \/ 最近拦/.test(vadSrc)) {
+      throw new Error('心跳里没有「文本被拦 N 条 / 最近拦」—— 没有分母就判断不了影响面');
+    }
 
     /**
      * ⑯ 🔴 **`words` 必须从「送 Whisper」那一层传下来** ✗
