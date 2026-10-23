@@ -4774,7 +4774,7 @@ check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏�
     if (e < 0) throw new Error(`找不到 function ${name} 的结尾`);
     return src.slice(start, e + 2);
   };
-  const minSecM = /const WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*(\d+)\s*;/.exec(src);
+  const minSecM = /const WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*(\d+(?:\.\d+)?)\s*;/.exec(src);
   if (!minSecM) throw new Error('源码里没有 WHISPER_SEGMENTS_MIN_DELAY_SEC');
   const MIN_SEC = Number(minSecM[1]);
   const DELAY_MIN_SEC = 3; // 与 lib/delayed-player.js 的 DELAY_MIN_SEC 一致
@@ -4820,11 +4820,12 @@ check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏�
     );
   };
 
-  const neu = { capture: { delaySec: 7.1 }, asr: { provider: 'vad-segments' } };
+  // ⚠️ 滑块必须**低于**新路下限（6.5），否则 `max(滑块, 下限)` 取滑块 ⇒ 这一段就测不到下限了 ✗
+  const neu = { capture: { delaySec: 4.7 }, asr: { provider: 'vad-segments' } };
   const old = { capture: { delaySec: 7.1 }, asr: { provider: 'vad' } };
   const EPS = 1e-6;
 
-  // ① 排期按**目标值**排：新模式 = target(10) + 录音滞后(1.2) = 11.20s
+  // ① 排期按**目标值**排：新模式 = target(MIN_SEC，现为 6.5) + 录音滞后(1.2) = 7.70s
   //    ⚠️ 不许按实测（7.1+1.2=8.30）排 —— 那是拿"缓冲不够"当锚，会让短句忽早忽晚而查不出原因
   const a = runOnce(neu, 7.1, 1.2, null);
   if (Math.abs(a.eff - MIN_SEC) > EPS) throw new Error(`新模式的生效延迟应是 ${MIN_SEC}，实际 ${a.eff}`);
@@ -8290,12 +8291,14 @@ check('「让 Whisper 自己断句」的延迟预算：滑块与 clamp 上限都
   if (!slider) throw new Error('player.html 里找不到 id="delay" 的滑块');
   const maxM = slider[0].match(/max="(\d+(?:\.\d+)?)"/);
   if (!maxM) throw new Error('延迟滑块没有 max');
-  if (Number(maxM[1]) < 10) throw new Error('延迟滑块 max=' + maxM[1] + '，拉不到新路要的 10 秒');
+  if (Number(maxM[1]) < 10) throw new Error('延迟滑块 max=' + maxM[1] + '，拉不到新路下限所需的高度');
 
   const pjs = fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8');
   if (!/function effectiveDelaySec\s*\(/.test(pjs)) throw new Error('player.js 里没有 effectiveDelaySec');
-  if (!/WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*10\b/.test(pjs)) {
-    throw new Error('WHISPER_SEGMENTS_MIN_DELAY_SEC 不是 10 —— 新路的延迟预算写着 10');
+  if (!/WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*6\.5\s*;/.test(pjs)) {
+    throw new Error(
+      'WHISPER_SEGMENTS_MIN_DELAY_SEC 不是 6.5 —— 新路的延迟下限实测只能到 6.5（缓冲前方中位 7.7）',
+    );
   }
   // ⭐ 核心：不许再有裸读（否则漏一处就是「滑块 10 而标签 3.0s」）
   const bare = [

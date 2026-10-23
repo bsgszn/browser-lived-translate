@@ -70,18 +70,19 @@ import {
 //       和**旧开关**（`whisperSegments === true`，v2.66.82 迁移之前的残留数据）。
 //       两支都要认 —— 否则老用户迁移完之前那一次打开会按旧延迟排期，字幕必然迟到。
 /** 老位置：新路延迟下限的硬编码。现在只当**兜底**用（用户能从面板改，见 `minDelaySec`）。 */
-const WHISPER_SEGMENTS_MIN_DELAY_SEC = 10;
+const WHISPER_SEGMENTS_MIN_DELAY_SEC = 6.5;
 /** 面板可调范围。下限 4 是 `DELAY_MIN_SEC` 之上一点 —— 再低排期预算就不够了。 */
 const MIN_DELAY_SEC_RANGE = [4, 16];
 
 /**
- * 新路延迟下限：**用户可调**（`asr.vadSegments.minDelaySec`，默认 10）。
+ * 新路延迟下限：**用户可调**（`asr.vadSegments.minDelaySec`，默认 6.5）。
  *
  * 🔴 为什么必须可调：它原来是个写死的 10，而**这台机器的缓冲只撑得起 7.9~8.4 秒**
  *    ⇒ 日志天天报「画面实际比目标靠前 2.0s ⇒ 这句会晚」✗ ——
  *    而用户把滑块调到 4.7 时发现"降不下去"，因为 10 是硬下限 ✓
  *
- * ⚠️ 脏值一律退回 10（不是退回 0 —— 0 会让排期预算消失，字幕全部提前）。
+ * ⚠️ 脏值一律退回 6.5（不是退回 0 —— 0 会让排期预算消失，字幕全部提前）。
+ * ⚠️ 也不要让它变得"读不到就见旧值"：这里和 `settings.js` 的默认值**必须一致** ✗
  */
 function newPathMinDelaySec(settings) {
   const v = Number(settings?.asr?.vadSegments?.minDelaySec ?? WHISPER_SEGMENTS_MIN_DELAY_SEC);
