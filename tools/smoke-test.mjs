@@ -11585,7 +11585,7 @@ function assertSpeechRun() {
    *        `prompt` 在日志里看不见、`tooShort` 没人消费、`dt` 回填缺半边、
    *        `MIN_SHOW_HOLD_MS || …` 短路静默退化 ✓）
    */
-  check('新路四个旋钮：默认值必须等于旧硬编码，且四个都真的接线', () => {
+  check('新路五个旋钮：默认值必须等于旧硬编码，且五个都真的接线', () => {
     const S = loaded['lib/settings.js'];
     const B = loaded['lib/asr/whisper-batch.js'];
     const V = loaded['lib/asr/vad.js'];
@@ -11599,6 +11599,7 @@ function assertSpeechRun() {
      */
     const mustEqual = [
       ['maxBatchSec', g.maxBatchSec, B.MAX_BATCH_SEC, 8],
+      ['continueBatchSec', g.continueBatchSec, B.CONTINUE_BATCH_SEC, 5],
       ['maxAvgWordSec', g.maxAvgWordSec, B.WORDS_MAX_AVG_WORD_SEC, 1.9],
       ['pauseSplitMinSegSec', g.pauseSplitMinSegSec, V.PAUSE_SPLIT_MIN_SEG_SEC, 2.5],
     ];
@@ -11632,6 +11633,7 @@ function assertSpeechRun() {
     // 四个都从 config 读（且默认值写在 `??` 右边，和 ① 那次比对形成闭环 ✓）
     for (const [name, dflt] of [
       ['maxBatchSec', 8],
+      ['continueBatchSec', 5],
       ['maxAvgWordSec', 1.9],
       ['pauseSplitMinSegSec', 2.5],
     ]) {
@@ -11648,6 +11650,9 @@ function assertSpeechRun() {
     if (!/maxBatchSec:\s*segOpts\.maxBatchSec/.test(src)) {
       throw new Error('createSegmentLoop 没有收到 segOpts.maxBatchSec —— 批长旋钮没接线 ✗');
     }
+    if (!/continueBatchSec:\s*segOpts\.continueBatchSec/.test(src)) {
+      throw new Error('createSegmentLoop 没有收到 segOpts.continueBatchSec —— 续批旋钮没接线 ✗');
+    }
     if (!/pauseSplitMinSegSec|segOpts\.pauseSplitMinSegSec/.test(src)) {
       throw new Error('segOpts.pauseSplitMinSegSec 根本没出现');
     }
@@ -11656,6 +11661,21 @@ function assertSpeechRun() {
     }
     // `shownStartOf` 必须真的认这个 opt（不是收了不用）
     const bs = stripComments(fs.readFileSync(new URL('../lib/asr/whisper-batch.js', import.meta.url), 'utf8'));
+    /**
+     * 续批旋钮：**引擎的签名里必须真的收它** ✗
+     *    —— `vad.js` 传了而 `createSegmentLoop` 不认这个键 = 静默丢弃，
+     *    和今天那几次「存了但不读」是同一族（`words` / `prompt` / `tooShort` / `dt`）✓
+     */
+    if (!/continueBatchSec\s*=\s*CONTINUE_BATCH_SEC,/.test(bs)) {
+      throw new Error(
+        'createSegmentLoop 的签名里没有 `continueBatchSec = CONTINUE_BATCH_SEC` —— '
+          + 'vad.js 传进去也会被丢掉，续批旋钮是假旋钮 ✗',
+      );
+    }
+    /** 而 `batchSec()` 必须真的用它（不是只收不用） */
+    if (!/tail\s*\+\s*continueBatchSec/.test(bs)) {
+      throw new Error('batchSec() 里没有 `tail + continueBatchSec` —— 续批值收下但没用 ✗');
+    }
     if (!/segStartAnchor\s*=\s*undefined,/.test(bs)) {
       throw new Error('shownStartOf 的签名里没有 segStartAnchor —— 传了也收不到');
     }
@@ -11672,15 +11692,15 @@ function assertSpeechRun() {
       .replace(/<!--[\s\S]*?-->/g, '');
     if (!/data-vad-legacy/.test(html)) throw new Error('options.html 里没有 data-vad-legacy —— 旧 9 项藏不掉');
     if (!/data-segmented-only/.test(html)) throw new Error('options.html 里没有 data-segmented-only —— 新 4 项显不出来');
-    for (const id of ['seg-maxBatchSec', 'seg-maxAvgWordSec', 'seg-pauseSplitMinSegSec', 'seg-segStartAnchor']) {
+    for (const id of ['seg-maxBatchSec', 'seg-continueBatchSec', 'seg-maxAvgWordSec', 'seg-pauseSplitMinSegSec', 'seg-segStartAnchor']) {
       if (!html.includes(`id="${id}"`)) throw new Error(`options.html 里没有 id="${id}" —— 旋钮没控件`);
     }
     const ojs = fs.readFileSync(new URL('../options/options.js', import.meta.url), 'utf8');
-    for (const id of ['seg-maxBatchSec', 'seg-maxAvgWordSec', 'seg-pauseSplitMinSegSec', 'seg-segStartAnchor']) {
+    for (const id of ['seg-maxBatchSec', 'seg-continueBatchSec', 'seg-maxAvgWordSec', 'seg-pauseSplitMinSegSec', 'seg-segStartAnchor']) {
       if (!ojs.includes(`'${id}'`)) throw new Error(`options.js 的 FIELDS 里没有 ${id} —— 存不下来`);
     }
     // 键必须在 `asr.vadSegments.*`（塞进 whisperChunked 会被「键必须属于那个面板」抓住 ✓）
-    for (const f of ['maxBatchSec', 'maxAvgWordSec', 'pauseSplitMinSegSec', 'segStartAnchor']) {
+    for (const f of ['maxBatchSec', 'continueBatchSec', 'maxAvgWordSec', 'pauseSplitMinSegSec', 'segStartAnchor']) {
       if (!ojs.includes(`'asr.vadSegments.${f}'`)) {
         throw new Error(`FIELDS 里没有 'asr.vadSegments.${f}' —— 键落在错的组里`);
       }
