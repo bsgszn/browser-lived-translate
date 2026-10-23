@@ -1670,6 +1670,24 @@ function scheduleUtterance(u) {
      *    否则到上屏那一刻只能看到最终值，中间挪了几次、挪了多少全都看不见 ✗。
      */
     item.atPush = at;
+    /**
+     * ⭐ **"人真正开口"那一格**（用户报「有时候早有时候晚」，而日志量不到 ✓）
+     *
+     * `at` 是 `firstAudioAt + u.start*1000 + 延迟 + 同步偏移`（见上方的 `schedule.push`）✗
+     * ⇒ 反推"词首绝对时刻"需要存两个数：
+     *   · `delayPlusSyncMs` —— 这句排期里**加进去的延迟预算**（`at` 减去它就是音频时刻 ✓）
+     *   · `wordShiftMs`     —— `words[0].start` 相对 `u.start` 的偏移
+     *     （锚点被关掉时它让 `u.start = offset + words[0].start`，所以 `词首 == at − 预算`；
+     *       而锚点再打开时它会≠0，正好把锚点位移显出来 ✓）
+     *
+     * ⇒ 于是 `diagShown` 能印 `词首`，而 `真 − 词首` 就是**观众真的看到**这句比人开口
+     *   早/晚多少 —— 那才是"早/晚"的定义 ✓（`比排期晚` 只量"上屏 vs `at`"，量不到这个 ✗）
+     */
+    item.delayPlusSyncMs = usedDelayMs + (Number(settings.capture.syncOffsetMs) || 0);
+    item.wordShiftMs =
+      Number.isFinite(Number(u.wordStart)) && Number.isFinite(Number(u.start))
+        ? (Number(u.wordStart) - Number(u.start)) * 1000
+        : null;
     segs.push(item);
     if (segs.length > 40) segs.shift();
   }
@@ -2689,6 +2707,30 @@ function diagShown(item, now) {
    */
   const realSec = Math.round(((shownPerf - DIAG_T0) / 1000) * 1000) / 1000;
   const realStamp = `真 ${realSec < 0 ? '-' : '+'}${Math.abs(realSec).toFixed(3)}s`;
+  /**
+   * ⭐ **"人真正开口"的绝对时刻** —— 用户报的「有时候早有时候晚」靠它才量得到 ✗
+   *
+   * `比排期晚` 只回答"上屏 vs `at`"；而"`at` 本身早不早"它**量不到** ✗
+   * （`at` 就是基准 ⇒ 基准错了这个数照样是 0.0x ✓ —— 今天在这一点上绕过一整圈 ✓）
+   *
+   * ⇒ 印 `词首`，于是这一行同时给出：
+   *   · `真 − 词首` = **观众真的看到**这句比人开口早/晚多少 ← **"早/晚"的定义** ✓
+   *   · `at − 词首` = 排期的延迟预算 + 锚点位移（诊断排期用 ✓）
+   *
+   * ⚠️ 换算：`at` 是 `Date.now()` 口径、`真` 是 `performance.now()` 口径 ⇒
+   *    用**同一对** `(item.at, now)` 把 `at` 映射到 perf 刻度（和 `formatAtStamp` 同一个思路 ✓）
+   * ⚠️ 缺 `words` ⇒ 印 `词首 —`（**绝不印 0**：0 会被读成"就是这一刻"✗）
+   */
+  const atPerf = shownPerf + (Number(item.at) - Number(now));
+  const wordPerf =
+    Number.isFinite(item.wordShiftMs) && Number.isFinite(Number(item.delayPlusSyncMs))
+      ? atPerf - Number(item.delayPlusSyncMs) + Number(item.wordShiftMs)
+      : null;
+  const wordSec = wordPerf === null ? null : (wordPerf - DIAG_T0) / 1000;
+  const wordStamp =
+    wordSec === null
+      ? ' · 词首 —'
+      : ` · 词首 ${wordSec < 0 ? '-' : '+'}${Math.abs(wordSec).toFixed(3)}s`;
   const chars = String(item.translation || item.original || '').length;
   // ⚠️ 第一句没有上一条（`dwellMs = 0`）⇒ 印 `—`，不许印 0（0 会被当成"没待"✗）
   const dwellNote =
@@ -2696,7 +2738,7 @@ function diagShown(item, now) {
       ? ` · 上条待 ${(dwellMs / 1000).toFixed(2)}s/${lastShownChars} 字 = ${prevCps.toFixed(1)} 字/秒${prevCps > 8 ? ' ⚠ 读不完' : ''}`
       : ' · 上条待 —';
   diag(
-    `屏上 · ${atNote}${realStamp} · 比排期晚 ${(lateMs / 1000).toFixed(2)}s` +
+    `屏上 · ${atNote}${realStamp}${wordStamp} · 比排期晚 ${(lateMs / 1000).toFixed(2)}s` +
       ` · ${chars} 字${saidMs > 0 ? ` / 说了 ${(saidMs / 1000).toFixed(1)}s` : ''}` +
       `${inside ? ' · 仍在句内' : ''}${dwellNote}${heldNote} · 切 ${item.cut || '?'}`,
     // 晚得还在句内 = 观感可接受；而"读不完"（>8 字/秒）要报警 ✓
