@@ -6512,10 +6512,115 @@ check('每个预设里的设置路径都必须真实存在（写错路径会静�
   }
   // 而且它必须真的是"本地 + 延迟"那套，别写着写着变了
   const rec = settings.LATENCY_PRESETS[0].values;
-  if (rec['asr.provider'] !== 'vad') throw new Error('推荐预设的识别服务应当是本地 VAD');
+  /**
+   * ⭐ v2.67.2：推荐 + 默认的识别服务从 `vad` 换成了 `vad-segments`（Whisper 自己断句）。
+   * 这条断言跟着**改准**（不是放宽）：它仍然要求"推荐预设 = 本地的哪一条"，
+   * 只是那个 id 变了 ✓
+   * ⚠️ 而 `DEFAULT_SETTINGS.asr.provider` 必须和它**同一个值** —— 否则用户点「推荐」
+   *    之后反而从默认值上"改掉"了服务（下拉会显示成自定义）✗
+   */
+  if (rec['asr.provider'] !== 'vad-segments') {
+    throw new Error('推荐预设的识别服务应当是本地 Whisper 自断句（vad-segments）');
+  }
+  if (settings.DEFAULT_SETTINGS.asr.provider !== rec['asr.provider']) {
+    throw new Error(
+      '默认识别服务必须和「推荐」预设同一个值 —— '
+        + `默认 ${settings.DEFAULT_SETTINGS.asr.provider} vs 推荐 ${rec['asr.provider']}`,
+    );
+  }
   if (rec['capture.mode'] !== 'delayed') throw new Error('推荐预设应当是延迟模式');
   if (rec['asr.refine.enabled'] !== false) {
     throw new Error('推荐预设不该同时开识别校正（VAD 自己就是重识别那条路）');
+  }
+});
+
+/**
+ * ⭐⭐ 默认识别服务换成新路之后，**老用户的选择不许被覆盖** ✗
+ *
+ * 这是 v2.67.2 那一刀最大的风险：`DEFAULT_SETTINGS.asr.provider` 从 `'vad'` 改成
+ * `'vad-segments'`。而 `DEFAULT_SETTINGS` 只该影响**没存过这个键**的 profile ——
+ * 深合并时已存的值优先 ✓。**如果哪天有人给 `provider` 加了迁移，这条会红** ✓
+ *
+ * ⚠️ 另一条同样重要：**新用户必须拿到新默认**。只测"老用户不变"测不出"默认改了没有"
+ *    （改回 `'vad'` 它照样绿）。
+ * ⚠️ 第三条：`whisperSegments` 那个旧开关必须仍然是 `false` —— 唯一真相是 `provider`。
+ *    设成 `true` 会让「切回本地 VAD 断句」时那个残留值把新路又拉回来（本项目栽过：
+ *    "有设置没控件"）。
+ */
+await checkAsync('默认识别服务换成新路之后：老用户不被覆盖、新用户拿到新默认', async () => {
+  const want = settings.DEFAULT_SETTINGS.asr.provider;
+  if (want !== 'vad-segments') {
+    throw new Error(`默认识别服务应当是 vad-segments（现在是 ${want}）`);
+  }
+  // ① 老用户：存过 'vad'，合并后必须仍是 'vad'
+  const before = JSON.stringify(settings.DEFAULT_SETTINGS);
+  localStore.clear();
+  localStore.set(settings.STORAGE_KEY, { asr: { provider: 'vad' } });
+  localStore.set('livedub.settingsVersion', settings.SETTINGS_VERSION);
+  const old = await settings.getSettings();
+  if (old.asr.provider !== 'vad') {
+    throw new Error(`老用户存的 'vad' 被默认值覆盖成了 ${old.asr.provider} —— 升级把用户的选择改掉了`);
+  }
+  // ② 新用户：空 storage ⇒ 必须拿到新默认
+  localStore.clear();
+  const fresh = await settings.getSettings();
+  if (fresh.asr.provider !== 'vad-segments') {
+    throw new Error(`全新安装的默认识别服务是 ${fresh.asr.provider}，应当是 vad-segments`);
+  }
+  // ②b 新用户的生效延迟必须被抬到下限（否则新路超预算、字幕迟到）
+  /**
+   * ⚠️ 这里**必须跑真源码**，不能自己写一遍 `max(delaySec, minDelaySec)`：
+   *    那样只证明"我抄的公式对"，证明不了 `player.js` 里那个函数对 ✗
+   *    （本项目为"判据存在但算错"栽过太多次）
+   */
+  const pjs = stripComments(fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8'));
+  const cut = (name, endAnchor) => {
+    const a = pjs.indexOf(`function ${name}`);
+    if (a < 0) throw new Error(`player.js 里找不到 function ${name}（判据失效，得重新审视这条断言）`);
+    const b = endAnchor ? pjs.indexOf(endAnchor, a) : pjs.indexOf('\n}\n', a) + 2;
+    if (b <= a) throw new Error(`找不到 ${name} 的结束锚 ${endAnchor}`);
+    return pjs.slice(a, b);
+  };
+  const dminM = /export const DELAY_MIN_SEC\s*=\s*(\d+(?:\.\d+)?)\s*;/.exec(
+    fs.readFileSync(new URL('../lib/delayed-player.js', import.meta.url), 'utf8'),
+  );
+  if (!dminM) throw new Error('lib/delayed-player.js 里没有 DELAY_MIN_SEC');
+  /**
+   * ⚠️ `newPathMinDelaySec` 还要读 `MIN_DELAY_SEC_RANGE` —— 从源码取，
+   *    **不在这里另抄一份**（抄了就成了"测试里有份自己的常量"，改了源码它照样绿 ✗）
+   */
+  const rangeM = /const MIN_DELAY_SEC_RANGE\s*=\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]\s*;/.exec(pjs);
+  if (!rangeM) throw new Error('player.js 里没有 MIN_DELAY_SEC_RANGE');
+  const effSrc =
+    `const DELAY_MIN_SEC = ${dminM[1]};`
+    + `const MIN_DELAY_SEC_RANGE = [${rangeM[1]}, ${rangeM[2]}];`
+    + cut('newPathMinDelaySec', 'function effectiveDelaySec')
+    + cut('effectiveDelaySec', 'const $ = (id)');
+  const effFn = new Function(`${effSrc}; return effectiveDelaySec;`)();
+  const floor = settings.DEFAULT_SETTINGS.asr.vadSegments.minDelaySec;
+  const eff = effFn(settings.DEFAULT_SETTINGS);
+  if (eff + 1e-9 < floor) {
+    throw new Error(
+      `新用户用默认设置算出的生效延迟是 ${eff}，低于新路下限 ${floor} —— `
+        + '字幕会一路迟到（默认 capture.delaySec 是 3，必须靠下限抬起来）',
+    );
+  }
+  // ⚠️ 而且默认的 `capture.delaySec` 本来就低于下限 —— 否则上面那条"抬起"根本没被测到
+  if (Number(settings.DEFAULT_SETTINGS.capture.delaySec) >= floor) {
+    throw new Error(
+      `默认 capture.delaySec（${settings.DEFAULT_SETTINGS.capture.delaySec}）不低于下限（${floor}）`
+        + ' —— 那条"下限真的把延迟抬起来"的断言就测不到东西了',
+    );
+  }
+  // ③ 旧开关必须仍是 false（唯一真相是 provider）
+  if (settings.DEFAULT_SETTINGS.asr.whisperChunked.whisperSegments !== false) {
+    throw new Error(
+      'whisperChunked.whisperSegments 默认必须仍是 false —— '
+        + '它是"兼容旧数据"的入口，设成 true 会让切回 VAD 时被残留值拉回新路',
+    );
+  }
+  if (JSON.stringify(settings.DEFAULT_SETTINGS) !== before) {
+    throw new Error('getSettings() 把 DEFAULT_SETTINGS 改掉了（别名复用）');
   }
 });
 
