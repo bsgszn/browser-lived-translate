@@ -86,6 +86,7 @@ const FIELDS = [
   //    那一组属于「本地 Whisper 分片」面板，而这一组属于「自断句」面板。
   //    塞错组会被 `smoke-test` 那条「键必须属于那个面板的 provider」抓住（而那是对的 ✓）
   ['seg-maxBatchSec', 'number', 'asr.vadSegments.maxBatchSec'],
+  ['seg-continueBatchSec', 'number', 'asr.vadSegments.continueBatchSec'],
   ['seg-maxAvgWordSec', 'number', 'asr.vadSegments.maxAvgWordSec'],
   ['seg-pauseSplitMinSegSec', 'number', 'asr.vadSegments.pauseSplitMinSegSec'],
   ['seg-segStartAnchor', 'checkbox', 'asr.vadSegments.segStartAnchor'],
