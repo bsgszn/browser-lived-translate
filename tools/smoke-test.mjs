@@ -143,6 +143,9 @@ const MODULES = [
   // ⚠️ 「连续 N 帧都达标才算开口」的判据本体 —— 它原来内联在 `vad.js` 的闭包里 ✗
   //    ⇒ 断言只能靠源码正则，测不到行为。提出来之后这里才测得到 ✓
   'lib/asr/speech-run.js',
+  // ⚠️ 「一句话被 Whisper 断成两段」时在**送翻译之前**接回去 ——
+  //    纯函数，所以能直接喂数据验证真行为 ✓（而不是靠源码正则 ✗）
+  'lib/asr/merge-adjacent.js',
   // ⚠️ 批次引擎（新断句路径的驱动）—— 它曾经**不在这个清单里** ⇒ 一个断言都没有 ✗
   'lib/asr/whisper-batch.js',
   'lib/asr/index.js',
@@ -11868,6 +11871,131 @@ function assertSpeechRun() {
   });
 }
 assertSpeechRun();
+
+// 批内相邻段合并（lib/asr/merge-adjacent.js）—— 「一句话被断成两段」时在**送翻译之前**接回去
+//
+// ⚠️ 为什么必须在翻译之前：用户的现场是
+// ```
+// [+38.899s] 识别  意識を          ← 3 字
+// [+38.900s] 识别  引き締めていないですけど
+// ```
+// 那本来是一句话，而 Whisper 在「を」后面断成了两段 ⇒ 我们**分开送翻译** ✗
+// ⇒ DeepL 拿到两个半句、译文残缺 ✓
+// ⚠️ 显示层的"合并"救不了它 —— 那只能把两个**已经分开翻的**译文拼一起 ✗
+//
+// ⭐ 判据三条缺一不合（保守）：助词结尾 · 空隙 < 300ms · 合并后 ≤ 60 字 ✓
+check('批内相邻段合并：一句话被断成两段时在送翻译之前接回去（助词结尾 + 空隙小 + 不超长）', () => {
+  const M = loaded['lib/asr/merge-adjacent.js'];
+  if (typeof M.mergeAdjacentPieces !== 'function') throw new Error('merge-adjacent.js 没有 mergeAdjacentPieces');
+  if (typeof M.endsWithParticle !== 'function') throw new Error('merge-adjacent.js 没有 endsWithParticle');
+
+  const mk = (text, startSec, endSec, wordStart = startSec) => ({ text, startSec, endSec, startAbs: startSec, wordStart });
+  const texts = (r) => r.pieces.map((p) => p.text);
+
+  // ① 用户现场必须合（而起点取**前一条**：那句话是从那儿开始的）
+  {
+    const r = M.mergeAdjacentPieces([mk('意識を', 6.0, 7.1), mk('引き締めていないですけど', 7.1, 9.3)]);
+    if (r.merged !== 1 || r.pieces.length !== 1) {
+      throw new Error(`用户现场（「意識を」+「引き締め…」）应当合成 1 条，实际 ${r.pieces.length} 条 · merged=${r.merged} ✗`);
+    }
+    if (r.pieces[0].text !== '意識を引き締めていないですけど') {
+      throw new Error(`合并后的文本不对：${JSON.stringify(r.pieces[0].text)} —— 日语拼句不许加空格 ✗`);
+    }
+    if (r.pieces[0].startAbs !== 6.0) {
+      throw new Error(`合并后起点应当取**前一条**的 ${6.0}（那句话从那儿开始），实际 ${r.pieces[0].startAbs} ✗`);
+    }
+    if (r.pieces[0].endSec !== 9.3) {
+      throw new Error(`合并后终点应当取**后一条**的 9.3，实际 ${r.pieces[0].endSec} ✗`);
+    }
+  }
+
+  // ② 两句完整句**不许**合 —— 否则会把不相干的两句话缝成一句 ✗
+  {
+    const r = M.mergeAdjacentPieces([mk('そうですね。', 1, 2), mk('わかりました。', 2, 3)]);
+    if (r.merged !== 0 || r.pieces.length !== 2) {
+      throw new Error(`两句完整句被合了（${JSON.stringify(texts(r))}）—— 只有助词结尾才算"没说完" ✗`);
+    }
+  }
+
+  // ③ 空隙大**不许**合（300ms 是上限）
+  {
+    const r = M.mergeAdjacentPieces([mk('意識を', 1, 2), mk('引き締め', 2.5, 3)]);
+    if (r.merged !== 0) throw new Error(`空隙 500ms > 300ms 应当不合，实际 merged=${r.merged} ✗`);
+    // ⚠️ 边界：正好 300ms **要**合（判据是 <=）
+    const edge = M.mergeAdjacentPieces([mk('意識を', 1, 2), mk('引き締め', 2.3, 3)]);
+    if (edge.merged !== 1) throw new Error('空隙正好 300ms 应当合（判据是 <=），实际没合 ✗');
+  }
+
+  // ④ 合并后超 60 字**不许**合 —— 否则会把一整段吞成一条巨块 ✗
+  {
+    const r = M.mergeAdjacentPieces([mk('あ'.repeat(40) + 'を', 1, 2), mk('い'.repeat(25), 2, 3)]);
+    if (r.merged !== 0) throw new Error(`合并后 67 字 > 60 应当不合，实际 merged=${r.merged} ✗`);
+  }
+
+  // ⑤ 三段连锁：应当一路合成一条（前一条合并后又以助词结尾 ⇒ 继续合）
+  {
+    const r = M.mergeAdjacentPieces([mk('私は', 1, 2), mk('これを', 2, 3), mk('見た', 3, 4)]);
+    if (r.pieces.length !== 1 || r.pieces[0].text !== '私はこれを見た') {
+      throw new Error(`三段连锁应当合成「私はこれを見た」，实际 ${JSON.stringify(texts(r))} ✗`);
+    }
+  }
+
+  // ⑥ 助词识别：只看后缀，且**标点要先剥掉**
+  for (const [t, want] of [['意識を', true], ['そうですね。', false], ['だから', true], ['', false], ['   ', false], ['が', true]]) {
+    const got = M.endsWithParticle(t);
+    if (got !== want) throw new Error(`endsWithParticle(${JSON.stringify(t)}) 应为 ${want}，实际 ${got} ✗`);
+  }
+
+  // ⑦ 脏输入不崩、**且不丢条目**（丢一条就是丢一句话 ✗）
+  {
+    if (M.mergeAdjacentPieces(null).merged !== 0) throw new Error('null 输入应当安全返回 ✓');
+    if (M.mergeAdjacentPieces([mk('を', 1, 2), null, mk('あ', 3, 4)]).pieces.length !== 3) {
+      throw new Error('脏条目被丢了 —— 丢一条就是丢一句话 ✗');
+    }
+    const bad = M.mergeAdjacentPieces([{ text: 'を', startSec: NaN, endSec: NaN }, mk('あ', 1, 2)]);
+    if (bad.pieces.length !== 2) throw new Error('NaN 时间戳不该导致合并或丢条目 ✗');
+  }
+
+  // ⑧ ⚠️ 不许改入参（纯函数）—— 否则上游拿到的数据被悄悄改写 ✗
+  {
+    const input = [mk('意識を', 1, 2), mk('引き締め', 2, 3)];
+    const snapshot = JSON.stringify(input);
+    M.mergeAdjacentPieces(input);
+    if (JSON.stringify(input) !== snapshot) throw new Error('mergeAdjacentPieces 改了入参 —— 它必须是纯函数 ✗');
+  }
+
+  // ⑨ 接线反证：vad.js 必须在**下发之前**合并，且用的是这个函数
+  {
+    const vjs = fs.readFileSync(new URL('../lib/asr/vad.js', import.meta.url), 'utf8');
+    if (!/import\s*\{\s*mergeAdjacentPieces\s*\}\s*from\s*'\.\/merge-adjacent\.js'/.test(vjs)) {
+      throw new Error('vad.js 没有 import mergeAdjacentPieces —— 纯函数存在但没人用 ✗');
+    }
+    const iMerge = vjs.indexOf('mergeAdjacentPieces(batchPieces)');
+    if (iMerge < 0) throw new Error('vad.js 没有调用 mergeAdjacentPieces(batchPieces) ✗');
+    // ⚠️ 必须在 `for (const piece of mergedOut.pieces)` 下发循环**之前**
+    const iEmit = vjs.indexOf('for (const piece of mergedOut.pieces)');
+    if (iEmit < 0 || iEmit < iMerge) {
+      throw new Error('合并必须在**下发之前** —— 否则送翻译的仍是两个半句（这一层的全部意义 ✗）');
+    }
+    // ⚠️ 而下发必须走合并后的结果 ✗ —— 判据是"`pieces` 那一圈**只准往 batchPieces 里塞**，
+    //    不准在里面 `onEvent({ type: 'final' …)`"。否则合并等于没做 ✓
+    const collect = /for \(const piece of pieces\) \{\s*batchPieces\.push\(piece\);\s*\}/.exec(vjs);
+    if (!collect) {
+      throw new Error(
+        'vad.js 里 `for (const piece of pieces)` 不是"只往 batchPieces 塞" —— '
+          + '若它仍在里面下发 final，就是绕过了合并结果 ✗',
+      );
+    }
+    // ⭐ 合并之后的下发**只许一处**（旧路那一处 `final` 不受影响 ✓）
+    const afterMerge = vjs.slice(iMerge);
+    const finals = afterMerge.split("onEvent({ type: 'final'").length - 1;
+    if (finals !== 1) {
+      throw new Error(`vad.js 里合并之后有 ${finals} 处下发 final —— 应当只有一处（在合并循环里）✗`);
+    }
+    // ⭐ 合并次数必须进心跳（否则"接回去了"在日志里看不见 ✗）
+    if (!/segmentsBatchMerged/.test(vjs)) throw new Error('合并次数没有可观测的计数 —— 又一次"看不见" ✗');
+  }
+});
 
 // 批次引擎（lib/asr/whisper-batch.js）—— 新断句路径「按 Whisper 的边界推进」
 //
