@@ -79,6 +79,16 @@ const FIELDS = [
   // 「合理断句」：到单句上限时回看换气处，把切点从"时间到的那一刻"挪过去（见 vad.js 的 findLullCut）
   ['vd-smartCut', 'checkbox', 'asr.vad.vadSmartCut'],
   ['vd-dropShort', 'checkbox', 'asr.vad.vadDropShort'],
+  // —— 「本地 Whisper 自断句」自己的四个旋钮（v2.66.84）——
+  // ⚠️ 这四项只在选 `vad-segments` 时显示（见 options.html 的 `data-segmented-only`），
+  //    而它们**才是新路真正生效的参数**：上面那 9 项在新路下一个都不生效 ✗
+  // ⚠️ 键必须是 `asr.vadSegments.*`、不能塞进 `asr.whisperChunked.*` ——
+  //    那一组属于「本地 Whisper 分片」面板，而这一组属于「自断句」面板。
+  //    塞错组会被 `smoke-test` 那条「键必须属于那个面板的 provider」抓住（而那是对的 ✓）
+  ['seg-maxBatchSec', 'number', 'asr.vadSegments.maxBatchSec'],
+  ['seg-maxAvgWordSec', 'number', 'asr.vadSegments.maxAvgWordSec'],
+  ['seg-pauseSplitMinSegSec', 'number', 'asr.vadSegments.pauseSplitMinSegSec'],
+  ['seg-segStartAnchor', 'checkbox', 'asr.vadSegments.segStartAnchor'],
   ['wc-prompt', 'text', 'asr.whisperChunked.prompt'],
   ['wc-hotwords', 'text', 'asr.whisperChunked.hotwords'],
   // 内置「直播热词」（lib/hotwords/ja-live.js）—— **默认开**。
@@ -437,6 +447,21 @@ function syncPanels() {
   const backend = currentVadBackend();
   for (const el of document.querySelectorAll('#cardAsr [data-backend]')) {
     el.hidden = el.dataset.backend !== backend;
+  }
+  /**
+   * ⭐ 新路 / 旧路两套旋钮**互斥显示**（v2.66.84）
+   *
+   * 🔴 那 9 个 VAD 旋钮在新路下**一个都不生效**（`vad.js` 的 `if (segmentLoop) return;`），
+   *    所以选新路时把它们藏起来、换成 `data-segmented-only` 那 4 个 ✓
+   * ⚠️ 判据和 `lib/asr/index.js:41` 的 `id === 'vad-segments'` **必须同一处** ——
+   *    两处写两套就是"选 A 而实际跑 B"那一族 ✗
+   */
+  const segmented = asrId === 'vad-segments';
+  for (const el of document.querySelectorAll('#cardAsr [data-vad-legacy]')) {
+    el.hidden = segmented;
+  }
+  for (const el of document.querySelectorAll('#cardAsr [data-segmented-only]')) {
+    el.hidden = !segmented;
   }
   const trId = $('tr-provider').value;
   for (const panel of document.querySelectorAll('#cardTranslate .panel')) {

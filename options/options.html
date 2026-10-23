@@ -272,7 +272,14 @@
           data-panel 是空格分隔的列表，见 options.js 的 panelShown()。
         -->
         <div class="panel" data-panel="vad vad-segments dashscope">
-          <div class="grid">
+          <!--
+            🔴 **这 9 个旋钮对新路（`vad-segments`）一个都不生效** ✗
+               判据：`lib/asr/vad.js` 的 `if (segmentLoop) return;` —— 它之后读的设置全被跳过。
+               逐项核过：5 项完全无效、3 项只影响音频裁剪、**0 项能调新路的实际行为**。
+            ⇒ 选中新路时整块隐藏，换成下面 `data-segmented-only` 那四个 ✓
+               （看不见就不会以为自己在调它 ✓）
+          -->
+          <div class="grid" data-vad-legacy>
             <label class="field">
               <span>语速档位</span>
               <select id="vd-rate"></select>
@@ -324,6 +331,64 @@
               <input type="number" id="vd-padMs" min="0" max="800" step="50" />
               <small class="hint">句子前后各多切一点。切在音节中间会让识别丢掉开头的字。</small>
             </label>
+          </div>
+          <!--
+            ⭐⭐ **「本地 Whisper 自断句」自己真正生效的四个旋钮**（v2.66.84）
+
+            这四个才对应新路的实际行为：
+              · 批长上限  → 字幕滞后 / 生僻词认不认得出
+              · 词均阈值  → 「语气词 / 短句被丢」
+              · 段内切分  → 「句子碎」
+              · 开口锚    → 「字幕提前」
+
+            ⚠️ 只在选中新路时显示（`data-segmented-only`，见 options.js 的 syncPanels）
+            ⚠️ 默认值等于原来的硬编码（8 / 1.9 / 2.5 / 关）⇒ 升级后行为一个字不变 ✓
+          -->
+          <div class="grid" data-segmented-only>
+            <label class="field">
+              <span>批长上限（秒）</span>
+              <input type="number" id="seg-maxBatchSec" min="2" max="30" step="1" />
+              <small class="hint">
+                <b>这一项直接等于字幕滞后的主要部分。</b>一批最多取多长的音频送去识别；
+                <b>调大 → Whisper 听得更全（生僻专有名词更容易认对），但字幕更晚</b>。
+                实测：日常句子 6~12 秒都正确；而「コックスプレッシャー」这类需要约 14 秒
+                （那时延迟得 ≈18 秒）。默认 8。
+              </small>
+            </label>
+            <label class="field">
+              <span>词均时长上限（秒/词）</span>
+              <input type="number" id="seg-maxAvgWordSec" min="0.5" max="10" step="0.1" />
+              <small class="hint">
+                用 Whisper 自己的词级时间戳判「这段里是不是几乎没人说话」：
+                <code>(末词结束 − 首词开始) ÷ 词数</code> 超过它就整段不采纳。
+                <b>调小 → 短句/语气词会被误杀</b>（0.8 实测把「そうなんだよね」1.01、
+                「うんそうだね」1.78 全丢了 —— 那正是"语气词被丢"）；<b>调大 → 拦不住真垃圾</b>
+                （「ん」那种 1 个词占 2 秒 = 2.00 秒/词）。默认 <b>1.9</b>，别取 2.0 ——
+                判据是严格大于，2.0 会让"1 个词占 2.00 秒"正好漏过去。
+              </small>
+            </label>
+            <label class="field">
+              <span>段内切分门槛（秒）</span>
+              <input type="number" id="seg-pauseSplitMinSegSec" min="1" max="12" step="0.5" />
+              <small class="hint">
+                Whisper 会把「前导短音（♪ / 换气）+ 后面的句子」合成一段，段起点落在前导短音上，
+                于是那句提前。段内切分在段内部找一处真实停顿把它切开。
+                <b>调大 → 少切（句子更整）；调小 → 更容易切碎。</b>默认 2.5。
+              </small>
+            </label>
+            <div class="checks">
+              <label class="check">
+                <input type="checkbox" id="seg-segStartAnchor" />
+                <span>VAD 开口锚（默认关：把上屏时刻挪到"人真正开口"）</span>
+              </label>
+            </div>
+            <small class="hint" style="display: block; margin: -6px 0 12px 26px">
+              <b>⚠️ 默认关，而理由是实测的</b>：词级时间戳证明 Whisper 的段起点
+              与「第一个词」只差 <b>0.00~0.07 秒</b> —— 它本来就贴着人开口的地方。
+              所以开口锚是在改一个本来就对的数，而它把排期挪得<b>分散</b>（单次最多 2.6 秒），
+              副作用是「同一拍到期的条目变少」⇒ 同批一起上屏失效。
+              想回到 v2.66.83 之前的行为就打开它。
+            </small>
           </div>
           <!-- ⚠️ 文本从哪来 —— 两个 backend 说法不同，见 options.js 的 currentVadBackend() -->
           <p class="note" data-backend="whisper">

@@ -97,6 +97,18 @@ input[type="range"] { width: 100%; accent-color: var(--accent); padding: 0; back
  */
 [data-backend][hidden] { display: none !important; }
 
+/*
+ * ⭐ 新路 / 旧路两套旋钮的互斥显隐（v2.66.84）—— 和上面 `data-backend` 同一个理由：
+ *
+ *   · `data-vad-legacy`     那 9 个 VAD 旋钮**只对旧路生效** ⇒ 选新路时隐藏
+ *   · `data-segmented-only` 那 4 个新路旋钮 ⇒ 只有选新路时显示
+ *
+ * ⚠️ `display: grid` 是作者样式，**会盖过** UA 的 `[hidden] { display: none }` ⇒
+ *    不写这条，`el.hidden = true` 会静默失效，于是两块同时显示（又变成"调了半天没用的东西" ✗）。
+ */
+[data-vad-legacy][hidden],
+[data-segmented-only][hidden] { display: none !important; }
+
 .glossary-block {
   margin-top: 16px;
   padding-top: 14px;
