@@ -79,12 +79,13 @@ const FIELDS = [
   // 「合理断句」：到单句上限时回看换气处，把切点从"时间到的那一刻"挪过去（见 vad.js 的 findLullCut）
   ['vd-smartCut', 'checkbox', 'asr.vad.vadSmartCut'],
   ['vd-dropShort', 'checkbox', 'asr.vad.vadDropShort'],
-  // —— 「本地 Whisper 自断句」自己的四个旋钮（v2.66.84）——
-  // ⚠️ 这四项只在选 `vad-segments` 时显示（见 options.html 的 `data-segmented-only`），
+  // —— 「本地 Whisper 自断句」自己的旋钮（v2.66.84 起四个，v2.67.1 加 continueBatchSec，v2.67.2 加 minDelaySec）——
+  // ⚠️ 这些只在选 `vad-segments` 时显示（见 options.html 的 `data-segmented-only`），
   //    而它们**才是新路真正生效的参数**：上面那 9 项在新路下一个都不生效 ✗
   // ⚠️ 键必须是 `asr.vadSegments.*`、不能塞进 `asr.whisperChunked.*` ——
   //    那一组属于「本地 Whisper 分片」面板，而这一组属于「自断句」面板。
   //    塞错组会被 `smoke-test` 那条「键必须属于那个面板的 provider」抓住（而那是对的 ✓）
+  ['seg-minDelaySec', 'number', 'asr.vadSegments.minDelaySec'],
   ['seg-maxBatchSec', 'number', 'asr.vadSegments.maxBatchSec'],
   ['seg-continueBatchSec', 'number', 'asr.vadSegments.continueBatchSec'],
   ['seg-maxAvgWordSec', 'number', 'asr.vadSegments.maxAvgWordSec'],

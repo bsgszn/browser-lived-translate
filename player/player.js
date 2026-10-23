@@ -65,11 +65,30 @@ import {
 
 // ⭐ 有效延迟：选「本地 Whisper 自断句」时，首批音频 6 秒 + 往返 + 确认 ⇒ 需要 ≈10 秒。
 //    ⚠️ 只在运行时抬，**不写 storage** —— 用户切回别的服务就立刻回到他自己的值。
-//    ⚠️ 这里不 clamp：DelayedPlayback 自己会 clamp（现在是 3~20 秒）。
+//    ⚠️ 这里不 clamp 上限：DelayedPlayback 自己会 clamp（现在是 3~20 秒）。
 //    ⚠️ 判据有两支：**下拉项**（`asr.provider === 'vad-segments'`，正常路径）
 //       和**旧开关**（`whisperSegments === true`，v2.66.82 迁移之前的残留数据）。
 //       两支都要认 —— 否则老用户迁移完之前那一次打开会按旧延迟排期，字幕必然迟到。
+/** 老位置：新路延迟下限的硬编码。现在只当**兜底**用（用户能从面板改，见 `minDelaySec`）。 */
 const WHISPER_SEGMENTS_MIN_DELAY_SEC = 10;
+/** 面板可调范围。下限 4 是 `DELAY_MIN_SEC` 之上一点 —— 再低排期预算就不够了。 */
+const MIN_DELAY_SEC_RANGE = [4, 16];
+
+/**
+ * 新路延迟下限：**用户可调**（`asr.vadSegments.minDelaySec`，默认 10）。
+ *
+ * 🔴 为什么必须可调：它原来是个写死的 10，而**这台机器的缓冲只撑得起 7.9~8.4 秒**
+ *    ⇒ 日志天天报「画面实际比目标靠前 2.0s ⇒ 这句会晚」✗ ——
+ *    而用户把滑块调到 4.7 时发现"降不下去"，因为 10 是硬下限 ✓
+ *
+ * ⚠️ 脏值一律退回 10（不是退回 0 —— 0 会让排期预算消失，字幕全部提前）。
+ */
+function newPathMinDelaySec(settings) {
+  const v = Number(settings?.asr?.vadSegments?.minDelaySec ?? WHISPER_SEGMENTS_MIN_DELAY_SEC);
+  const [lo, hi] = MIN_DELAY_SEC_RANGE;
+  return Number.isFinite(v) && v >= lo && v <= hi ? v : WHISPER_SEGMENTS_MIN_DELAY_SEC;
+}
+
 function effectiveDelaySec(settings) {
   const raw = Number(settings?.capture?.delaySec);
   const own = Number.isFinite(raw) && raw > 0 ? raw : DELAY_MIN_SEC;
@@ -77,7 +96,7 @@ function effectiveDelaySec(settings) {
     settings?.asr?.provider === 'vad-segments' ||
     settings?.asr?.whisperChunked?.whisperSegments === true;
   if (onWhisperSegments) {
-    return Math.max(own, WHISPER_SEGMENTS_MIN_DELAY_SEC);
+    return Math.max(own, newPathMinDelaySec(settings));
   }
   return own;
 }
@@ -671,6 +690,9 @@ async function saveAudioAndLog() {
         ? `${eff}（设定 ${raw}）`
         : eff;
     })}s` +
+    // ⭐ 新路延迟下限必须印出来 —— 否则"滑块调了 4.7 而实际还是 10"这件事在日志里看不见 ✗
+    //    （用户就是被它困住的：以为降下去了，其实被这个下限顶着 ✓）
+    (cfg(() => (sv()?.asr?.provider === 'vad-segments' ? 1 : 0)) ? ` · 新路下限 ${cfg(() => newPathMinDelaySec(sv()))}s` : '') +
     ` · 帧率上限 ${cfg(() => sv()?.capture?.maxFrameRate)}\n` +
     `  VAD 阈值 ${cfg(() => sv()?.asr?.vad?.vadThreshold)}` +
     ` · 静音确认 ${cfg(() => sv()?.asr?.vad?.vadMinSilenceMs)}ms` +

@@ -4775,15 +4775,24 @@ check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏�
   if (!minSecM) throw new Error('源码里没有 WHISPER_SEGMENTS_MIN_DELAY_SEC');
   const MIN_SEC = Number(minSecM[1]);
   const DELAY_MIN_SEC = 3; // 与 lib/delayed-player.js 的 DELAY_MIN_SEC 一致
+  /**
+   * 下限的可调范围也要从源码读（**不在这里另抄一份** ✗）——
+   * 否则改了源码范围而这里还印旧值，判据就永远绿。
+   */
+  const rangeM = /const MIN_DELAY_SEC_RANGE\s*=\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(src);
+  if (!rangeM) throw new Error('源码里没有 MIN_DELAY_SEC_RANGE');
+  const RANGE = [Number(rangeM[1]), Number(rangeM[2])];
 
   /** 在假作用域里跑真源码：settings / playback 注入，EMA 可以预置 */
   const runOnce = (settingsIn, actual, recLag, ema0) => {
     const body = `
       const DELAY_MIN_SEC = ${DELAY_MIN_SEC};
       const WHISPER_SEGMENTS_MIN_DELAY_SEC = ${MIN_SEC};
+      const MIN_DELAY_SEC_RANGE = [${RANGE[0]}, ${RANGE[1]}];
       const SCHEDULE_DEVIATION_WARN_MS = 300;
       let scheduleDeviationMs = getEma();
       let scheduleDeviationEma = getEma();
+      ${sliceFn('newPathMinDelaySec')}
       ${sliceFn('effectiveDelaySec')}
       ${sliceFn('recorderLagMs')}
       ${sliceFn('currentDelayMs', 'function recorderLagMs')}
@@ -4839,6 +4848,44 @@ check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏�
   const d = runOnce(neu, null, 1.2, null);
   if (Math.abs(d.ms / 1000 - (MIN_SEC + 1.2)) > 0.02) {
     throw new Error(`实测未知时应回落 target + lag，实际 ${(d.ms / 1000).toFixed(2)}s`);
+  }
+
+  /**
+   * ④b 新路的延迟下限**必须可调** —— 否则用户把滑块调到 4.7 而实际还是 10，
+   *     在界面上看起来就是"降不下去"✗（用户实测报过这一条）。
+   *
+   * ⚠️ 这一组同时钉两件事：
+   *    · 缺省（没有这个键）= 常量 10 ⇒ 老配置行为不变 ✓
+   *    · 设成 8 ⇒ **生效延迟真的是 8** ⇒ 旋钮通电，不是"存了不读" ✓
+   */
+  const withMin = (v) => ({ capture: { delaySec: 4.7 }, asr: { provider: 'vad-segments', vadSegments: { minDelaySec: v } } });
+  if (Math.abs(runOnce(withMin(undefined), null, 0, null).eff - MIN_SEC) > EPS) {
+    throw new Error(`没有 minDelaySec 时应回落常量 ${MIN_SEC}`);
+  }
+  if (Math.abs(runOnce(withMin(8), null, 0, null).eff - 8) > EPS) {
+    throw new Error(
+      `minDelaySec = 8 时生效延迟应是 8，实际 ${runOnce(withMin(8), null, 0, null).eff}` +
+        ' —— 否则滑块调下去也没用（"降不下去"就是这么来的）',
+    );
+  }
+  // ⭐ 它只抬不压：滑块比下限高时，滑块说了算
+  if (Math.abs(runOnce({ capture: { delaySec: 12 }, asr: { provider: 'vad-segments', vadSegments: { minDelaySec: 8 } } }, null, 0, null).eff - 12) > EPS) {
+    throw new Error('minDelaySec 只该当"下限"，高过它的滑块值不许被压下来');
+  }
+  // ⚠️ 脏值一律退回 10 —— **不许退回 0**（0 会让排期预算消失、字幕全部提前）
+  for (const bad of [0, -5, NaN, 3, 99, null, 'abc']) {
+    const got = runOnce(withMin(bad), null, 0, null).eff;
+    if (Math.abs(got - MIN_SEC) > EPS) {
+      throw new Error(`minDelaySec = ${String(bad)} 是脏值，应退回 ${MIN_SEC}，实际 ${got}`);
+    }
+  }
+  // ⚠️ 旧路**不该**有这个下限（旧路延迟本来就低）
+  if (Math.abs(runOnce({ capture: { delaySec: 4.7 }, asr: { provider: 'vad', vadSegments: { minDelaySec: 10 } } }, null, 0, null).eff - 4.7) > EPS) {
+    throw new Error('旧路被 minDelaySec 抬了 —— 那个下限只属于新路');
+  }
+  // ⚠️ 范围常量必须真的被用（改范围而函数不读 = 假旋钮）
+  if (!new RegExp(`v >= lo && v <= hi`).test(sliceFn('newPathMinDelaySec'))) {
+    throw new Error('newPathMinDelaySec 没在读范围 —— 常量 MIN_DELAY_SEC_RANGE 成了摆设');
   }
 
   // ⑤ 源里必须 `return target + lag;`，且**不许**再拿实测当锚（两个方向都不许）
@@ -11604,7 +11651,7 @@ function assertSpeechRun() {
    *        `prompt` 在日志里看不见、`tooShort` 没人消费、`dt` 回填缺半边、
    *        `MIN_SHOW_HOLD_MS || …` 短路静默退化 ✓）
    */
-  check('新路五个旋钮：默认值 / 模块常量 / vad.js 兜底三者必须成对，且五个都真的接线', () => {
+  check('新路旋钮：默认值 / 模块常量 / vad.js 兜底三者必须成对，且每个都真的接线（含 minDelaySec）', () => {
     const S = loaded['lib/settings.js'];
     const B = loaded['lib/asr/whisper-batch.js'];
     const V = loaded['lib/asr/vad.js'];
@@ -11664,6 +11711,58 @@ function assertSpeechRun() {
     }
     if (g.segStartAnchor !== false) {
       throw new Error(`asr.vadSegments.segStartAnchor 默认必须是 false，实际 ${String(g.segStartAnchor)}`);
+    }
+    /**
+     * ⭐ **延迟下限必须是一个设置项，且默认 = `player.js` 里那个常量** ✗
+     *
+     * v2.67.2 之前它是写死在 `player.js` 的 `WHISPER_SEGMENTS_MIN_DELAY_SEC = 10` ✗
+     * ⇒ 用户把「画面延迟」滑块调到 4.7 而实际还是 10，界面上看起来就是"降不下去" ✓
+     * 而实测这台机器的缓冲只撑得起 **7.9~8.4 秒** ⇒ 定成 10 会让日志天天报"填不到目标" ✓
+     *
+     * ⚠️ 三处必须**成对**（和上面 ①②③ 同一个道理，两处真相不一致就是 bug）：
+     *    · `settings.js` 的默认值
+     *    · `player.js` 的常量（缺省兜底）
+     *    · 面板控件 + FIELDS 映射（否则用户根本改不到）
+     */
+    if (typeof g.minDelaySec !== 'number') {
+      throw new Error(`asr.vadSegments.minDelaySec 必须是数字，实际 ${String(g.minDelaySec)}`);
+    }
+    {
+      const pj = fs.readFileSync(new URL('../player/player.js', import.meta.url), 'utf8');
+      const m = /const WHISPER_SEGMENTS_MIN_DELAY_SEC\s*=\s*(\d+(?:\.\d+)?)\s*;/.exec(pj);
+      if (!m) throw new Error('player.js 里没有 WHISPER_SEGMENTS_MIN_DELAY_SEC');
+      const constVal = Number(m[1]);
+      if (g.minDelaySec !== constVal) {
+        throw new Error(
+          `asr.vadSegments.minDelaySec 默认值（${g.minDelaySec}）必须等于 player.js 的`
+            + ` WHISPER_SEGMENTS_MIN_DELAY_SEC（${constVal}）—— 否则"没有这个键的旧配置"`
+            + '会走另一条路，两处真相不一致 ✗',
+        );
+      }
+      /** 范围常量必须存在、必须包住默认值（否则默认值自己就被判成脏值 ✗） */
+      const rm = /const MIN_DELAY_SEC_RANGE\s*=\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]/.exec(pj);
+      if (!rm) throw new Error('player.js 里没有 MIN_DELAY_SEC_RANGE —— 下限的可调范围没定义');
+      const lo = Number(rm[1]);
+      const hi = Number(rm[2]);
+      if (!(lo < g.minDelaySec && g.minDelaySec < hi)) {
+        throw new Error(
+          `minDelaySec 默认值 ${g.minDelaySec} 必须落在可调范围 (${lo}, ${hi}) 内部 —— `
+            + '否则用户一碰滑块就被判成脏值退回默认 ✗',
+        );
+      }
+      /**
+       * ⚠️ 而面板那个 input 的 `min`/`max` 必须和范围常量一致 ✗
+       *    （不一致时：界面上能填 4，而代码判 4 是脏值 ⇒ 填了不生效，且没有任何提示）
+       */
+      const oh = fs.readFileSync(new URL('../options/options.html', import.meta.url), 'utf8');
+      const im = /id="seg-minDelaySec"[^>]*min="(\d+(?:\.\d+)?)"[^>]*max="(\d+(?:\.\d+)?)"/.exec(oh);
+      if (!im) throw new Error('options.html 里没有 id="seg-minDelaySec" 的数字框');
+      if (Number(im[1]) !== lo || Number(im[2]) !== hi) {
+        throw new Error(
+          `面板 seg-minDelaySec 的范围是 ${im[1]}~${im[2]}，而代码的 MIN_DELAY_SEC_RANGE 是 ${lo}~${hi} —— `
+            + '两边不一致时用户填的值会被静默判成脏值 ✗',
+        );
+      }
     }
     /** 开口锚：设置缺省时必须退回模块常量（那样"改常量能不能恢复旧行为"仍然成立 ✓） */
     if (B.SEG_START_ANCHOR_ENABLED !== false) {
