@@ -73,6 +73,18 @@ import {
 const WHISPER_SEGMENTS_MIN_DELAY_SEC = 6.5;
 /** 面板可调范围。下限 4 是 `DELAY_MIN_SEC` 之上一点 —— 再低排期预算就不够了。 */
 const MIN_DELAY_SEC_RANGE = [4, 16];
+/**
+ * 旧路线（`provider === 'vad'`）的延迟下限 —— **5 秒**（用户定的：「旧线路延迟下限改为 5S」）。
+ *
+ * 🔴 为什么给旧路也加地板：`capture.delaySec` 的默认值是 **3 秒** ✗ ——
+ *    而 3 秒连"识别定稿 + 翻译往返"都装不下 ⇒ 字幕必然比画面晚 ✗
+ *
+ * ⚠️ 它和新路的 6.5 **不是同一个数** ✗：
+ *    旧路是流式识别（延迟 0.3~1 秒），不需要新路那么厚的预算 ✓
+ * ⚠️ 反过来，新路的 `minDelaySec` **不许**染指旧路 ✓ —— 两条路各用各的地板。
+ * ⚠️ 只抬不压：滑块高过 5 时滑块说了算 ✓
+ */
+const OLD_PATH_MIN_DELAY_SEC = 5;
 
 /**
  * 新路延迟下限：**用户可调**（`asr.vadSegments.minDelaySec`，默认 6.5）。
@@ -99,7 +111,7 @@ function effectiveDelaySec(settings) {
   if (onWhisperSegments) {
     return Math.max(own, newPathMinDelaySec(settings));
   }
-  return own;
+  return Math.max(own, OLD_PATH_MIN_DELAY_SEC);
 }
 
 const $ = (id) => document.getElementById(id);
@@ -693,7 +705,16 @@ async function saveAudioAndLog() {
     })}s` +
     // ⭐ 新路延迟下限必须印出来 —— 否则"滑块调了 4.7 而实际还是 10"这件事在日志里看不见 ✗
     //    （用户就是被它困住的：以为降下去了，其实被这个下限顶着 ✓）
-    (cfg(() => (sv()?.asr?.provider === 'vad-segments' ? 1 : 0)) ? ` · 新路下限 ${cfg(() => newPathMinDelaySec(sv()))}s` : '') +
+    /**
+     * ⚠️ 三元必须写在 `cfg` 回调**里面** ✗ ——
+     *    `cfg()` 返回的是**字符串**（`String(v)`）⇒ `'0'` 是 truthy ⇒
+     *    `cfg(() => (… ? 1 : 0)) ? A : B` **永远走 A** ✗
+     *    ⇒ 旧路会被印成「新路下限 6.5s」（实测踩到：旧路那轮日志印的正是 6.5）✗
+     *    ⇒ 让 `cfg` 去字符串化，三元放在回调里 ✓
+     */
+    ` · ${cfg(() => (sv()?.asr?.provider === 'vad-segments'
+      ? `新路下限 ${newPathMinDelaySec(sv())}s`
+      : `旧路下限 ${OLD_PATH_MIN_DELAY_SEC}s`))}` +
     ` · 帧率上限 ${cfg(() => sv()?.capture?.maxFrameRate)}\n` +
     `  VAD 阈值 ${cfg(() => sv()?.asr?.vad?.vadThreshold)}` +
     ` · 静音确认 ${cfg(() => sv()?.asr?.vad?.vadMinSilenceMs)}ms` +
@@ -3034,7 +3055,7 @@ function bindUi() {
   $('delay').addEventListener('input', (e) => {
     const raw = Number(e.target.value);
     /**
-     * ⚠️ 新模式有**硬下限 10 秒**，拖到下面也不会生效 —— 所以滑块当场弹回下限。
+     * ⚠️ 两条路都有**硬下限**（新路 6.5 秒 / 旧路 5 秒），拖到下面也不会生效 —— 所以滑块当场弹回下限。
      *
      *    不弹回去就会出现「滑块 7、标签 7、实际按 10 排」这种三个数各不相同的情况 ✗
      *    （本项目为「滑块 10 而标签 3.0s」专门写过断言，那是同一类问题。）
@@ -3045,7 +3066,7 @@ function bindUi() {
     const v = effectiveDelaySec({ ...settings, capture: { ...settings.capture, delaySec: raw } });
     const snapped = v !== raw;
     if (snapped) $('delay').value = String(v);
-    $('delayVal').textContent = snapped ? `${v.toFixed(1)}s（新模式最低 ${v.toFixed(1)}s）` : `${v.toFixed(1)}s`;
+    $('delayVal').textContent = snapped ? `${v.toFixed(1)}s（最低 ${v.toFixed(1)}s）` : `${v.toFixed(1)}s`;
     settings.capture.delaySec = raw;
     playback?.setDelay(v);
     scheduleSave('capture.delaySec', raw);
