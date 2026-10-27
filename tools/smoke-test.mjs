@@ -4778,6 +4778,10 @@ check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏�
   if (!minSecM) throw new Error('源码里没有 WHISPER_SEGMENTS_MIN_DELAY_SEC');
   const MIN_SEC = Number(minSecM[1]);
   const DELAY_MIN_SEC = 3; // 与 lib/delayed-player.js 的 DELAY_MIN_SEC 一致
+  /** 旧路地板也要从源码取 —— 抄一份就成了"测试里有自己的常量"，改了源码它照样绿 ✗ */
+  const oldFloorSrcM = /const OLD_PATH_MIN_DELAY_SEC\s*=\s*(\d+(?:\.\d+)?)\s*;/.exec(src);
+  if (!oldFloorSrcM) throw new Error('源码里没有 OLD_PATH_MIN_DELAY_SEC —— 旧路的延迟地板丢了');
+  const OLD_FLOOR = Number(oldFloorSrcM[1]);
   /**
    * 下限的可调范围也要从源码读（**不在这里另抄一份** ✗）——
    * 否则改了源码范围而这里还印旧值，判据就永远绿。
@@ -4792,6 +4796,7 @@ check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏�
       const DELAY_MIN_SEC = ${DELAY_MIN_SEC};
       const WHISPER_SEGMENTS_MIN_DELAY_SEC = ${MIN_SEC};
       const MIN_DELAY_SEC_RANGE = [${RANGE[0]}, ${RANGE[1]}];
+      const OLD_PATH_MIN_DELAY_SEC = ${OLD_FLOOR};
       const SCHEDULE_DEVIATION_WARN_MS = 300;
       let scheduleDeviationMs = getEma();
       let scheduleDeviationEma = getEma();
@@ -4883,9 +4888,38 @@ check('排期按「目标延迟 + 录音滞后」，并把实测与目标的偏�
       throw new Error(`minDelaySec = ${String(bad)} 是脏值，应退回 ${MIN_SEC}，实际 ${got}`);
     }
   }
-  // ⚠️ 旧路**不该**有这个下限（旧路延迟本来就低）
-  if (Math.abs(runOnce({ capture: { delaySec: 4.7 }, asr: { provider: 'vad', vadSegments: { minDelaySec: 10 } } }, null, 0, null).eff - 4.7) > EPS) {
-    throw new Error('旧路被 minDelaySec 抬了 —— 那个下限只属于新路');
+  /**
+   * ⚠️ 旧路有**自己的**下限（`OLD_PATH_MIN_DELAY_SEC`，用户定的 5 秒）——
+   *    而它和新路的 `minDelaySec` 是两回事，三条判据分开钉：
+   *      · 旧路滑块 2   ⇒ 生效 **5**（旧路地板抬起）
+   *      · 旧路滑块 7   ⇒ 生效 **7**（只抬不压）
+   *      · 旧路 + 新路的 `minDelaySec = 10` ⇒ 生效仍 **5**（新路的下限不许染指旧路）
+   */
+  if (Math.abs(OLD_FLOOR - 5) > EPS) {
+    throw new Error(`旧路延迟下限应是 5 秒（用户定的），实际 ${OLD_FLOOR}`);
+  }
+  const oldEff = (delaySec, vadSegments) =>
+    runOnce({ capture: { delaySec }, asr: vadSegments ? { provider: 'vad', vadSegments } : { provider: 'vad' } }, null, 0, null).eff;
+  if (Math.abs(oldEff(2) - 5) > EPS) {
+    throw new Error(`旧路滑块 2 应被抬到 5，实际 ${oldEff(2)} —— 否则「旧路延迟下限 5 秒」是假的`);
+  }
+  if (Math.abs(oldEff(7) - 7) > EPS) {
+    throw new Error(`旧路滑块 7 应是 7，实际 ${oldEff(7)} —— 地板不许压高过它的值`);
+  }
+  if (Math.abs(oldEff(4.7, { minDelaySec: 10 }) - 5) > EPS) {
+    throw new Error('旧路被新路的 minDelaySec 抬了 —— 那个下限只属于新路（旧路只用 5 秒地板）');
+  }
+  /**
+   * ⚠️ 配置快照里「新路/旧路下限」那格**不许对 `cfg()` 的返回值做布尔判断** ✗
+   *    `cfg()` 返回字符串（`String(v)`）⇒ `'0'` 是 truthy ⇒
+   *    `cfg(() => (… ? 1 : 0)) ? '新路…' : '旧路…'` **永远走新路** ✗
+   *    ⇒ 旧路会被印成「新路下限 6.5s」（实测踩到：旧路闭环日志印的就是 6.5）✗
+   */
+  if (/cfg\(\(\) => \(sv\(\)\?\.asr\?\.provider === 'vad-segments' \? 1 : 0\)\) \?/.test(src)) {
+    throw new Error('配置快照对 cfg() 的返回值做布尔判断 —— cfg 返回字符串，"0" 是 truthy，旧路会被印成"新路下限"');
+  }
+  if (!/旧路下限 \$\{OLD_PATH_MIN_DELAY_SEC\}s/.test(src)) {
+    throw new Error('配置快照没印旧路下限 —— "滑块 3 而实际 5"在日志里看不见');
   }
   // ⚠️ 范围常量必须真的被用（改范围而函数不读 = 假旋钮）
   if (!new RegExp(`v >= lo && v <= hi`).test(sliceFn('newPathMinDelaySec'))) {
@@ -6591,8 +6625,11 @@ await checkAsync('默认识别服务换成新路之后：老用户不被覆盖�
    */
   const rangeM = /const MIN_DELAY_SEC_RANGE\s*=\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]\s*;/.exec(pjs);
   if (!rangeM) throw new Error('player.js 里没有 MIN_DELAY_SEC_RANGE');
+  const oldFloorPjsM = /const OLD_PATH_MIN_DELAY_SEC\s*=\s*(\d+(?:\.\d+)?)\s*;/.exec(pjs);
+  if (!oldFloorPjsM) throw new Error('player.js 里没有 OLD_PATH_MIN_DELAY_SEC');
   const effSrc =
     `const DELAY_MIN_SEC = ${dminM[1]};`
+    + `const OLD_PATH_MIN_DELAY_SEC = ${oldFloorPjsM[1]};`
     + `const MIN_DELAY_SEC_RANGE = [${rangeM[1]}, ${rangeM[2]}];`
     + cut('newPathMinDelaySec', 'function effectiveDelaySec')
     + cut('effectiveDelaySec', 'const $ = (id)');
